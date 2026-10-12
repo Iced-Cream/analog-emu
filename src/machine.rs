@@ -1,0 +1,1403 @@
+//! The Analog Rytm: CPU, memory, peripherals, and the few high-level stand-ins
+//! for hardware that is not modelled at register level.
+
+use crate::bus::Bus;
+use crate::cpu::{Cpu, Stop};
+use crate::firmware::Firmware;
+use crate::symbols::{Device, Profile, MAIN_LOAD};
+
+/// Where the OS finds its own container in the SPI flash: the updater writes
+/// it there and the OS's flash reads (section tables, the panel MCU image)
+/// look for it there.
+pub const FLASH_SLOT: usize = 0x8_0000;
+pub const FLASH_SIZE: usize = 16 << 20;
+pub const INITIAL_SP: u32 = 0x4080_0000;
+/// The MKI units' LCD: 122x32, 1 bit (the OS clears 488 B = 122 x 4 pages and
+/// centres text on 0x7a) [measured, docs/MK1-PORT.md].
+pub const MK1_LCD_W: usize = 122;
+pub const MK1_LCD_H: usize = 32;
+pub const DEFAULT_VBR: u32 = 0x4000_0000;
+/// The argument the bootstrap passes MAIN OS when a panel answered: bit 20
+/// always, bit 18 from the bootstrap's own check (reference FINDINGS, "The
+/// boot flags"). The OS stores it at 0x401F55C0 and tests it in more than
+/// twenty places; 0x40|0x20 would mean "no panel" and park the OS.
+pub const BOOT_FLAGS: u32 = 0x0014_0000;
+
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Stats {
+    pub flash_reads: u64,
+    pub idle_hits: u64,
+    pub idle_skipped: u64,
+    pub tasks: Vec<(u32, u32, u32)>,
+    pub frames: u64,
+    pub intro_done_at: Option<u64>,
+    pub abort_at: Option<(u64, u32)>,
+    pub mainloop: u64,
+}
+
+pub struct Options {
+    /// Treat an idle spin as wait-for-interrupt: jump the clock to the next
+    /// event instead of executing the spin.
+    pub fast_idle: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { fast_idle: true }
+    }
+}
+
+/// A panel event queued for a clock (`Machine::nudge`).
+#[derive(Clone, Copy, Debug)]
+pub enum Nudge {
+    Turn(u8, i8),
+    Key(&'static str, bool),
+}
+
+/// What `Machine::power_off` saw.
+#[derive(Debug)]
+pub struct PowerOff {
+    /// EPORT IRQ2 was enabled: the firmware was listening for the power sense.
+    pub armed: bool,
+    /// The handler finished with the card (GO_PRE_IDLE seen).
+    pub done: bool,
+    pub instructions: u64,
+    pub sectors_written: u64,
+    /// A valid state header ('COKI') at sector 0x7a000, 0x7c000 afterwards.
+    pub slots: [bool; 2],
+    pub stop: Stop,
+}
+
+pub struct Machine {
+    pub cpu: Cpu,
+    pub prof: Profile,
+    pub flash: Vec<u8>,
+    pub stats: Stats,
+    pub opts: Options,
+    /// The last complete frame the firmware handed to the panel.
+    pub frame: Option<Vec<u8>>,
+    pub frame_seq: u64,
+    pub log: Vec<String>,
+    /// Addresses at which `run_until` stops and returns `Stop::Hook`.
+    pub breakpoints: Vec<u32>,
+    /// Hit counters: address -> count.
+    pub counters: Vec<(u32, u64)>,
+    /// The force a pad press reports (0..255; the OS ignores 10 and below).
+    pub pad_force: u8,
+    /// While the idle task is posting a USB MIDI message (`feed_usb_midi`): its
+    /// stack pointer before the call, and the arguments pushed (2 for
+    /// `queue_send`, then 1 for `sem_post`), popped when it is back.
+    usb_call: Option<(u32, u32)>,
+    /// The USB audio buffer the last receive-buffer copy wrote (read on the
+    /// next call, when that copy is complete).
+    usb_audio_last: Option<u32>,
+    /// Overbridge host -> Rytm frames waiting to be mixed (oblink.rs), and the
+    /// host link that fills them.
+    pub ob_in: std::collections::VecDeque<crate::oblink::Frame>,
+    pub ob_link: Option<crate::oblink::ObLink>,
+    /// A simulated USB host on the Rytm's USB port (usbhost.rs): with it, the
+    /// firmware's own Overbridge path carries the audio, both ways.
+    pub usb_host: Option<crate::usbhost::UsbHost>,
+    /// Panel events due at a clock (`nudge`), in time order.
+    pub nudges: std::collections::VecDeque<(u64, Nudge)>,
+    /// Per encoder: the clock of its last nudge (an encoder turned recently is
+    /// awake: the firmware takes its turns at once).
+    nudge_last: [u64; 16],
+    /// ext_report's memory: the amp start command seen last block, and P1..P8 sent.
+    ext_amp_cmd: [bool; 8],
+    ext_params: [[u8; 8]; 8],
+    /// The firmware's own USB MIDI sender runs (`set_usb_midi_real`): its
+    /// request pool, its dTDs on endpoint 0x81, completed only as the
+    /// simulated USB host reads them. Off: the emulator takes the sender's
+    /// calls (`usb_midi_send`, `usb_midi_send_short`, `sysex_send`).
+    pub usb_midi_real: bool,
+    /// While `usb_midi_real`: sem_pend calls that would block (count <= 0)
+    /// made with the interrupt mask above 0 - an RTOS wait from inside an
+    /// interrupt handler: (level, semaphore, return address) -> (first clock, count).
+    pub isr_pends: std::collections::BTreeMap<(u8, u32, u32), (u64, u64)>,
+}
+
+/// The Rytm's pads in pad-number order (pad p reports as `0xAp`/`0xBp`;
+/// `*0x40285608` maps p to the OS's pad index, identity in OS 1.73).
+pub const RYTM_PADS: [&str; 12] = ["BD", "SD", "RS", "CP", "BT", "LT", "MT", "HT", "CH", "OH", "CY", "CB"];
+
+impl Machine {
+    pub fn new(fw: &Firmware, ddr_mb: usize) -> Result<Machine, String> {
+        let os = fw.main_os().map_err(|e| e.to_string())?;
+        if os.entry.dest != MAIN_LOAD {
+            return Err(format!("MAIN OS loads at 0x{:08x}, expected 0x{MAIN_LOAD:08x}", os.entry.dest));
+        }
+        let prof = Profile::for_image(&os.data)?;
+        // The A4 MKI has 64 MB of DDR (ACR0 0x4003e020; its stack starts at
+        // 0x44000000) [measured, docs/MK1-PORT.md].
+        let ddr_mb = if prof.device == Device::A4Mk1 { 64 } else { ddr_mb };
+        let mut bus = Bus::new(ddr_mb);
+        if prof.device.mk1() {
+            bus.nor = Some(Default::default());
+            bus.codec = Some(Default::default());
+        }
+        bus.poke_bytes(MAIN_LOAD, &os.data);
+        if std::env::var_os("DTEMU_NO_ICACHE").is_none() {
+            bus.icache_enable(os.data.len() as u32);
+        }
+        // DTEMU_STRICT=1: unmapped pages and the SRAM mirror fault (bus.rs). It
+        // runs on the interpreter, which reports the exact faulting PC.
+        let strict_env = std::env::var("DTEMU_STRICT").unwrap_or_default();
+        let strict = !strict_env.is_empty() && strict_env != "0";
+        bus.set_strict(strict);
+        bus.strict_raise = strict_env != "log";
+        let mut cpu = Cpu::new(bus);
+        // The block compiler, on its own thread (DTEMU_JIT_SYNC=1: in line;
+        // DTEMU_NO_JIT=1: the interpreter alone).
+        if std::env::var_os("DTEMU_NO_JIT").is_none() && !strict {
+            if std::env::var_os("DTEMU_JIT_SYNC").is_some() {
+                cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
+            } else {
+                cpu.jitw = Some(crate::jit::Worker::new());
+            }
+        }
+        cpu.pc = prof.entry;
+        cpu.sr = 0x2700;
+        // The OS entry reads its argument at 4(a7).
+        cpu.a[7] = INITIAL_SP - 8;
+        cpu.bus.poke32(INITIAL_SP - 4, BOOT_FLAGS);
+        cpu.vbr = DEFAULT_VBR;
+
+        let mut flash = vec![0u8; FLASH_SIZE];
+        let c = &fw.container;
+        flash[FLASH_SLOT..FLASH_SLOT + c.len()].copy_from_slice(c);
+
+        let mut m = Machine {
+            cpu,
+            prof,
+            flash,
+            stats: Stats::default(),
+            opts: Options::default(),
+            frame: None,
+            frame_seq: 0,
+            log: Vec::new(),
+            breakpoints: Vec::new(),
+            counters: Vec::new(),
+            pad_force: 100,
+            usb_call: None,
+            usb_audio_last: None,
+            ob_in: std::collections::VecDeque::new(),
+            ob_link: None,
+            usb_host: None,
+            nudges: std::collections::VecDeque::new(),
+            nudge_last: [0; 16],
+            ext_amp_cmd: [false; 8],
+            ext_params: [[255; 8]; 8],
+            usb_midi_real: false,
+            isr_pends: Default::default(),
+        };
+        match m.prof.device {
+            Device::RytmMk2 => m.rytm_bootstrap_state(),
+            Device::A4Mk2 => m.a4_bootstrap_state(),
+            Device::RytmMk1 | Device::A4Mk1 => m.mk1_bootstrap_state(),
+            Device::Digitakt => {}
+        }
+        m.install_hooks();
+        if std::env::var_os("DTEMU_USB_MIDI_REAL").is_some_and(|v| v != "0") {
+            m.set_usb_midi_real(true);
+        }
+        Ok(m)
+    }
+
+    /// Run the firmware's own USB MIDI sender (`usb_midi_real`; also
+    /// `DTEMU_USB_MIDI_REAL=1`): unhook its stand-ins, and watch `sem_pend`
+    /// for waits from interrupt level (`isr_pends`). Needs a USB host
+    /// (`usb_host`) to read anything; the host's `midi_in` is set as it
+    /// attaches (`run_until`).
+    pub fn set_usb_midi_real(&mut self, on: bool) {
+        self.usb_midi_real = on;
+        let p = self.prof.clone();
+        for a in [p.usb_midi_send, p.usb_midi_send_short, p.sysex_send] {
+            if a != 0 {
+                self.cpu.set_hook(a, !on);
+            }
+        }
+        if p.sem_pend != 0 {
+            self.cpu.set_hook(p.sem_pend, on);
+        }
+    }
+
+    /// A synthetic analog calibration record, as a calibrated Rytm keeps in its
+    /// SPI flash at 0x340000 (and a copy at 0x300000), so the OS boots as on a
+    /// calibrated unit. The analog side is stubbed, so the values only have to
+    /// pass the OS's checks (OS 1.73, `0x400fade6` and its helpers):
+    ///
+    ///   +0      magic "RBOW"
+    ///   +4      12490, block 1's size
+    ///   +8      format: 5 is current (the OS's own default record carries 5)
+    ///   +12     checksum of block 1's 12474 data bytes from +16: sum of
+    ///           (byte_i XOR i), i from 1 (`0x400fabfc`)
+    ///   +16..   block 1 data; its first word is the calibration version:
+    ///           0xFFFF = missing, 1 = an old calibration ("improved tuning"
+    ///           prompt); `DTEMU_CAL_VERSION`, default 2 [inferred]
+    ///   +12492  block 2 (checked from format 2): end offset, then the checksum
+    ///           of the bytes from +12500 to that end minus 16
+    ///
+    /// The record is 110706 bytes; everything not named here is 0.
+    ///
+    /// On by default since 2026-10-06 (`DTEMU_NO_CAL=1` for none: MISSING CAL,
+    /// and silent toms). A nonzero version word makes the
+    /// machine engines use the calibration values (`tstw +16` at 0x4011b07a;
+    /// 0 means the built-in defaults), and with zeros there the first engine to
+    /// run divides by zero (`remul +3126`, 0x4011b112) and the OS stops in its
+    /// fatal handler. Booting as calibrated needs plausible values for the
+    /// fields the engines read; see docs/RYTM-PORT.md.
+    fn rytm_calibration(mk1: bool) -> Vec<u8> {
+        const LEN: usize = 110_706;
+        const B1: usize = 12_490;
+        let mut r = vec![0u8; LEN];
+        // The Rytm MKI reads the version word the other way round: 1 is the
+        // current calibration (0x400f4254; anything else gives "MISSING CAL:
+        // SYNTH" and the "improved tuning" offer) [measured].
+        let version: u16 = std::env::var("DTEMU_CAL_VERSION").ok().and_then(|v| v.parse().ok()).unwrap_or(if mk1 { 1 } else { 2 });
+        r[16..18].copy_from_slice(&version.to_be_bytes());
+        let sum = |d: &[u8]| -> u32 {
+            d.iter().enumerate().fold(0u32, |s, (i, &b)| s.wrapping_add((b as u32) ^ (i as u32 + 1)))
+        };
+        // The toms (4 groups: BT, LT, MT, HT) [measured layout, 0x4011b000]:
+        // nine period counts each at +3126 + 36g + 4k; the OS fits
+        // y = 49152000/count linearly against its x table (`0x401f7ecc`) and a
+        // tom routine (`0x4011b534`) writes its tune CV as
+        // ((y_target - b) / s)^2 / 2048, y_target being its exponential pitch
+        // value / 4 (about 57143 at BT's default TUN) [measured arithmetic].
+        // The counts describe a made-up tom that this emulator's model then
+        // follows: y = 1142.8 f and f = 0.1 x, so f = 4.53 sqrt(CV) Hz, up to
+        // about 1.16 kHz; BT's default TUN comes out near 100 Hz [synthetic]. Block 2's +12500 + 36g + 4k hold x
+        // points for the OS's second (decay) fit [synthetic].
+        const TOM_X: [u32; 9] = [362, 512, 724, 1024, 1448, 2048, 2896, 4096, 5793];
+        for g in 0..4 {
+            for (k, &x) in TOM_X.iter().enumerate() {
+                let y = crate::analog::TOM_Y_PER_HZ as f64 * crate::analog::TOM_HZ_PER_X as f64 * x as f64;
+                let count = (49_152_000.0 / y).round() as u32;
+                let o = 3126 + 36 * g + 4 * k;
+                r[o..o + 4].copy_from_slice(&count.to_be_bytes());
+                let o = 12_500 + 36 * g + 4 * k;
+                r[o..o + 4].copy_from_slice(&x.to_be_bytes());
+            }
+        }
+        // Block 2: header at +B1+2 (0x30CC), data from +B1+10 (0x30D4).
+        let end = LEN as u32;
+        let b2 = B1 + 2;
+        let b2_len = (end - 12_516) as usize;
+        r[b2..b2 + 4].copy_from_slice(&end.to_be_bytes());
+        let s2 = sum(&r[b2 + 8..b2 + 8 + b2_len]);
+        r[b2 + 4..b2 + 8].copy_from_slice(&s2.to_be_bytes());
+        // Block 1 header.
+        r[0..4].copy_from_slice(b"RBOW");
+        r[4..8].copy_from_slice(&(B1 as u32).to_be_bytes());
+        r[8..12].copy_from_slice(&5u32.to_be_bytes());
+        let s1 = sum(&r[16..16 + 12_474]);
+        r[12..16].copy_from_slice(&s1.to_be_bytes());
+        r
+    }
+
+    /// What the Rytm's bootstrap leaves set up that MAIN OS relies on, since the
+    /// emulator enters MAIN OS directly. The bootstrap (OS 1.73, 0x070207c2) sets
+    /// DTIM2's DTMR to 7 - enabled, clocked from DTIN - and clears its counter;
+    /// MAIN OS then times a delay on that counter (0x400055b2) before setting up
+    /// SSI1. What drives DTIN2 is not known: 12.288 MHz, an audio master clock, is
+    /// [inferred], and only the length of that wait depends on it.
+    fn rytm_bootstrap_state(&mut self) {
+        if std::env::var_os("DTEMU_NO_CAL").is_none() {
+            let cal = Self::rytm_calibration(false);
+            for at in [0x30_0000usize, 0x34_0000] {
+                self.flash[at..at + cal.len()].copy_from_slice(&cal);
+            }
+        }
+        self.cpu.bus.io.dtin_hz = 12_288_000.0;
+        // The Rytm's panel has 11 button groups (the OS's slot table, panel.rs).
+        self.cpu.bus.io.panel.groups = 11;
+        self.cpu.bus.io.panel.card = crate::panel::CARD_RYTM;
+        // Its analog voices, modelled from the control frame (analog.rs).
+        if std::env::var_os("DTEMU_NO_ANALOG").is_none() {
+            self.cpu.bus.analog = Some(Default::default());
+        }
+        self.cpu.bus.write16(0xFC07_8000, 0x0007);
+        self.cpu.bus.write32(0xFC07_800C, 0);
+    }
+
+    /// A synthetic calibration record for the Analog Four MKII OS 1.56, as a
+    /// calibrated unit keeps in its SPI flash at 0x300000 (3670 B, read by
+    /// 0x400f18e8 into the buffer *0x40214c10). Format [measured, code
+    /// reading; docs/A4-PORT.md section 11]:
+    ///
+    ///   +0      magic "RBOW"; +4 size 3670; +8 format (2 current, 1 is
+    ///           upgraded at 0x400f1a38); +12 checksum of the size - 16 bytes
+    ///           from +16: sum of (byte_i XOR i), i from 1 (0x400f1884)
+    ///   +0x10   CV calibrated (nonzero); +0x14/+0x24/+0x34 + 4c: CV out c's
+    ///           offset and two gains (0x400fc9a2 -> 0x41864a64/54/44)
+    ///   +0x44   AUD (voice) calibrated (nonzero); +0x48.. per voice v and
+    ///           oscillator k = 2v + osc the voice tables 0x40218e48..0x40218fa7
+    ///           (loaded by 0x40104148)
+    ///   +0x24c  KBD calibrated (u16, nonzero; read only from format 2);
+    ///           +0x24e six 256-entry u16 tables; +0xe4e 4 x u16 input ranges
+    ///           (0x400649d2: gain 0x800000 / (v - 34))
+    ///
+    /// The values are neutral: AUD's are solved from the OS's own uncalibrated
+    /// tables (read from the loaded image, so the voices run as uncalibrated);
+    /// KBD's are the OS's own format-1 upgrade defaults (ramps 0, 10 .. 2550;
+    /// ranges 150); CV's are offset 0, gains 0x40000000 [synthetic].
+    ///
+    /// `tab_shift`: how far below the MKII's the OS's uncalibrated tables sit
+    /// (0 on the A4 MKII; 0x26750 on the A4 MKI OS 1.56, where xmatch places
+    /// 0x40218e48 / 0x40218ea8 / 0x40218ed8 / 0x40218ee8 / 0x40218f28 /
+    /// 0x40218f68 at that distance [measured], the other three words at the
+    /// same distance [inferred]).
+    fn a4_calibration(&self, tab_shift: u32) -> Vec<u8> {
+        const LEN: usize = 0xE56;
+        let mut r = vec![0u8; LEN];
+        let put = |r: &mut Vec<u8>, o: usize, v: i32| r[o..o + 4].copy_from_slice(&v.to_be_bytes());
+        let peek = |a: u32| self.cpu.bus.peek32(a - tab_shift) as i32;
+        // CV: flag, offsets 0, both gains 0.5 (Q31).
+        put(&mut r, 0x10, 1);
+        for c in 0..4 {
+            put(&mut r, 0x24 + 4 * c, 0x4000_0000);
+            put(&mut r, 0x34 + 4 * c, 0x4000_0000);
+        }
+        // AUD (0x40104148), per voice v (4) and oscillator k = 2v + o (8).
+        put(&mut r, 0x44, 1);
+        // The "span" pair: S = (lo + hi) << 15, D = (((hi + 2000) - (lo - 2000)
+        // (hi + 2000 clamped to 0x7fff when `clamp`)) << 15) / 63 << 6.
+        let span = |s: i32, d: i32, clamp: bool| -> (i32, i32) {
+            let sum = s >> 15;
+            let f = |hi: i32| {
+                let lo = sum - hi;
+                let h = if clamp { (hi + 2000).min(0x7fff) } else { hi + 2000 };
+                ((h - (lo - 2000)).wrapping_shl(15) / 63).wrapping_shl(6)
+            };
+            let est = ((d as f64 / 64.0 * 63.0 / 32768.0 - 4000.0 + sum as f64) / 2.0).round() as i32;
+            let hi = (est - 64..=est + 64).min_by_key(|&h| (f(h) as i64 - d as i64).abs()).unwrap();
+            (sum - hi, hi)
+        };
+        for k in 0..8u32 {
+            let ko = 8 * k as usize;
+            // Copied as is: 0x40218f68 + 8k.
+            put(&mut r, 0x48 + ko, peek(0x4021_8F68 + 8 * k));
+            put(&mut r, 0x4C + ko, peek(0x4021_8F6C + 8 * k));
+            // (D at 0x40218f28 + 8k, S at +4), clamped; (D at 0x40218ee8 + 8k, S at +4).
+            let (lo, hi) = span(peek(0x4021_8F2C + 8 * k), peek(0x4021_8F28 + 8 * k), true);
+            put(&mut r, 0x88 + ko, lo);
+            put(&mut r, 0x8C + ko, hi);
+            let (lo, hi) = span(peek(0x4021_8EEC + 8 * k), peek(0x4021_8EE8 + 8 * k), false);
+            put(&mut r, 0xC8 + ko, lo);
+            put(&mut r, 0xCC + ko, hi);
+        }
+        for v in 0..4u32 {
+            let vo = 4 * v as usize;
+            // 0x40218ea8 + 8v = (0xb8cfe d) >> 16 (unsigned), +4 = lo - 8d; d = hi - lo.
+            let (a, b) = (peek(0x4021_8EA8 + 8 * v), peek(0x4021_8EAC + 8 * v));
+            let d = (-40000..40000).min_by_key(|&d: &i32| ((0xB8CFEi32.wrapping_mul(d) as u32 >> 16) as i64 - a as i64).abs()).unwrap();
+            let lo = b + ((d.wrapping_shl(19) >> 16) as i16 as i32);
+            put(&mut r, 0x13C + vo, lo);
+            put(&mut r, 0x14C + vo, lo + d);
+            put(&mut r, 0x16C + vo, peek(0x4021_8ED8 + 4 * v));
+            // 0x40218e48 + 8v = (0xb8cfe d) >> 16 (signed), +4 = lo - 9d.
+            let (a, b) = (peek(0x4021_8E48 + 8 * v), peek(0x4021_8E4C + 8 * v));
+            let d = (-40000..40000).min_by_key(|&d: &i32| ((0xB8CFEi32.wrapping_mul(d) >> 16) as i64 - a as i64).abs()).unwrap();
+            let lo = b + ((d.wrapping_mul(0x9_0000) >> 16) as i16 as i32);
+            put(&mut r, 0x1DC + vo, lo);
+            put(&mut r, 0x1EC + vo, lo + d);
+            put(&mut r, 0x1FC + vo, peek(0x4021_8EC8 + 4 * v));
+        }
+        // KBD: the OS's own format-1 upgrade values (0x400f1a42).
+        r[0x24C..0x24E].copy_from_slice(&1u16.to_be_bytes());
+        for t in 0..6 {
+            for i in 0..256 {
+                let o = 0x24E + 0x200 * t + 2 * i;
+                r[o..o + 2].copy_from_slice(&(10 * i as u16).to_be_bytes());
+            }
+        }
+        for i in 0..4 {
+            r[0xE4E + 2 * i..0xE50 + 2 * i].copy_from_slice(&150u16.to_be_bytes());
+        }
+        // Header.
+        r[0..4].copy_from_slice(b"RBOW");
+        r[4..8].copy_from_slice(&(LEN as u32).to_be_bytes());
+        r[8..12].copy_from_slice(&2u32.to_be_bytes());
+        let sum = r[16..].iter().enumerate().fold(0u32, |s, (i, &b)| s.wrapping_add((b as u32) ^ (i as u32 + 1)));
+        r[12..16].copy_from_slice(&sum.to_be_bytes());
+        r
+    }
+
+    /// The Analog Four MKII's start state (docs/A4-PORT.md). Its main task sets
+    /// DTIM2 up itself (0x40106018) and reads the counter, so DTIN must count; the
+    /// UI card is type 6. A synthetic calibration record (`a4_calibration`;
+    /// `DTEMU_NO_CAL=1` for none: "MISSING CAL: AUD CV KBD").
+    fn a4_bootstrap_state(&mut self) {
+        if std::env::var_os("DTEMU_NO_CAL").is_none() {
+            let cal = self.a4_calibration(0);
+            self.flash[0x30_0000..0x30_0000 + cal.len()].copy_from_slice(&cal);
+        }
+        self.cpu.bus.io.dtin_hz = 12_288_000.0;
+        self.cpu.bus.io.panel.card = crate::panel::CARD_A4;
+        // 12 button groups (the OS's slot table, panel.rs A4_KEYS).
+        self.cpu.bus.io.panel.groups = 12;
+        crate::panel::use_a4_panel();
+        // Its voices, modelled from the voice frame (a4voice.rs).
+        if std::env::var_os("DTEMU_NO_ANALOG").is_none() {
+            self.cpu.bus.a4 = Some(Default::default());
+        }
+    }
+
+    /// The MKI units' start state (docs/MK1-PORT.md). There is no bootstrap
+    /// section: the emulator enters MAIN OS directly, as the bootstrap in the
+    /// flash's boot block would. So the flash holds what a unit's does: the
+    /// bootstrap MAIN OS carries (`boot_blob`) at 0 and its version record at
+    /// the end of the boot block, which the entry compares before deciding on
+    /// a bootstrap upgrade [measured]. The boot flags (the entry's argument,
+    /// kept at 0x401d8ea4 on the A4) are the panel's UI firmware version in
+    /// the top byte, as the bootstrap leaves them, and 0 below (a blank card
+    /// adds 0x12, `attach_card`): on the A4 bit 20 with a top byte
+    /// of 0, 1 or 3 starts a panel (UI) upgrade (0x40100f7c), bit 0 clears the
+    /// CS1 memory, bits 1, 2 and 31 restore settings from it (0x40000f7a)
+    /// [measured]; `DTEMU_BOOT_FLAGS=HEX` overrides. MAIN OS sets DTIM2 up itself
+    /// (internal clock), so DTIN is not needed [measured].
+    fn mk1_bootstrap_state(&mut self) {
+        let p = self.prof.clone();
+        let bus = &mut self.cpu.bus;
+        let blob = bus.peek_bytes(p.boot_blob.0, (p.boot_blob.1 - p.boot_blob.0) as usize);
+        crate::nor::load(&mut bus.sparse, 0, &blob);
+        let ver = bus.peek_bytes(p.boot_ver, 8);
+        crate::nor::load(&mut bus.sparse, p.boot_ver_flash, &ver);
+        // The bootstrap puts the panel MCU's UI firmware version (byte 1 of its
+        // reply to `70 00`, the UI card query) in the flags' top byte (Rytm MKI
+        // blob 0x8a4); with 0 there the Rytm MKI OS reports "OLD UI FW"
+        // (0x400a19be) [measured].
+        let ui = (bus.io.panel.card[1] as u32) << 24;
+        let flags = std::env::var("DTEMU_BOOT_FLAGS").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(ui);
+        bus.poke32(INITIAL_SP - 4, flags);
+        // The A4 MKI keeps its calibration record (the A4 MKII's format, 3670 B)
+        // in the NOR flash at 0x7f0000 (written by 0x400ebcde) [measured].
+        if p.device == Device::A4Mk1 {
+            // Its panel: 11 key groups (the OS's slot table, panel::A4MK1_KEYS).
+            self.cpu.bus.io.panel.groups = 11;
+            crate::panel::use_a4mk1_panel();
+        }
+        if p.device == Device::RytmMk1 {
+            // Its panel: 10 key groups (the OS's slot table, panel::RYTMMK1_KEYS).
+            self.cpu.bus.io.panel.groups = 10;
+            crate::panel::use_rytmmk1_panel();
+        }
+        // The Rytm MKI reads the Rytm MKII's record format (RBOW, format 5,
+        // block 1 12490 B, 110706 B in all; 0x400f3e40) from its NOR flash at
+        // 0x780000, with a copy at 0x7c0000 [measured].
+        if p.device == Device::RytmMk1 && std::env::var_os("DTEMU_NO_CAL").is_none() {
+            let cal = Self::rytm_calibration(true);
+            for at in [0x78_0000, 0x7C_0000] {
+                crate::nor::load(&mut self.cpu.bus.sparse, at, &cal);
+            }
+        }
+        if p.device == Device::A4Mk1 && std::env::var_os("DTEMU_NO_CAL").is_none() {
+            let cal = self.a4_calibration(0x2_6750);
+            crate::nor::load(&mut self.cpu.bus.sparse, 0x7F_0000, &cal);
+        }
+        let bus = &mut self.cpu.bus;
+        // The voice frame goes out on DSPI2 by eDMA channel 29; the sender
+        // (A4 MKI 0x40061b7e) waits for TCF (SR bit 28) from the last one
+        // first. Transfers complete at once here [inferred], so TCF reads set.
+        bus.io.forced.insert(0xEC03_802C, 0x9000_0000);
+        // The Rytm MKI: SSI0 beside SSI1, and the Rytm MKII's analog model on
+        // its own frame and FX parameter addresses.
+        if p.device == Device::RytmMk1 {
+            bus.io.ssi0.on = true;
+            if std::env::var_os("DTEMU_NO_ANALOG").is_none() {
+                let mut a = crate::analog::Analog::default();
+                a.frame_addr = 0x8000_4CE0;
+                a.fx_addr = 0x8000_66E6;
+                bus.analog = Some(a);
+            }
+        }
+        // The A4 MKI's voices: the A4 MKII's model on its own frame address.
+        if p.device == Device::A4Mk1 && std::env::var_os("DTEMU_NO_ANALOG").is_none() {
+            let mut v = crate::a4voice::A4Voices::default();
+            v.frame_addr = 0x8000_32B0;
+            bus.a4 = Some(v);
+        }
+        // DTRR's reset value is 0xFFFFFFFF (MCF54418RM): the OS runs DTIM0 and
+        // DTIM3 free from the bus clock with FRR set (0x400ffc30) and reads
+        // their counters without writing DTRR [measured].
+        for d in bus.io.dtim.iter_mut() {
+            d.dtrr = u32::MAX;
+        }
+        // The bootstrap starts DTIM0 that way (DTMR = 0x0b; the Rytm MKI's blob
+        // at 0x4028cf58), and the Rytm MKI OS times its codec start-up on it
+        // without setting it up itself (0x400066a2) [measured].
+        bus.write16(0xFC07_0000, 0x000B);
+    }
+
+    fn install_hooks(&mut self) {
+        let p = self.prof.clone();
+        for a in [p.flash_read, p.task_create, p.intro_done, p.panel_diff, p.abort_loop, p.mainloop, p.sysex_send, p.usb_midi_send, p.usb_midi_send_short, p.usb_audio_copy, p.voice_output_mix] {
+            if a == 0 {
+                continue; // not found in this image
+            }
+            self.cpu.set_hook(a, true);
+        }
+        for &a in &p.idle_spins {
+            self.cpu.set_hook(a, true);
+        }
+    }
+
+    /// Stand-in for the Rytm-side report of the EXT machine (rytm-mods 0021) to an
+    /// Overbridge host: trigs and P1..P8 of every voice whose track plays
+    /// machine 44, sent over the link (oblink.rs). A trig is the voice's amp
+    /// envelope record getting its start command (0x4000 in the first word,
+    /// control frame +168 + 8v) [measured]; note and velocity from the track
+    /// (pitch table 0x80006388 + 4t, 16.16, note + 24 when played chromatically;
+    /// velocity byte 0x800067c4 + 2t); the owner track from 0x40290dd8[v];
+    /// machines at 0x8000ea00 [measured, rytm-mods 0020 design.md]. OS 1.73/1.74
+    /// RAM.
+    /// Only while machine 44's engine is DISABLE's own (0x40113efc): a build with
+    /// ext_render reports for itself, as USB MIDI SysEx.
+    fn ext_report(&mut self) {
+        const EXT: u8 = 44;
+        let b = &self.cpu.bus;
+        if b.peek32(0x4029_037C + 4 * EXT as u32) != 0x4011_3EFC {
+            return;
+        }
+        for v in 0..8u32 {
+            let track = b.peek8(0x4029_0DD8 + v) as u32;
+            if track >= 12 || b.peek8(0x8000_EA00 + track) != EXT {
+                self.ext_amp_cmd[v as usize] = false;
+                continue;
+            }
+            let start = b.peek16(0x8000_63C0 + 168 + 8 * v) == 0x4000;
+            let was = self.ext_amp_cmd[v as usize];
+            self.ext_amp_cmd[v as usize] = start;
+            let params: [u8; 8] = std::array::from_fn(|k| (b.peek16(0x8000_F7BA + 84 * track + 2 * k as u32) >> 8) as u8);
+            let note = ((b.peek32(0x8000_6388 + 4 * track) >> 16) as u8).min(127);
+            let vel = b.peek8(0x8000_67C4 + 2 * track) & 0x7F;
+            if let Some(l) = self.ob_link.as_ref() {
+                if params != self.ext_params[v as usize] {
+                    l.send_params(v as u8, params);
+                }
+                if start && !was {
+                    l.send_trig(v as u8, note, vel);
+                }
+            }
+            self.ext_params[v as usize] = params;
+        }
+    }
+
+    pub fn add_counter(&mut self, pc: u32) {
+        self.counters.push((pc, 0));
+        self.cpu.set_hook(pc, true);
+    }
+
+    pub fn add_breakpoint(&mut self, pc: u32) {
+        self.breakpoints.push(pc);
+        self.cpu.set_hook(pc, true);
+    }
+
+    pub fn now(&self) -> u64 {
+        self.cpu.icount()
+    }
+
+    fn note(&mut self, s: String) {
+        if self.log.len() < 10_000 {
+            self.log.push(format!("[{:>12}] {s}", self.now()));
+        }
+    }
+
+    /// MIDI arriving on the DIN port, except Elektron-protocol SysEx on a build
+    /// whose USB MIDI queue is known: that goes in as USB (`Io::midi_send`).
+    pub fn midi_send(&mut self, bytes: &[u8]) {
+        self.cpu.bus.io.usb_midi = self.prof.usb_midi_queue != 0;
+        self.cpu.bus.io.midi_send(bytes);
+    }
+
+    /// Called in the idle loop at `pc`: post the next waiting USB MIDI message
+    /// to the OS's USB MIDI queue as the USB driver would, as a chain of blocks
+    /// from the MIDI pool handed to `queue_send`. The idle task makes the call
+    /// (its frame is pushed here, returning to `pc`), so the queue's semaphore
+    /// wakes the MIDI task the firmware's own way. No task can be inside the
+    /// pool's allocator while the idle task runs. -> true when the CPU was
+    /// redirected.
+    fn feed_usb_midi(&mut self, pc: u32) -> bool {
+        let p = &self.prof;
+        if let Some((sp0, args)) = self.usb_call {
+            if self.cpu.a[7] != sp0 - 4 * args {
+                return false; // not back yet
+            }
+            self.cpu.a[7] = sp0;
+            self.usb_call = None;
+            if args == 2 {
+                // Queued; now wake the MIDI task: sem_post(midi_event).
+                let bus = &mut self.cpu.bus;
+                bus.poke32(sp0 - 4, p.midi_event);
+                bus.poke32(sp0 - 8, pc);
+                self.cpu.a[7] = sp0 - 8;
+                self.cpu.pc = p.sem_post;
+                self.usb_call = Some((sp0, 1));
+                return true;
+            }
+        }
+        let (q, pool, map) = (p.usb_midi_queue, p.midi_pool, p.midi_pool_map);
+        if q == 0 || self.cpu.bus.io.usb_in.is_empty() {
+            return false;
+        }
+
+        let bus = &mut self.cpu.bus;
+        // Queue: count at +4, index mask at +16.
+        if bus.peek32(q + 4) >= bus.peek32(q + 16) || bus.peek32(p.midi_pool_sem) == 0 {
+            return false;
+        }
+        let msg = bus.io.usb_in.front().unwrap().clone();
+        if msg.first().is_some_and(|&b| b != 0xF0) && p.midi_short_ring != 0 {
+            // A short message: one 4-byte slot `[status, d1, d2, len]`, taken
+            // as the USB driver's allocator does (`0x400812de`).
+            let idx = bus.peek32(p.midi_short_idx) & 0xFF;
+            bus.poke32(p.midi_short_idx, (idx + 1) & 0xFF);
+            let slot = p.midi_short_ring + 4 * idx;
+            let mut s = [0u8; 4];
+            for (k, &b) in msg.iter().take(3).enumerate() {
+                s[k] = b;
+            }
+            s[3] = msg.len().min(3) as u8;
+            bus.poke_bytes(slot, &s);
+            bus.io.usb_in.pop_front();
+            let sp = self.cpu.a[7];
+            let bus = &mut self.cpu.bus;
+            bus.poke32(sp - 4, slot);
+            bus.poke32(sp - 8, q);
+            bus.poke32(sp - 12, pc);
+            self.cpu.a[7] = sp - 12;
+            self.cpu.pc = p.queue_send;
+            self.usb_call = Some((sp, 2));
+            return true;
+        }
+        let need = msg.len().div_ceil(152);
+        let mut free = Vec::new();
+        'scan: for w in 0..32u32 {
+            let bits = bus.peek32(map + 4 * w);
+            for n in 0..32u32 {
+                if bits >> n & 1 == 0 {
+                    free.push(32 * w + n);
+                    if free.len() == need {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        if free.len() < need {
+            return false; // the pool is busy; try again later
+        }
+        for (k, (&idx, chunk)) in free.iter().zip(msg.chunks(152)).enumerate() {
+            let w = map + 4 * (idx / 32);
+            let bits = bus.peek32(w);
+            bus.poke32(w, bits | 1 << (idx % 32));
+            let blk = pool + 160 * idx;
+            let next = free.get(k + 1).map_or(0, |&i| pool + 160 * i);
+            bus.poke32(blk, chunk.len() as u32);
+            bus.poke32(blk + 4, next);
+            bus.poke_bytes(blk + 8, chunk);
+        }
+        bus.io.usb_in.pop_front();
+        // The producer's message credit (`0x400813d4` pends on it before it
+        // allocates; the MIDI task's free posts it back).
+        let credit = bus.peek32(p.midi_pool_sem);
+        bus.poke32(p.midi_pool_sem, credit - 1);
+        let sp = self.cpu.a[7];
+        let bus = &mut self.cpu.bus;
+        bus.poke32(sp - 4, pool + 160 * free[0]);
+        bus.poke32(sp - 8, q);
+        bus.poke32(sp - 12, pc);
+        self.cpu.a[7] = sp - 12;
+        self.cpu.pc = p.queue_send;
+        self.usb_call = Some((sp, 2));
+        true
+    }
+
+    /// Handle a hooked PC. -> true to let the instruction there execute.
+    fn on_hook(&mut self, pc: u32, until: u64) -> bool {
+        let p = &self.prof;
+        if self.usb_midi_real && pc == p.sem_pend {
+            // sem_pend(sem): count at +0; it blocks (trap #0, a task switch)
+            // when the count is <= 0. The caller's mask is SR's here, before
+            // sem_pend raises it to 7.
+            let level = ((self.cpu.sr >> 8) & 7) as u8;
+            let sp = self.cpu.a[7];
+            let (ret, sem) = (self.cpu.bus.peek32(sp), self.cpu.bus.peek32(sp + 4));
+            if level > 0 && (self.cpu.bus.peek32(sem) as i32) <= 0 {
+                let now = self.now();
+                let e = self.isr_pends.entry((level, sem, ret)).or_insert((now, 0));
+                e.1 += 1;
+                if e.1 == 1 {
+                    self.note(format!("BLOCKING sem_pend(0x{sem:08x}) at interrupt level {level}, return 0x{ret:08x}"));
+                }
+            }
+            return true;
+        }
+        if pc == p.flash_read {
+            // flash_read(offset, length, dest) -> 0, served from the image.
+            let sp = self.cpu.a[7];
+            let bus = &mut self.cpu.bus;
+            let ret = bus.peek32(sp);
+            let off = bus.peek32(sp + 4) as usize;
+            let len = bus.peek32(sp + 8) as usize;
+            let dest = bus.peek32(sp + 12);
+            if len != 0 && dest != 0 && off + len <= self.flash.len() {
+                let data = self.flash[off..off + len].to_vec();
+                self.cpu.bus.poke_bytes(dest, &data);
+            }
+            self.stats.flash_reads += 1;
+            self.cpu.d[0] = 0;
+            self.cpu.a[7] = sp + 4;
+            self.cpu.pc = ret;
+            return false;
+        }
+        if p.idle_spins.contains(&pc) {
+            self.stats.idle_hits += 1;
+            if self.feed_usb_midi(pc) {
+                return false;
+            }
+            if self.opts.fast_idle {
+                // Nothing can change until an interrupt: skip to the next
+                // event (or the end of the budget), as a WFI would.
+                let io = &mut self.cpu.bus.io;
+                let target = io.deadline.min(until);
+                if target > io.now {
+                    self.stats.idle_skipped += target - io.now;
+                    io.now = target;
+                }
+            }
+            return true;
+        }
+        if pc == p.task_create {
+            let sp = self.cpu.a[7];
+            let b = &self.cpu.bus;
+            let (tcb, entry, prio) = (b.peek32(sp + 4), b.peek32(sp + 8), b.peek32(sp + 12));
+            self.stats.tasks.push((entry, prio, tcb));
+            self.note(format!("task_create entry=0x{entry:08x} prio={prio} tcb=0x{tcb:08x}"));
+            return true;
+        }
+        if pc == p.intro_done {
+            if self.stats.intro_done_at.is_none() {
+                self.stats.intro_done_at = Some(self.now());
+                self.note("intro done".into());
+            }
+            return true;
+        }
+        if pc == p.panel_diff {
+            let ptr = self.cpu.bus.peek32(p.fb_front);
+            if (0x4000_0000..0x5000_0000).contains(&ptr) {
+                // 8 pages x 128 columns; the MKI's LCD 4 pages.
+                let len = if p.device.mk1() { 512 } else { 1024 };
+                self.frame = Some(self.cpu.bus.peek_bytes(ptr, len));
+                self.frame_seq += 1;
+                self.stats.frames += 1;
+            }
+            return true;
+        }
+        if pc == p.abort_loop {
+            if self.stats.abort_at.is_none() {
+                self.stats.abort_at = Some((self.now(), self.cpu.bus.peek32(self.cpu.a[7])));
+                let caller = self.cpu.bus.peek32(self.cpu.a[7]);
+                self.note(format!("ABORT: reached the abort loop, return address 0x{caller:08x}"));
+            }
+            return true;
+        }
+        if pc == p.mainloop {
+            self.stats.mainloop += 1;
+            return true;
+        }
+        if pc == p.voice_output_mix {
+            // The Overbridge input: this block's 32 frames into the half of the
+            // double buffer the mix reads now (the firmware prepared it, with
+            // zeros when no host sends).
+            if let Some(l) = self.ob_link.as_mut() {
+                l.poll(&mut self.ob_in);
+            }
+            let usb_streaming = self.usb_host.as_ref().is_some_and(|h| h.streaming());
+            // Without a USB host streaming, the stand-in writes the link's frames
+            // straight into the firmware's input ring.
+            if !usb_streaming && !self.ob_in.is_empty() {
+                let half = self.cpu.bus.peek32(p.ob_in_index) & 1;
+                let base = p.ob_in_buf + half * 1536;
+                for f in 0..32u32 {
+                    let fr = self.ob_in.pop_front().unwrap_or([0; crate::oblink::CHANNELS]);
+                    for (c, &v) in fr.iter().enumerate() {
+                        self.cpu.bus.poke32(base + 48 * f + 4 * c as u32, v as u32);
+                    }
+                }
+            }
+            if self.ob_link.is_some() {
+                self.ext_report();
+            }
+            return true;
+        }
+        if pc == p.usb_audio_copy {
+            if self.cpu.bus.io.usb_audio_capture {
+                if let Some(dst) = self.usb_audio_last {
+                    let words: Vec<i32> = (0..32 * 12).map(|k| self.cpu.bus.peek32(dst + 4 * k) as i32 >> 8).collect();
+                    self.cpu.bus.io.usb_audio.extend(words);
+                }
+                self.usb_audio_last = Some(self.cpu.bus.peek32(self.cpu.a[7] + 8));
+            }
+            return true;
+        }
+        if pc == p.usb_midi_send || pc == p.usb_midi_send_short {
+            // The firmware's USB MIDI output, `(len, ptr)`: taken here, not
+            // handed to the unmodelled USB controller.
+            let sp = self.cpu.a[7];
+            let bus = &self.cpu.bus;
+            let (len, ptr) = (bus.peek32(sp + 4), bus.peek32(sp + 8));
+            let bytes = bus.peek_bytes(ptr, len.min(4096) as usize);
+            self.cpu.bus.io.usb_midi_out.extend(bytes);
+            self.cpu.pc = self.cpu.bus.peek32(sp);
+            self.cpu.a[7] = sp + 4;
+            return false;
+        }
+        if pc == p.sysex_send {
+            // A SysEx reply for USB (interface 2 or 4) goes out of the emulated
+            // MIDI port instead of the unmodelled USB controller.
+            let sp = self.cpu.a[7];
+            let bus = &self.cpu.bus;
+            let iface = bus.peek32(sp + 16);
+            if iface == 2 || iface == 4 {
+                let (buf, len) = (bus.peek32(sp + 4), bus.peek32(sp + 8));
+                let bytes = bus.peek_bytes(buf, len.min(1 << 20) as usize);
+                self.cpu.bus.io.midi_out.extend(bytes.iter().copied());
+                self.cpu.bus.io.usb_midi_out.extend(bytes);
+                self.cpu.d[0] = 1;
+                self.cpu.pc = self.cpu.bus.peek32(sp);
+                self.cpu.a[7] = sp + 4;
+                return false;
+            }
+            return true;
+        }
+        true
+    }
+
+    /// Run until the clock reaches `until` or something stops the machine.
+    /// Run the simulated USB host for the microframes that are due.
+    fn usb_microframes(&mut self) {
+        let Some(h) = self.usb_host.as_mut() else { return };
+        let io = &mut self.cpu.bus.io;
+        if io.usb_uframe.is_none() {
+            io.usb_uframe = Some(io.now);
+            io.deadline = io.deadline.min(io.now);
+        }
+        let n = std::mem::take(&mut io.usb_uframes_due);
+        h.midi_in = self.usb_midi_real;
+        for _ in 0..n {
+            h.microframe(&mut self.cpu.bus, &mut self.ob_in);
+        }
+        if !h.midi_out.is_empty() {
+            self.cpu.bus.io.usb_midi_out.extend(h.midi_out.drain(..));
+        }
+        // The Rytm's outputs go to the link's host; without one they are dropped.
+        if let Some(l) = self.ob_link.as_ref() {
+            if h.from_rytm.len() >= 32 {
+                let v: Vec<crate::oblink::Frame> = h.from_rytm.drain(..).collect();
+                l.send_rytm(&v);
+            }
+        }
+    }
+
+    pub fn run_until(&mut self, until: u64) -> Stop {
+        self.usb_microframes();
+        self.run_nudges();
+        self.cpu.bus.io.service();
+        loop {
+            match self.cpu.run(until) {
+                Stop::Budget => return Stop::Budget,
+                Stop::Event => {
+                    self.cpu.bus.io.service();
+                    self.cpu.bus.dma_service();
+                    self.usb_microframes();
+                    if !self.nudges.is_empty() {
+                        self.run_nudges();
+                    }
+                }
+                Stop::Stopped => {
+                    // STOP: sleep until the next event.
+                    let io = &mut self.cpu.bus.io;
+                    let target = io.deadline.min(until);
+                    if target > io.now {
+                        io.now = target;
+                    }
+                    if io.now >= until {
+                        return Stop::Budget;
+                    }
+                    self.cpu.bus.io.service();
+                    self.cpu.bus.dma_service();
+                    self.usb_microframes();
+                    // An interrupt at or below the mask cannot wake it; the
+                    // CPU takes any that can in `run`.
+                    if self.cpu.bus.io.deadline == u64::MAX && self.cpu.bus.io.irq_level <= self.cpu.ipl() {
+                        return Stop::Stopped;
+                    }
+                }
+                Stop::Hook(pc) => {
+                    if self.breakpoints.contains(&pc) {
+                        self.breakpoints.retain(|&b| b != pc);
+                        self.cpu.skip_hook = Some(pc);
+                        return Stop::Hook(pc);
+                    }
+                    for c in self.counters.iter_mut() {
+                        if c.0 == pc {
+                            c.1 += 1;
+                        }
+                    }
+                    if self.on_hook(pc, until) {
+                        self.cpu.skip_hook = Some(pc);
+                    }
+                }
+                f @ Stop::Fault(..) => return f,
+            }
+        }
+    }
+
+    /// Every task seen created: (entry, prio, tcb, parked pc, stack words).
+    pub fn task_report(&self) -> String {
+        let b = &self.cpu.bus;
+        let cur = b.peek32(self.prof.current_tcb);
+        let mut out = String::new();
+        for &(entry, prio, tcb) in &self.stats.tasks {
+            let sp = b.peek32(tcb + 0x48);
+            let pc = b.peek32(sp + 4);
+            let words: Vec<String> = (2..14).map(|i| format!("{:08x}", b.peek32(sp + 4 * i))).collect();
+            out += &format!(
+                "  prio {prio:>2} entry {entry:08x} tcb {tcb:08x}{} sp {sp:08x} pc {pc:08x} | {}\n",
+                if tcb == cur { " (running)" } else { "" },
+                words.join(" ")
+            );
+        }
+        out
+    }
+
+    /// Attach a +Drive card image (read now; `flush_card` writes it back).
+    /// A missing or empty image becomes a fresh card with the sample area
+    /// formatted, as a factory unit's is (the OS never creates it itself).
+    /// -> whether the card is fresh.
+    pub fn attach_card(&mut self, path: &std::path::Path) -> std::io::Result<bool> {
+        let mut card = crate::esdhc::Card::open(path)?;
+        let fresh = card.sectors.is_empty();
+        if fresh {
+            crate::ekfs::format(&mut card);
+        }
+        // An MKI OS meeting a +Drive without its header at byte 0 (A4 MKI
+        // 0xBEEFBABA, 0x400708ec; Rytm MKI 0xBEEFBACE, 0x40091128) runs its
+        // factory-reset sequence with "keep the working project" set (A4 MKI
+        // 0x40096938). On the A4 MKI that copies CS1's project into project
+        // slot 1 and depacks the CS1-sized default image (0x401bb5a0,
+        // 2096892 B) into slot 2, 35876 B past the slots' end (0x40839774)
+        // over live statics, and the OS dies in its abort loop: the image's own
+        // code, so a unit would do the same [measured]; units leave the
+        // factory with an initialised +Drive. The bootstrap menu's FACTORY
+        // RESET with keys 0x81 and 0x82 held passes boot flags 0x12 (both MKI
+        // blobs), and bit 4 skips the copy, so the default lands in slot 1
+        // [measured]. A blank card boots that way here, as if the user had run
+        // that reset (the Rytm MKI then also lays out its own ekFS, version 1
+        // at sector 0x180000); DTEMU_BOOT_FLAGS overrides.
+        let magic = match self.prof.device {
+            Device::A4Mk1 => Some(0xBEEF_BABA),
+            Device::RytmMk1 => Some(0xBEEF_BACE),
+            _ => None,
+        };
+        let header = card.sectors.get(&0).map(|d| u32::from_be_bytes([d[0], d[1], d[2], d[3]]));
+        if magic.is_some() && self.now() == 0 && header != magic && std::env::var_os("DTEMU_BOOT_FLAGS").is_none() {
+            let f = self.cpu.bus.peek32(INITIAL_SP - 4);
+            self.cpu.bus.poke32(INITIAL_SP - 4, f | 0x12);
+            self.note("blank +Drive: boot flags 0x12 (the bootstrap's FACTORY RESET)".into());
+        }
+        self.cpu.bus.io.esdhc.card = card;
+        Ok(fresh)
+    }
+
+    pub fn flush_card(&mut self) -> std::io::Result<()> {
+        self.cpu.bus.io.esdhc.card.flush()
+    }
+
+    /// Switch the power off, as pulling the Rytm's supply does: the power
+    /// sense (PPDSDR_C bit 2) falls and EPORT flags IRQ2's edge (level 7).
+    /// The firmware's handler then runs on the supercap and writes the working
+    /// state (the 2 MB at 0x405c8e10 on OS 1.73, 'COKI' header) to one of two
+    /// raw eMMC slots, sectors 0x7a000 and 0x7c000, and invalidates the other;
+    /// the next boot loads the valid one (docs/RYTM-PORT.md, "Power-off and
+    /// the working state"). Runs until the handler has put the card in
+    /// pre-idle (CMD0 0xF0F0F0F0), plus 2M to let it return, or for `limit`
+    /// instructions. The machine is then off: nothing after it is meaningful
+    /// except the card.
+    pub fn power_off(&mut self, limit: u64) -> PowerOff {
+        let t0 = self.now();
+        let writes0 = self.cpu.bus.io.esdhc.card.writes;
+        let pre0 = self.cpu.bus.io.esdhc.pre_idle;
+        let armed = self.cpu.bus.peek8(0xFC09_0003) & 0x04 != 0; // EPIER: IRQ2 enabled
+        let io = &mut self.cpu.bus.io;
+        io.power_lost = true;
+        io.epfr |= 0x04; // the flag sets whether or not EPIER lets it interrupt
+        io.update_irq();
+        io.deadline = io.now;
+        let mut stop = Stop::Budget;
+        let mut done = false;
+        while self.now() < t0 + limit {
+            let to = (self.now() + 1_000_000).min(t0 + limit);
+            stop = self.run_until(to);
+            if matches!(stop, Stop::Fault(..) | Stop::Hook(_) | Stop::Stopped) {
+                break;
+            }
+            if self.cpu.bus.io.esdhc.pre_idle > pre0 {
+                done = true;
+                let to = self.now() + 2_000_000;
+                stop = self.run_until(to);
+                break;
+            }
+        }
+        let card = &self.cpu.bus.io.esdhc.card;
+        let slots = [0x7a000u32, 0x7c000].map(|s| card.sectors.get(&s).is_some_and(|d| &d[..4] == b"COKI"));
+        PowerOff { armed, done, instructions: self.now() - t0, sectors_written: card.writes - writes0, slots, stop }
+    }
+
+    /// The firmware's own "+Drive mounted" flag.
+    pub fn drive_mounted(&self) -> bool {
+        self.prof.mounted != 0 && self.cpu.bus.peek32(self.prof.mounted) == 1
+    }
+
+    /// Press or release a key by control code (see `panel::key_name`).
+    pub fn key(&mut self, code: u8, down: bool) {
+        if let Some(msg) = self.cpu.bus.io.panel.key(code, down) {
+            self.panel_send(&msg);
+        }
+    }
+
+    /// A key from the Digitakt-shaped panel (window and upstream control codes).
+    /// On a Rytm the button's label is pressed by name instead, so the window is
+    /// usable before it has a Rytm panel: 1..16 -> T1..T16, knob pushes A..H ->
+    /// PUSH_A..PUSH_H, LEVEL/DATA -> PUSH_LEVEL, SAMPLE -> SAMPLER; PTN and BANK
+    /// have no single Rytm key and do nothing.
+    pub fn key_compat(&mut self, code: u8, down: bool) {
+        if self.is_a4() || self.is_mk1() {
+            if let Some(name) = crate::panel::key_name(code) {
+                self.key_named(name, down);
+            }
+            return;
+        }
+        if !self.is_rytm() {
+            return self.key(code, down);
+        }
+        if code >= crate::panel::RYTM_CODE_BASE {
+            // The window's Rytm panel: the code names a RYTM_KEYS entry.
+            if let Some(name) = crate::panel::key_name(code) {
+                self.key_named(name, down);
+            }
+            return;
+        }
+        let Some(label) = crate::panel::key_name(code) else { return };
+        let name = match label {
+            "SAMPLE" => "SAMPLER".to_string(),
+            "LEVEL/DATA" => "PUSH_LEVEL".to_string(),
+            l if l.len() == 1 && l.as_bytes()[0].is_ascii_uppercase() => format!("PUSH_{l}"),
+            l if l.parse::<u8>().is_ok() => format!("T{l}"),
+            l => l.to_string(),
+        };
+        self.key_named(&name, down);
+    }
+
+    /// Words the codec link carries per audio frame (SSI STCCR: Digitakt 2,
+    /// Analog Rytm MKII 16) [measured].
+    pub fn ssi_frame_words(&self) -> usize {
+        self.cpu.bus.io.ssi_frame_words() as usize
+    }
+
+    /// Whether this machine runs an Analog Rytm MKII OS.
+    pub fn is_rytm(&self) -> bool {
+        self.prof.device == Device::RytmMk2
+    }
+
+    /// Whether this machine runs an Analog Four MKII OS.
+    pub fn is_a4(&self) -> bool {
+        self.prof.device == Device::A4Mk2
+    }
+
+    /// Whether this machine is an MKI unit (Analog Rytm MKI, Analog Four MKI).
+    pub fn is_mk1(&self) -> bool {
+        self.prof.device.mk1()
+    }
+
+    /// Press or release a key by name (Rytm: `panel::RYTM_KEYS`; Digitakt:
+    /// `panel::key_name`). -> false if this machine has no such key.
+    pub fn key_named(&mut self, name: &str, down: bool) -> bool {
+        // A Rytm pad is a pressure sensor: besides its button bit, the panel
+        // sends `0xAp force` when it is struck and `0xBp 0` when released
+        // (parser 0x40082084: type A posts a pad-hit event with a velocity
+        // curve above the threshold at 0x40285624, type B a release) [measured:
+        // `A0 7F` alone triggers BD]. Pad p = the pad's place in RYTM_PADS.
+        // The Rytm MKI's parser (0x400806c2) takes the same `9p`, `Ap`, `Bp`
+        // messages through its pad map (*0x40249dd0, identity) [measured].
+        if self.is_rytm() || self.prof.device == Device::RytmMk1 {
+            if let Some(p) = RYTM_PADS.iter().position(|&n| n.eq_ignore_ascii_case(name)) {
+                let msg = if down { [0xA0 | p as u8, self.pad_force] } else { [0xB0 | p as u8, 0] };
+                self.panel_send(&msg);
+            }
+        }
+        let msg = if self.is_rytm() || self.is_a4() || self.is_mk1() {
+            crate::panel::rytm_key(name).and_then(|(ch, bit)| self.cpu.bus.io.panel.wire(ch, bit, down))
+        } else {
+            (0..=47u8)
+                .find(|&c| crate::panel::key_name(c).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+                .and_then(|c| self.cpu.bus.io.panel.key(c, down))
+        };
+        match msg {
+            Some(m) => {
+                self.panel_send(&m);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Write 24-bit samples (interleaved, `chans` channels at 48 kHz) as a
+    /// 16-bit WAV.
+    pub fn write_wav16(path: &std::path::Path, samples: &[i32], chans: u16) -> std::io::Result<()> {
+        let data: Vec<u8> = samples.iter().flat_map(|&s| ((s >> 8) as i16).to_le_bytes()).collect();
+        let mut f = Vec::with_capacity(44 + data.len());
+        f.extend_from_slice(b"RIFF");
+        f.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        f.extend_from_slice(b"WAVEfmt ");
+        f.extend_from_slice(&16u32.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&chans.to_le_bytes());
+        f.extend_from_slice(&48_000u32.to_le_bytes());
+        f.extend_from_slice(&(48_000 * 2 * chans as u32).to_le_bytes());
+        f.extend_from_slice(&(2 * chans).to_le_bytes());
+        f.extend_from_slice(&16u16.to_le_bytes());
+        f.extend_from_slice(b"data");
+        f.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        f.extend_from_slice(&data);
+        std::fs::write(path, f)
+    }
+
+    /// MIDI arriving on the USB MIDI port (the window's "rytm-emu usb in").
+    pub fn usb_midi_send(&mut self, bytes: &[u8]) {
+        if self.prof.usb_midi_queue != 0 {
+            self.cpu.bus.io.usb_midi_send(bytes);
+        }
+    }
+
+    /// The Rytm pad (place in `RYTM_PADS`) a window key code names, if any.
+    pub fn pad_of_code(&self, code: u8) -> Option<usize> {
+        if !(self.is_rytm() || self.prof.device == Device::RytmMk1) || code < crate::panel::RYTM_CODE_BASE {
+            return None;
+        }
+        let name = crate::panel::key_name(code)?;
+        RYTM_PADS.iter().position(|&n| n.eq_ignore_ascii_case(name))
+    }
+
+    /// A pad's pressure while it is held: the panel streams `0x9p value`, which
+    /// the OS posts as a pad-pressure event with the raw value (parser
+    /// 0x40082276, event type 2) [measured]; the strike (`0xAp`) carries the
+    /// velocity.
+    pub fn pad_pressure(&mut self, pad: usize, value: u8) {
+        self.panel_send(&[0x90 | pad as u8, value]);
+    }
+
+    /// Turn an encoder (0..8: A..H, then LEVEL/DATA) by `delta` counts.
+    /// One value step on an encoder, as a person's single detent would make it
+    /// (the window's arrow keys). The Rytm takes turns once per UI frame, spends
+    /// the first two frames of a turn waking the knob (its value popup), then
+    /// moves about one step per 4 counts and accelerates on faster turning
+    /// [measured, OS 1.73, frames 10M apart: 8, 8, 4 counts -> +1; 8, 8, 4, 4 ->
+    /// +2; 8, 8, 8 -> +2; turns under 8 do not wake it (1, 1, 4 -> 0); bursts 1M
+    /// apart mostly lost; a knob stays awake 2..4 s after its last turn]. So:
+    /// unless this knob was nudged within 1.5 s, two 8-count turns a frame apart
+    /// to wake it, then 4 counts. With `func`, FUNC is held across the burst
+    /// (what FUNC + a turn does on the hardware).
+    pub fn nudge(&mut self, enc: u8, dir: i8, func: bool) {
+        self.nudge_steps(enc, dir, 1, func);
+    }
+
+    /// `steps` value steps in one go: the wake (if needed), then one 4-count turn
+    /// a frame for each step (4 counts a frame stay below the acceleration).
+    pub fn nudge_steps(&mut self, enc: u8, dir: i8, steps: u8, func: bool) {
+        const FRAME: u64 = 10_000_000;
+        let now = self.now();
+        let e = (enc as usize) & 15;
+        let tail = self.nudges.back().map(|n| n.0 + FRAME).unwrap_or(now).max(now);
+        // The A4 MKI takes encoder counts one to one, with no wake-up turn: one
+        // count of +1 is one step [measured, OS 1.56: five turns of 1, 2, 4 and 8
+        // counts 50 ms apart move OSC1 TUN by 5, 10, 20 and 40].
+        let awake = self.is_mk1() || (self.nudge_last[e] != 0 && self.nudge_last[e] + 30 * FRAME > tail);
+        let count = if self.is_mk1() { 1 } else { 4 };
+        let mut t = tail;
+        if func {
+            self.nudges.push_back((t, Nudge::Key("FUNC", true)));
+            t += FRAME / 2;
+        }
+        if !awake {
+            for _ in 0..2 {
+                self.nudges.push_back((t, Nudge::Turn(enc, dir.signum() * 8)));
+                t += FRAME;
+            }
+        }
+        for k in 0..steps.max(1) {
+            if k > 0 {
+                t += FRAME;
+            }
+            self.nudges.push_back((t, Nudge::Turn(enc, dir.signum() * count)));
+        }
+        self.nudge_last[e] = t;
+        if func {
+            self.nudges.push_back((t + FRAME / 2, Nudge::Key("FUNC", false)));
+        }
+    }
+
+    /// Send the nudges that are due.
+    pub fn run_nudges(&mut self) {
+        let now = self.now();
+        while let Some(&(at, n)) = self.nudges.front() {
+            if at > now {
+                break;
+            }
+            self.nudges.pop_front();
+            match n {
+                Nudge::Turn(e, d) => self.turn(e, d),
+                Nudge::Key(name, down) => {
+                    self.key_named(name, down);
+                }
+            }
+        }
+    }
+
+    pub fn turn(&mut self, enc: u8, delta: i8) {
+        // The A4 MKI's panel numbers its encoders B C D E G H I J A F LEVEL
+        // (the OS's map 0x401ebdf8: wire channel -> knob) [measured]; `enc`
+        // is the knob, A..J = 0..9, LEVEL 10.
+        // The Rytm MKI's: B C D LEVEL F G H A E (0x40249fb8) [measured]; `enc`
+        // is A..H = 0..7, LEVEL 8.
+        const A4MK1_WIRE: [u8; 11] = [8, 0, 1, 2, 3, 9, 4, 5, 6, 7, 10];
+        const RYTMMK1_WIRE: [u8; 9] = [7, 0, 1, 2, 8, 4, 5, 6, 3];
+        let enc = match self.prof.device {
+            Device::A4Mk1 => A4MK1_WIRE.get(enc as usize).copied().unwrap_or(enc),
+            Device::RytmMk1 => RYTMMK1_WIRE.get(enc as usize).copied().unwrap_or(enc),
+            _ => enc,
+        };
+        let msg = crate::panel::PanelMcu::encoder(enc, delta);
+        self.panel_send(&msg);
+    }
+
+    /// Encoder counts per value step: the Digitakt's panel sends 1 per detent;
+    /// the Rytm's sends about 8 - five turns of -2 left TRK LEVEL at 100, of -4
+    /// moved it 1, of -8 moved it 4 (the first turn only shows the value)
+    /// [measured, OS 1.73]; the A4 MKI takes one count per step (`nudge_steps`).
+    pub fn counts_per_detent(&self) -> i8 {
+        if self.is_rytm() || self.is_a4() { 8 } else { 1 }
+    }
+
+    /// Turn an encoder by `detents` steps, as a user's knob turn (the window).
+    /// `turn` takes raw panel counts.
+    pub fn turn_detents(&mut self, enc: u8, detents: i8) {
+        let d = (detents as i32 * self.counts_per_detent() as i32).clamp(-127, 127) as i8;
+        self.turn(enc, d);
+    }
+
+    pub fn release_all_keys(&mut self) {
+        let msg = self.cpu.bus.io.panel.release_all();
+        if !msg.is_empty() {
+            self.panel_send(&msg);
+        }
+    }
+
+    /// Bytes from the panel MCU to the ColdFire, on UART8.
+    pub fn panel_send(&mut self, bytes: &[u8]) {
+        self.cpu.bus.io.uart_receive(8, bytes);
+        self.cpu.bus.run_dma();
+    }
+
+    /// Panel frame as rows of pixels (true = lit), y = 0 at the top. A
+    /// 1024-byte frame is the MKII's 128x64 OLED; a 512-byte one the MKI's
+    /// 4-page LCD framebuffer (`frame_pixels_mk1`).
+    pub fn frame_pixels(buf: &[u8]) -> Vec<Vec<bool>> {
+        if buf.len() == 512 {
+            return Self::frame_pixels_mk1(buf);
+        }
+        // SSD1306-style pages, page 0 at the bottom (a remapped COM scan):
+        // byte = page + 8 * column, bit n = row 8 * (7 - page) + n.
+        let mut rows = vec![vec![false; 128]; 64];
+        for (y, row) in rows.iter_mut().enumerate() {
+            for (x, px) in row.iter_mut().enumerate() {
+                let b = buf[(7 - y / 8) + 8 * x];
+                *px = (b >> (y % 8)) & 1 != 0;
+            }
+        }
+        rows
+    }
+
+    /// The MKI's framebuffer as 122x32 pixels: byte = page + 4 * column
+    /// (`0x4007333a` walks it so), bit n = row 8 * (3 - page) + n: page 0 is the
+    /// bottom band, as on the MKII's OLED [measured: the main screen reads
+    /// upright only so].
+    pub fn frame_pixels_mk1(buf: &[u8]) -> Vec<Vec<bool>> {
+        let mut rows = vec![vec![false; MK1_LCD_W]; MK1_LCD_H];
+        for (y, row) in rows.iter_mut().enumerate() {
+            for (x, px) in row.iter_mut().enumerate() {
+                let b = buf[(3 - y / 8) + 4 * x];
+                *px = (b >> (y % 8)) & 1 != 0;
+            }
+        }
+        rows
+    }
+
+    /// The display as the panel MCU holds it (its tiles, `PanelMcu::oled`), as
+    /// rows of pixels: the MKII's 128x64 OLED, or the MKI's 122x32 LCD, whose
+    /// 4 pages arrive as tiles `0x10|page` (stored at page + 8 * column) with
+    /// page 0 the bottom band, as the framebuffer's [measured].
+    pub fn panel_pixels(&self) -> Vec<Vec<bool>> {
+        let oled = &self.cpu.bus.io.panel.oled;
+        if self.is_mk1() {
+            let mut rows = vec![vec![false; MK1_LCD_W]; MK1_LCD_H];
+            for (y, row) in rows.iter_mut().enumerate() {
+                for (x, px) in row.iter_mut().enumerate() {
+                    *px = (oled[(3 - y / 8) + 8 * x] >> (y % 8)) & 1 != 0;
+                }
+            }
+            return rows;
+        }
+        Self::frame_pixels(oled)
+    }
+
+    /// Rows of pixels as text, two rows per line.
+    pub fn pixels_ascii(rows: &[Vec<bool>]) -> String {
+        let mut s = String::new();
+        for y in (0..rows.len()).step_by(2) {
+            for (&a, &b) in rows[y].iter().zip(&rows[y + 1]) {
+                s.push(match (a, b) {
+                    (true, true) => '█',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    _ => ' ',
+                });
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    pub fn frame_ascii(buf: &[u8]) -> String {
+        let rows = Self::frame_pixels(buf);
+        let mut s = String::new();
+        // Two pixel rows per text line.
+        for y in (0..rows.len()).step_by(2) {
+            for (&a, &b) in rows[y].iter().zip(&rows[y + 1]) {
+                s.push(match (a, b) {
+                    (true, true) => '█',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    _ => ' ',
+                });
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    pub fn lit(buf: &[u8]) -> usize {
+        buf.iter().map(|b| b.count_ones() as usize).sum()
+    }
+}

@@ -1,0 +1,121 @@
+# rytm-emu - an emulator for the Analog Rytm and Analog Four, MKI and MKII (work in progress)
+
+| Device | OS | Firmware file (yours; not included) | Start |
+|---|---|---|---|
+| Analog Rytm MKII | 1.73 | `fw/Analog-Rytm_MKII_OS1.73.syx` | `./target/release/rytm --card rytm.img` |
+| Analog Four MKII | 1.56 | `fw/Analog-Four_MKII_OS1.56.syx` | `./target/release/a4` (card `a4.img`) |
+| Analog Rytm MKI | 1.74 | `fw/Analog-Rytm_OS1.74.syx` | `./target/release/rytm fw/Analog-Rytm_OS1.74.syx --card rytmmk1.img` |
+| Analog Four MKI / Analog Keys | 1.56 | `fw/Analog-Four_Analog-Keys_OS1.56.syx` | `./target/release/rytm fw/Analog-Four_Analog-Keys_OS1.56.syx --card a4mk1.img` |
+| Digitakt MK1 (upstream) | 1.53 | `fw/Digitakt_OS1.53.syx` | `./target/release/rytm fw/Digitakt_OS1.53.syx` |
+
+The emulator picks the device from the firmware file. Make a card image once per device with
+`./target/release/dtcard NAME.img format` (MKI and MKII cards are not interchangeable).
+In the window: click keys, drag or scroll a knob to turn it, click a knob to push it,
+ctrl-drag to push and turn.
+
+Goal: run the Analog Rytm MKII's own OS, stock or patched by
+[`rytm-mods`](../rytm-mods), on emulated hardware, to check that a firmware boots
+and to see and drive its UI before anything is flashed. The analog voice circuits
+are stubbed: the CPU side runs for real, and what it sends to the voice hardware is
+accepted and can be inspected.
+
+This is a fork of [rouletrro](https://github.com/Ondrysak/rouletrro) (a Digitakt
+MK1 emulator in Rust, MIT per its `Cargo.toml`), whose upstream README is in
+[`docs/UPSTREAM-README.md`](docs/UPSTREAM-README.md). The Digitakt MK1 and the Rytm
+MKII appear to share a CPU (ColdFire V4e, MCF5441x family), a memory map, an OS
+framework and a container format, so most of that work carries over. See
+[`docs/RYTM-PORT.md`](docs/RYTM-PORT.md) for the evidence and the plan.
+
+**Status: Analog Rytm MKII OS 1.73 boots** to its main screen and answers keys;
+see [`docs/RYTM-PORT.md`](docs/RYTM-PORT.md). Digitakt OS 1.53 still runs as before.
+
+**Analog Four MKII OS 1.56 boots** to its main UI too (`fw/Analog-Four_MKII_OS1.56.syx`,
+card image e.g. `a4.img`); see [`docs/A4-PORT.md`](docs/A4-PORT.md). The emulator picks
+the Rytm, the A4 or the Digitakt by the firmware's hash. On an A4 the window draws the
+A4's panel (keys, the 25-key keyboard, encoders A..J, LEDs) and plays a model of its
+analog voices from the OS's voice frame, with the OS's own digital chorus, delay and
+reverb (the voices go to the codec input, the effects' return is mixed back), in tune
+to within about a cent (the frequency word is a 24.576 MHz NCO increment); its MIDI
+ports are `a4-emu in/out`. A synthetic calibration record keeps "MISSING CAL" away
+(`DTEMU_NO_CAL=1` for none).
+
+    ./target/release/a4      # the window: rytm with fw/Analog-Four_MKII_OS1.56.syx and --card a4.img as defaults
+    ./target/release/rytm fw/Analog-Four_MKII_OS1.56.syx --card a4.img   # the same
+    ./target/release/dtboot fw/Analog-Four_MKII_OS1.56.syx --instr 3G --card a4.img
+
+**Analog Four MKI OS 1.56 boots** to its main screen as well (`fw/Analog-Four_Analog-Keys_OS1.56.syx`,
+an ELE2 file; on a copy of an A4 MKII card such as `a4.img`, or on a blank card, which it
+initialises as the bootstrap's FACTORY RESET does); see
+[`docs/MK1-PORT.md`](docs/MK1-PORT.md). The window draws the A4 MKI's panel with its
+122x32 LCD and single-colour LEDs; keys, the 13-key keyboard and encoders A..J work, SSI
+audio and the A4 voice model run, and a synthetic calibration record sits in the
+emulated NOR flash. **Analog Rytm MKI OS 1.74 boots** to its main screen on a blank card
+(`fw/Analog-Rytm_OS1.74.syx`; it lays out its own +Drive, so not on a Rytm MKII card), after
+closing its start-up popups with NO; open items are in the same document.
+
+    ./target/release/rytm fw/Analog-Four_Analog-Keys_OS1.56.syx --card a4mk1.img   # a copy of an A4 card, or a new image
+    ./target/release/dtboot fw/Analog-Four_Analog-Keys_OS1.56.syx --instr 3G --card a4mk1.img
+    ./target/release/dtboot fw/Analog-Rytm_OS1.74.syx --instr 3700M --card rytmmk1.img --card-save \
+        --press NO@3000M --press NO@3300M     # a new image: initialised on the first boot
+
+Interactive, in a window (the firmware defaults to `fw/Analog-Rytm_MKII_OS1.73.syx`):
+
+    ./target/release/rytm --card rytm.img --snapshot rytm.snap
+
+Headless, for scripted tests (runs a fixed budget, prints the screen, exits):
+
+    ./target/release/dtboot fw/Analog-Rytm_MKII_OS1.73.syx --instr 4G --card rytm.img \
+        --press YES@3000M --press NO@3400M
+
+The window draws the loaded device's front panel. Mouse: click a key to press it,
+shift-click to latch it (again to release; Esc releases all). On a knob, drag
+(up or right is clockwise) or use the wheel to turn it; a click without a drag
+pushes it; ctrl-click (or cmd-click) holds its push, so ctrl-drag is push + turn.
+The arrow keys nudge the last knob touched (up/down 1, left/right 8). On a Rytm
+pad, clicking higher strikes harder. Every key is also reachable by name in
+`dtboot` (`panel::RYTM_KEYS` etc.).
+
+**No firmware is included or ever committed.** Bring your own `.syx` from Elektron;
+`*.syx`, extracted sections, snapshots and card images are git-ignored.
+
+**MIDI**: the window creates two virtual MIDI ports, `rytm-emu in` and `rytm-emu out`,
+wired to the emulated DIN MIDI port (`--no-midi` to skip). Connect a keyboard, a DAW
+or a SysEx tool to them as to a real Rytm's DIN MIDI. Headless tests can send MIDI
+with `dtboot --midi 9d0064@5G` or a SysEx file with `--midi-file dump.syx@5G`.
+`DTEMU_MIDI_LOG=FILE` logs every message through the ports. Elektron's own protocol
+(Transfer, elektroid), which the Rytm only serves over USB, is answered on these
+ports too: the emulator hands it to the OS as USB input and returns the replies
+(docs/RYTM-PORT.md, DIN MIDI). `tools/ekproto.py` encodes and decodes it for tests.
+
+**Overbridge input** (Rytm): `--ob-link [ADDR]` (window and dtboot) serves the
+host->Rytm Overbridge stream over TCP (default 127.0.0.1:7301; `src/oblink.rs`):
+a host such as rytm-teensy's `sim/obhost.py` sends 12 channels a frame and each
+voice's channel plays through that voice's analog chain while it is triggered.
+`dtboot --ob-in FILE.wav[:CH]` plays a WAV into channel CH (4..11 = BD SD RS/CP BT
+LT MT/HT CH/OH CY/CB).
+
+**Firmware**: stock Analog Rytm MKII OS 1.73 and 1.74, and modified images built from
+them (rytm-mods builds), recognised by keeping stock code where the emulator hooks.
+Use a separate `--snapshot` per firmware image; snapshots do not cross images.
+
+**More I/O** (window options): `--audio-in audio|ext|both` feeds the Mac's default
+input to AUDIO IN (sampling) or EXT IN (the main mix); virtual ports `rytm-emu usb
+in/out` are the USB MIDI port; `--midi-from NAME` connects an existing MIDI source
+(for example a real Rytm, as a controller) to the DIN input; `--usb-wav FILE`
+records the 12-channel USB audio stream (MAIN, the eight voices, AUDIO IN). Pads
+strike harder the higher you click them, and send pressure (aftertouch) while held
+as you move the pointer.
+
+**Samples**: with the emulator closed, `dtcard rytm.img add sound.wav` puts a WAV in
+the +Drive's `incoming` folder. In the emulator, GLOBAL > SAMPLES, open `incoming`,
+YES to tick the file, RIGHT, LOAD TO PROJ, YES. The sample is then in the project's
+slot list (FUNC+SMPL on a track) and plays from that track.
+
+## Build
+
+```sh
+cargo build --release
+```
+
+Upstream's window app `digitakt` is now `rytm`; the other tools (`dtboot`, `fwinfo`,
+`dtpeek`, ...) keep their names. See the upstream README for their options.

@@ -1,0 +1,16 @@
+/target
+# Elektron firmware and anything derived from it is not ours to publish.
+*.syx
+/sections/
+/snapshots/
+*.snap
+*.img
+
+# local tool state
+.omc/
+/fw/
+__pycache__/
+docs/*.pdf
+.DS_Store
+tools/dspbench/vendor/
+tools/dspbench/build/
