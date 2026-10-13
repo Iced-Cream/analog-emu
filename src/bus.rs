@@ -82,6 +82,8 @@ pub struct Bus {
     pub analog: Option<crate::analog::Analog>,
     /// The Analog Four MKII's voices, modelled from its voice frame (a4voice.rs).
     pub a4: Option<crate::a4voice::A4Voices>,
+    /// The Syntakt's analog voices and analog FX block (stanalog.rs).
+    pub st: Option<crate::stanalog::StAnalog>,
     /// The MKI units' parallel NOR flash at 0 and persistent memory at
     /// 0x20000000 (nor.rs); None on the MKII units and the Digitakt, whose
     /// flash is SPI.
@@ -156,6 +158,7 @@ impl Bus {
             io: Io::new(),
             analog: None,
             a4: None,
+            st: None,
             nor: None,
             codec: None,
             pc: 0,
@@ -388,6 +391,16 @@ impl Bus {
         if let Some(o) = self.ddr_off(addr) {
             return self.ddr[o];
         }
+        if let Some(d) = self.io.dsp.as_ref() {
+            if addr.wrapping_sub(crate::syntakt::MBOX_BASE) < crate::syntakt::MBOX_SIZE {
+                return d.read(addr, 1) as u8;
+            }
+        }
+        if let Some(d) = self.io.dsp_side.as_ref() {
+            if addr < crate::syntakt::MBOX_SIZE {
+                return d.read(addr, 1) as u8;
+            }
+        }
         if self.nor.is_some() && addr < crate::nor::NOR_SIZE {
             return crate::nor::byte(&self.sparse, addr);
         }
@@ -407,6 +420,16 @@ impl Bus {
             self.check_code(o as u32, 1);
             self.ddr[o] = v;
             return;
+        }
+        if let Some(d) = self.io.dsp.as_mut() {
+            if addr.wrapping_sub(crate::syntakt::MBOX_BASE) < crate::syntakt::MBOX_SIZE {
+                return d.write(addr, 1, v as u32);
+            }
+        }
+        if let Some(d) = self.io.dsp_side.as_mut() {
+            if addr < crate::syntakt::MBOX_SIZE {
+                return d.write(addr, 1, v as u32);
+            }
         }
         if (SRAM_BASE..0x8C00_0000).contains(&addr) {
             self.sram[(addr as usize) & (SRAM_SIZE - 1)] = v;
@@ -637,6 +660,17 @@ impl Bus {
 
     #[cold]
     fn read_slow(&mut self, a: u32, size: u32) -> u32 {
+        if let Some(d) = self.io.dsp.as_ref() {
+            if a.wrapping_sub(crate::syntakt::MBOX_BASE) < crate::syntakt::MBOX_SIZE {
+                return d.read(a, size);
+            }
+        }
+        // The Syntakt DSP's view of the mailbox: FlexBus CS0 at 0.
+        if let Some(d) = self.io.dsp_side.as_ref() {
+            if a < crate::syntakt::MBOX_SIZE {
+                return d.read(a, size);
+            }
+        }
         if let Some(n) = self.nor.as_ref() {
             if a < crate::nor::NOR_SIZE {
                 return n.read(&self.sparse, a, size);
@@ -690,6 +724,20 @@ impl Bus {
                 if self.io.ssi.voices.len() > 48_000 {
                     self.io.ssi.voices.pop_front();
                 }
+            } else if let Some(st) = self.st.as_mut() {
+                // The Syntakt (docs/SYNTAKT-PORT.md section 12): the frame from
+                // the buffer eDMA channel 15 sends, the DAC frame in.
+                let t = crate::stanalog::FRAME_CHAN * 32;
+                let sa = u32::from_be_bytes(self.io.edma.tcd[t..t + 4].try_into().unwrap());
+                let o = (crate::stanalog::StAnalog::frame_base(sa) as usize) & (SRAM_SIZE - 1);
+                let out = st.frame(&self.sram[o..o + 4 * crate::stanalog::FRAME_WORDS], sa, &self.io.ssi.tx_last);
+                self.io.ssi.input.extend(out.rx);
+                // The analog part of the speakers' mix; the DAC's main pair
+                // joins it (Machine::speaker_pair).
+                self.io.ssi.voices.push_back(out.mix);
+                if self.io.ssi.voices.len() > 48_000 {
+                    self.io.ssi.voices.pop_front();
+                }
             }
         }
         if crate::usbdev::is_usb(a) {
@@ -716,6 +764,16 @@ impl Bus {
 
     #[cold]
     fn write_slow(&mut self, a: u32, size: u32, v: u32) {
+        if let Some(d) = self.io.dsp.as_mut() {
+            if a.wrapping_sub(crate::syntakt::MBOX_BASE) < crate::syntakt::MBOX_SIZE {
+                return d.write(a, size, v);
+            }
+        }
+        if let Some(d) = self.io.dsp_side.as_mut() {
+            if a < crate::syntakt::MBOX_SIZE {
+                return d.write(a, size, v);
+            }
+        }
         if let Some(n) = self.nor.as_mut() {
             if a < crate::nor::NOR_SIZE {
                 return n.write(&mut self.sparse, a, size, v);

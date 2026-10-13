@@ -21,3 +21,5 @@ pub mod usbhost;
 pub mod a4voice;
 pub mod nor;
 pub mod mk1;
+pub mod syntakt;
+pub mod stanalog;

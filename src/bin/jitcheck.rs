@@ -62,13 +62,23 @@ mod erased {
     }
 }
 
-/// -> what differs between the two machines, if anything.
+/// -> what differs between the two machines, if anything: CPU1, and the
+/// Syntakt's second CPU when it runs.
 fn diff(a: &Machine, b: &Machine) -> Vec<String> {
-    let (x, y) = (&a.cpu, &b.cpu);
+    let mut out = diff_cpu(&a.cpu, &b.cpu, "");
+    match (a.dsp.as_ref(), b.dsp.as_ref()) {
+        (Some(x), Some(y)) => out.extend(diff_cpu(x, y, "dsp ")),
+        (None, None) => {}
+        _ => out.push("dsp: running on one machine only".into()),
+    }
+    out
+}
+
+fn diff_cpu(x: &dtemu::cpu::Cpu, y: &dtemu::cpu::Cpu, who: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut reg = |name: &str, p: u64, q: u64| {
         if p != q {
-            out.push(format!("{name}: interp {p:x} jit {q:x}"));
+            out.push(format!("{who}{name}: interp {p:x} jit {q:x}"));
         }
     };
     for i in 0..8 {
@@ -88,19 +98,19 @@ fn diff(a: &Machine, b: &Machine) -> Vec<String> {
     if x.bus.ddr != y.bus.ddr {
         let first = x.bus.ddr.iter().zip(&y.bus.ddr).position(|(p, q)| p != q).unwrap();
         out.push(format!(
-            "DDR differs, first at 0x{:08x}: interp {:02x} jit {:02x}",
+            "{who}DDR differs, first at 0x{:08x}: interp {:02x} jit {:02x}",
             0x4000_0000 + first,
             x.bus.ddr[first],
             y.bus.ddr[first]
         ));
     }
     if x.bus.sram != y.bus.sram {
-        out.push("SRAM differs".into());
+        out.push(format!("{who}SRAM differs"));
     }
     let (p, q) = (&x.bus.io, &y.bus.io);
     let mut part = |name: &str, s: Vec<u8>, t: Vec<u8>| {
         if s != t {
-            out.push(format!("peripheral state differs: {name}"));
+            out.push(format!("{who}peripheral state differs: {name}"));
         }
     };
     let ser = |v: &dyn erased::Ser| v.bytes();
@@ -115,8 +125,11 @@ fn diff(a: &Machine, b: &Machine) -> Vec<String> {
     part("ssi", ser(&p.ssi), ser(&q.ssi));
     part("irq", ser(&(p.irq_level, p.deadline, p.gpio_d4, p.pit_hold)), ser(&(q.irq_level, q.deadline, q.gpio_d4, q.pit_hold)));
     part("irq_taken", ser(&p.irq_taken.to_vec()), ser(&q.irq_taken.to_vec()));
+    part("dsp link", ser(&p.dsp), ser(&q.dsp));
+    let side = |s: &Option<Box<dtemu::syntakt::DspSide>>| s.as_ref().map(|s| (s.irq_line, s.kicks.clone(), s.kicks_taken, s.blocks));
+    part("dsp side", ser(&side(&p.dsp_side)), ser(&side(&q.dsp_side)));
     if p.forced != q.forced {
-        out.push("peripheral state differs: forced".into());
+        out.push(format!("{who}peripheral state differs: forced"));
     }
     out
 }
@@ -170,6 +183,10 @@ fn main() {
         }
     }
     println!("idle-skipped: interp {} jit {}", a.stats.idle_skipped, b.stats.idle_skipped);
+    if let Some(d) = b.dsp.as_ref() {
+        let (c, f, s) = d.jit_stats();
+        println!("dsp: {c} blocks compiled in {s:.2}s, {f} declined; {} entries into compiled code; idle-skipped interp {} jit {}", d.jit_runs, a.dsp_stats.idle_skipped, b.dsp_stats.idle_skipped);
+    }
     let (compiled, failed, secs) = b.cpu.jit_stats();
     println!(
         "identical through clock {t}: {} instructions; interp {ta:.2}s, jit {tb:.2}s ({:.2}x); {} blocks compiled in {:.2}s, {} declined; {} cache flushes; {} entries into compiled code",

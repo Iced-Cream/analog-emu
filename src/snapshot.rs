@@ -6,8 +6,10 @@
 //! to the MAIN OS image by hash: restoring onto a different build would run
 //! one firmware's RAM against another's code.
 
+use crate::cpu::Cpu;
 use crate::io::Io;
-use crate::machine::{Machine, Stats};
+use crate::machine::{DspStats, Machine, Stats};
+use crate::syntakt::DspSide;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -60,26 +62,92 @@ struct Snap {
     frame_seq: u64,
 }
 
-pub fn save(m: &Machine, path: &Path) -> std::io::Result<()> {
-    let c = &m.cpu;
-    let cpu = CpuState {
-        d: c.d,
-        a: c.a,
-        pc: c.pc,
-        sr: c.sr,
-        other_sp: c.other_sp,
-        vbr: c.vbr,
-        cacr: c.cacr,
-        ctl: c.ctl.clone(),
-        macsr: c.macsr,
-        mask: c.mask,
-        acc: [0, 1, 2, 3].map(|i| c.acc_phys(i).0),
-        accext: [0, 1, 2, 3].map(|i| c.acc_phys(i).1),
-        stopped: c.stopped,
-        exc_counts: c.exc_counts.to_vec(),
-    };
+impl CpuState {
+    fn of(c: &Cpu) -> CpuState {
+        CpuState {
+            d: c.d,
+            a: c.a,
+            pc: c.pc,
+            sr: c.sr,
+            other_sp: c.other_sp,
+            vbr: c.vbr,
+            cacr: c.cacr,
+            ctl: c.ctl.clone(),
+            macsr: c.macsr,
+            mask: c.mask,
+            acc: [0, 1, 2, 3].map(|i| c.acc_phys(i).0),
+            accext: [0, 1, 2, 3].map(|i| c.acc_phys(i).1),
+            stopped: c.stopped,
+            exc_counts: c.exc_counts.to_vec(),
+        }
+    }
+
+    fn restore(self, c: &mut Cpu) {
+        c.d = self.d;
+        c.a = self.a;
+        c.pc = self.pc;
+        c.sr = self.sr;
+        c.other_sp = self.other_sp;
+        c.vbr = self.vbr;
+        c.cacr = self.cacr;
+        c.ctl = self.ctl;
+        c.macsr = self.macsr;
+        c.mask = self.mask;
+        for i in 0..4 {
+            c.set_acc_phys(i, self.acc[i], self.accext[i]);
+        }
+        c.stopped = self.stopped;
+        for (i, v) in self.exc_counts.iter().enumerate().take(256) {
+            c.exc_counts[i] = *v;
+        }
+        c.skip_hook = None;
+    }
+}
+
+fn sparse_of(c: &Cpu) -> Vec<(u32, &[u8])> {
     let mut sparse: Vec<(u32, &[u8])> = c.bus.sparse.iter().map(|(k, v)| (*k, &v[..])).collect();
     sparse.sort_by_key(|x| x.0);
+    sparse
+}
+
+fn sparse_from(v: Vec<(u32, Vec<u8>)>) -> std::collections::HashMap<u32, Box<[u8; 4096]>> {
+    v.into_iter()
+        .map(|(k, v)| {
+            let mut b = Box::new([0u8; 4096]);
+            b[..v.len().min(4096)].copy_from_slice(&v[..v.len().min(4096)]);
+            (k, b)
+        })
+        .collect()
+}
+
+/// The Syntakt's second CPU, after the main body when it runs (a snapshot
+/// without it loads as before; one with it carries a trailer).
+#[derive(Serialize)]
+struct DspRef<'a> {
+    cpu: CpuState,
+    io: &'a Io,
+    side: &'a DspSide,
+    sram: &'a [u8],
+    sparse: Vec<(u32, &'a [u8])>,
+    ddr_lz4: Vec<u8>,
+    stats: &'a DspStats,
+}
+
+#[derive(Deserialize)]
+struct DspSnap {
+    cpu: CpuState,
+    io: Io,
+    side: DspSide,
+    sram: Vec<u8>,
+    sparse: Vec<(u32, Vec<u8>)>,
+    ddr_lz4: Vec<u8>,
+    stats: DspStats,
+}
+
+pub fn save(m: &Machine, path: &Path) -> std::io::Result<()> {
+    let c = &m.cpu;
+    let cpu = CpuState::of(c);
+    let sparse = sparse_of(c);
     let snap = SnapRef {
         main_sha256: m.prof.sha256.clone(),
         cpu,
@@ -91,7 +159,19 @@ pub fn save(m: &Machine, path: &Path) -> std::io::Result<()> {
         frame: &m.frame,
         frame_seq: m.frame_seq,
     };
-    let body = bincode::serialize(&snap).map_err(std::io::Error::other)?;
+    let mut body = bincode::serialize(&snap).map_err(std::io::Error::other)?;
+    if let Some(d) = m.dsp.as_ref() {
+        let dsp = DspRef {
+            cpu: CpuState::of(d),
+            io: &d.bus.io,
+            side: d.bus.io.dsp_side.as_ref().expect("DSP side"),
+            sram: &d.bus.sram,
+            sparse: sparse_of(d),
+            ddr_lz4: lz4_flex::compress_prepend_size(&d.bus.ddr),
+            stats: &m.dsp_stats,
+        };
+        body.extend(bincode::serialize(&dsp).map_err(std::io::Error::other)?);
+    }
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -115,7 +195,13 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     }
     let mut body = Vec::new();
     f.read_to_end(&mut body).map_err(|e| e.to_string())?;
-    let s: Snap = bincode::deserialize(&body).map_err(|e| e.to_string())?;
+    let mut cur = std::io::Cursor::new(&body[..]);
+    let s: Snap = bincode::deserialize_from(&mut cur).map_err(|e| e.to_string())?;
+    let dsp: Option<DspSnap> = if (cur.position() as usize) < body.len() {
+        Some(bincode::deserialize_from(&mut cur).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     if s.main_sha256 != m.prof.sha256 {
         return Err("snapshot was taken on a different MAIN OS".into());
     }
@@ -127,24 +213,18 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     c.bus.ddr = ddr;
     c.bus.icache_flush();
     c.bus.sram = s.sram;
-    c.bus.sparse = s
-        .sparse
-        .into_iter()
-        .map(|(k, v)| {
-            let mut b = Box::new([0u8; 4096]);
-            b[..v.len().min(4096)].copy_from_slice(&v[..v.len().min(4096)]);
-            (k, b)
-        })
-        .collect();
+    c.bus.sparse = sparse_from(s.sparse);
     // Host-side settings are the running machine's, not the snapshot's.
     let (ips, ignore_masks, trace) = (c.bus.io.ips, c.bus.io.ignore_masks, c.bus.io.trace_intc);
     let ssi0_on = c.bus.io.ssi0.on;
+    let rx_sign_extend = c.bus.io.ssi.rx_sign_extend;
     let card_path = c.bus.io.esdhc.card.path.clone();
     c.bus.io = s.io;
     c.bus.io.ips = ips;
     c.bus.io.ignore_masks = ignore_masks;
     c.bus.io.trace_intc = trace;
     c.bus.io.ssi0.on = ssi0_on;
+    c.bus.io.ssi.rx_sign_extend = rx_sign_extend;
     if ssi0_on {
         // The slot masks the request counts use, from the register pages.
         for (i, a) in [0xFC0C_8048u32, 0xFC0C_804C].into_iter().enumerate() {
@@ -156,26 +236,31 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     }
     c.bus.io.esdhc.card.path = card_path;
     c.bus.io.deadline = c.bus.io.now;
-    let r = s.cpu;
-    c.d = r.d;
-    c.a = r.a;
-    c.pc = r.pc;
-    c.sr = r.sr;
-    c.other_sp = r.other_sp;
-    c.vbr = r.vbr;
-    c.cacr = r.cacr;
-    c.ctl = r.ctl;
-    c.macsr = r.macsr;
-    c.mask = r.mask;
-    for i in 0..4 {
-        c.set_acc_phys(i, r.acc[i], r.accext[i]);
-    }
-    c.stopped = r.stopped;
-    for (i, v) in r.exc_counts.iter().enumerate().take(256) {
-        c.exc_counts[i] = *v;
-    }
-    c.skip_hook = None;
+    s.cpu.restore(c);
     m.stats = s.stats;
+    m.dsp = None;
+    if let Some(d) = dsp {
+        if !m.dsp_real() {
+            return Err("snapshot carries the Syntakt's second CPU; this machine runs the stand-in (DTEMU_SYNTAKT_DSP=stub)".into());
+        }
+        let ddr = lz4_flex::decompress_size_prepended(&d.ddr_lz4).map_err(|e| e.to_string())?;
+        let mut core = m.dsp_core(d.io.now);
+        if ddr.len() != core.bus.ddr.len() {
+            return Err(format!("snapshot DSP DDR is {} bytes, the DSP has {}", ddr.len(), core.bus.ddr.len()));
+        }
+        core.bus.ddr = ddr;
+        core.bus.icache_flush();
+        core.bus.sram = d.sram;
+        core.bus.sparse = sparse_from(d.sparse);
+        let ips = core.bus.io.ips;
+        core.bus.io = d.io;
+        core.bus.io.ips = ips;
+        core.bus.io.dsp_side = Some(Box::new(d.side));
+        core.bus.io.deadline = core.bus.io.now;
+        d.cpu.restore(&mut core);
+        m.dsp = Some(Box::new(core));
+        m.dsp_stats = d.stats;
+    }
     m.frame = s.frame;
     m.frame_seq = s.frame_seq;
     Ok(())

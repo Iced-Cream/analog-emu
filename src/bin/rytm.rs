@@ -225,9 +225,10 @@ fn emulate(
     m.cpu.bus.io.ips = ips;
     m.cpu.bus.io.usb_audio_capture = o.usb_wav.is_some();
     let ports = o.midi && (!o.headless || o.midi_headless);
-    // DTEMU_MIDI_NAME renames the ports (default "rytm-emu", "a4-emu" on an A4),
+    // DTEMU_MIDI_NAME renames the ports (default "rytm-emu", "a4-emu" on an A4,
+    // "syntakt-emu" on a Syntakt),
     // so a second emulator can run beside a window without their ports colliding.
-    let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else { "rytm-emu" }.into());
+    let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let mut midi_out = if ports { midi::Out::start(&format!("{pname} out"), "out") } else { None };
     let mut usb_out = if ports && m.is_rytm() { midi::Out::start(&format!("{pname} usb out"), "uout") } else { None };
     let slice = (ips / 500.0) as u64; // 2 ms of emulated time
@@ -351,7 +352,19 @@ fn emulate(
                     .map(|_| voices.pop_front().unwrap_or((0.0, 0.0)))
                     .collect()
             } else {
-                words.chunks(fw).map(|p| (p[0] as f32 / 8_388_608.0, p[1] as f32 / 8_388_608.0)).collect()
+                // The Syntakt adds its analog side (stanalog.rs), one pair a
+                // codec frame.
+                let st = m.cpu.bus.st.is_some();
+                let pairs: Vec<(f32, f32)> = words.chunks(fw).map(|p| m.speaker_pair(p)).collect();
+                if st {
+                    let voices = &mut m.cpu.bus.io.ssi.voices;
+                    pairs.into_iter().map(|(l, r)| {
+                        let (al, ar) = voices.pop_front().unwrap_or((0.0, 0.0));
+                        (l + al, r + ar)
+                    }).collect()
+                } else {
+                    pairs
+                }
             };
             // Resample by stepping through the source at the rate ratio.
             while phase < frames.len() as f64 {

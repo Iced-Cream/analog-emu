@@ -1,4 +1,4 @@
-# rytm-emu - an emulator for the Analog Rytm and Analog Four, MKI and MKII (work in progress)
+# rytm-emu - an emulator for the Analog Rytm and Analog Four, MKI and MKII, and the Syntakt (work in progress)
 
 | Device | OS | Firmware file (yours; not included) | Start |
 |---|---|---|---|
@@ -6,7 +6,10 @@
 | Analog Four MKII | 1.56 | `fw/Analog-Four_MKII_OS1.56.syx` | `./target/release/a4` (card `a4.img`) |
 | Analog Rytm MKI | 1.74 | `fw/Analog-Rytm_OS1.74.syx` | `./target/release/rytm fw/Analog-Rytm_OS1.74.syx --card rytmmk1.img` |
 | Analog Four MKI / Analog Keys | 1.56 | `fw/Analog-Four_Analog-Keys_OS1.56.syx` | `./target/release/rytm fw/Analog-Four_Analog-Keys_OS1.56.syx --card a4mk1.img` |
+| Syntakt (main screen; digital tracks 1-8 and modelled analog tracks 9-12 sound) | 1.42 | `fw/Syntakt_OS1.42.syx` | `./target/release/rytm fw/Syntakt_OS1.42.syx --card syntakt.img` |
 | Digitakt MK1 (upstream) | 1.53 | `fw/Digitakt_OS1.53.syx` | `./target/release/rytm fw/Digitakt_OS1.53.syx` |
+
+**New to this? Follow [`docs/INSTALL.md`](docs/INSTALL.md)**: a step-by-step guide from installing Rust to the first boot.
 
 The emulator picks the device from the firmware file. Make a card image once per device with
 `./target/release/dtcard NAME.img format` (MKI and MKII cards are not interchangeable).
@@ -52,6 +55,28 @@ audio and the A4 voice model run, and a synthetic calibration record sits in the
 emulated NOR flash. **Analog Rytm MKI OS 1.74 boots** to its main screen on a blank card
 (`fw/Analog-Rytm_OS1.74.syx`; it lays out its own +Drive, so not on a Rytm MKII card), after
 closing its start-up popups with NO; open items are in the same document.
+
+**Syntakt OS 1.42 boots** to its main screen (`fw/Syntakt_OS1.42.syx`, on a `dtcard`-formatted
+card or none); see [`docs/SYNTAKT-PORT.md`](docs/SYNTAKT-PORT.md). The Syntakt has a second
+ColdFire for its digital voices behind an FPGA mailbox. It runs here as a second emulated
+CPU with the firmware's own DSP program (section 7): the main CPU's boot handshake reports
+"DSP OK", and the digital tracks 1..8 sound (the pattern, the keys, MIDI). The analog tracks
+9..12 and the analog FX block are modelled from the 500-word voice frame the firmware sends
+them (`src/stanalog.rs`, section 12): two oscillators with pitch and amp envelopes per drum
+voice, the cymbal voice's oscillator banks, the digital layers, overdrive, the analog filter
+and VCA per track, and the FX block's drive, filter and amp; pitch within a cent of the note,
+curves and levels inferred (`DTEMU_NO_ANALOG=1` turns the model off).
+`DTEMU_SYNTAKT_DSP=stub` swaps the second CPU for the stage 1 scripted stand-in (silent).
+The window draws the Syntakt's panel (keys, encoders A..H and Level/Data, the RGB key LEDs)
+and plays the digital mix; its MIDI ports are `syntakt-emu in/out`.
+
+    ./target/release/dtcard syntakt.img format
+    ./target/release/rytm fw/Syntakt_OS1.42.syx --card syntakt.img
+    ./target/release/dtboot fw/Syntakt_OS1.42.syx --instr 4G --card syntakt.img
+    ./target/release/dtboot fw/Syntakt_OS1.42.syx --instr 6G --press PLAY@4G \
+        --main-wav main.wav --dsp-wav tracks.wav    # the speakers' mix; tracks 1..8 as rendered
+    ./target/release/dtboot fw/Syntakt_OS1.42.syx --instr 5G --midi 983c64@4.5G \
+        --analog-wav analog.wav                     # track 9's note: the analog side alone
 
     ./target/release/rytm fw/Analog-Four_Analog-Keys_OS1.56.syx --card a4mk1.img   # a copy of an A4 card, or a new image
     ./target/release/dtboot fw/Analog-Four_Analog-Keys_OS1.56.syx --instr 3G --card a4mk1.img

@@ -74,4 +74,9 @@ fn hardware_layouts() {
     let places = gui::layout_for(false, false, true);
     check("Rytm MKI", &places, &panel::RYTMMK1_KEYS, 9);
     render(false, false, true, &places);
+
+    panel::use_syntakt_panel();
+    let places = gui::layout_for(false, false, false);
+    check("Syntakt", &places, &panel::SYNTAKT_KEYS, 9);
+    render(false, false, false, &places);
 }

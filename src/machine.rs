@@ -115,7 +115,33 @@ pub struct Machine {
     /// made with the interrupt mask above 0 - an RTOS wait from inside an
     /// interrupt handler: (level, semaphore, return address) -> (first clock, count).
     pub isr_pends: std::collections::BTreeMap<(u8, u32, u32), (u64, u64)>,
+    /// The Syntakt's second CPU (syntakt.rs), once CPU1 has started it; its
+    /// profile and program (section 7). None elsewhere, and with the
+    /// stand-in (`DTEMU_SYNTAKT_DSP=stub`).
+    pub dsp: Option<Box<Cpu>>,
+    pub dsp_prof: Option<crate::syntakt::DspProfile>,
+    dsp_image: Vec<u8>,
+    pub dsp_stats: DspStats,
+    /// Keep the DSP's rendered blocks (`dsp_take_capture`).
+    pub dsp_capture: bool,
 }
+
+/// What the Syntakt's second CPU did.
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DspStats {
+    /// Starts (CPU1 can reset and boot it again), and the last one's clock.
+    pub boots: u64,
+    pub started_at: u64,
+    /// Clock skipped in its idle spins.
+    pub idle_skipped: u64,
+    /// A fault it could not take: (vector, pc).
+    pub fault: Option<(u8, u32)>,
+}
+
+/// Instructions CPU1 runs before the DSP catches up (`Machine::run_until`):
+/// the latency of each line between them [inferred: 50 us at 200 M a
+/// second, against a 32-frame block of about 133 k].
+pub const DSP_SLICE: u64 = 10_000;
 
 /// The Rytm's pads in pad-number order (pad p reports as `0xAp`/`0xBp`;
 /// `*0x40285608` maps p to the OS's pad index, identity in OS 1.73).
@@ -190,11 +216,33 @@ impl Machine {
             ext_params: [[255; 8]; 8],
             usb_midi_real: false,
             isr_pends: Default::default(),
+            dsp: None,
+            dsp_prof: None,
+            dsp_image: Vec::new(),
+            dsp_stats: DspStats::default(),
+            dsp_capture: false,
         };
         match m.prof.device {
             Device::RytmMk2 => m.rytm_bootstrap_state(),
             Device::A4Mk2 => m.a4_bootstrap_state(),
             Device::RytmMk1 | Device::A4Mk1 => m.mk1_bootstrap_state(),
+            Device::Syntakt => {
+                // The second CPU's version word, as section 7 carries it at
+                // 0x4004005a (sent in its `HO HA`, 0x40000ecc) [measured].
+                let ver = fw.section(7).and_then(|s| s.data.get(0x3_FC5A..0x3_FC5C)).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
+                let mut link = crate::syntakt::DspLink::new(ver);
+                // The second CPU runs section 7 unless the stand-in is asked
+                // for (DTEMU_SYNTAKT_DSP=stub).
+                let stub = std::env::var("DTEMU_SYNTAKT_DSP").is_ok_and(|v| v == "stub");
+                if let (false, Some(s7)) = (stub, fw.section(7)) {
+                    let p = crate::syntakt::DspProfile::for_image(&s7.data)?;
+                    m.dsp_image = s7.data.clone();
+                    m.dsp_prof = Some(p);
+                    link.real = true;
+                }
+                m.cpu.bus.io.dsp = Some(Box::new(link));
+                m.syntakt_bootstrap_state()
+            }
             Device::Digitakt => {}
         }
         m.install_hooks();
@@ -528,6 +576,72 @@ impl Machine {
         // at 0x4028cf58), and the Rytm MKI OS times its codec start-up on it
         // without setting it up itself (0x400066a2) [measured].
         bus.write16(0xFC07_0000, 0x000B);
+    }
+
+    /// A synthetic analog calibration record for the Syntakt OS 1.42, as a
+    /// calibrated unit keeps in its SPI flash at 0x300000 (the factory copy is
+    /// at 0x340000) [measured, code reading: reader 0x4006ecb8, check
+    /// 0x4006edca]:
+    ///
+    ///   +0      magic "RBOZ"; +4 size 0x22d30; +8 format 1; +12 checksum of the
+    ///           0x22d30 bytes from +16: sum of (byte_i XOR i), i from 1
+    ///           (0x4006eb5c)
+    ///   +0x10   u16 1 = calibrated (else "ANALOG CALIBRATION MISSING [-1]")
+    ///   +0x17, +0x18, +0x19, +0xda, +0x14f, +0x15c, +0x1885, +0x2fae: one
+    ///           flag byte per calibrated part, nonzero = done (a zero one
+    ///           reports -2 .. -9 and offers RUN WARM-UP CALIBRATION)
+    ///
+    /// The record is 0x22d40 B; everything else is 0 [synthetic: what the
+    /// parts' values mean is not traced; the analog voices are not modelled].
+    fn syntakt_calibration() -> Vec<u8> {
+        const LEN: usize = 0x22D40;
+        let mut r = vec![0u8; LEN];
+        r[0..4].copy_from_slice(b"RBOZ");
+        r[4..8].copy_from_slice(&0x22D30u32.to_be_bytes());
+        r[8..12].copy_from_slice(&1u32.to_be_bytes());
+        r[0x10..0x12].copy_from_slice(&1u16.to_be_bytes());
+        for o in [0x17, 0x18, 0x19, 0xDA, 0x14F, 0x15C, 0x1885, 0x2FAE] {
+            r[o] = 1;
+        }
+        let sum = r[16..].iter().enumerate().fold(0u32, |s, (i, &b)| s.wrapping_add((b as u32) ^ (i as u32 + 1)));
+        r[12..16].copy_from_slice(&sum.to_be_bytes());
+        r
+    }
+
+    /// The Syntakt's start state (docs/SYNTAKT-PORT.md): UI card type 0x0B on
+    /// the Digitakt's panel MCU.
+    fn syntakt_bootstrap_state(&mut self) {
+        self.cpu.bus.io.panel.card = crate::panel::CARD_SYNTAKT;
+        crate::panel::use_syntakt_panel();
+        if std::env::var_os("DTEMU_NO_CAL").is_none() {
+            let cal = Self::syntakt_calibration();
+            for at in [0x30_0000usize, 0x34_0000] {
+                self.flash[at..at + cal.len()].copy_from_slice(&cal);
+            }
+        }
+        // The board revision register, a byte on FlexBus CS1 at 0 (CS1 64 KB
+        // at 0, 0x40082510): bits 0-4 the PCB revision r, 5-7 a variant v;
+        // the self-test prints PCBA0046 'A'+r, v+1 (0x40081c7a). r < 3, or r = 3
+        // with v < 3, is "TOO OLD HARDWARE FOR THIS OS", and 0x82, 0x23, 0x43
+        // "OLD HARDWARE" (0x4000aec0) [measured]. 0x63 reads PCBA0046D4: the
+        // owner's board says PCBA0046D [community photo; the digit inferred].
+        self.cpu.bus.poke8(0, 0x63);
+        // As on the Rytm MKII: MAIN OS times a delay on DTIM2's counter
+        // (0x40000f66) that its bootstrap started from DTIN [measured: the
+        // wait; DTIN's clock inferred].
+        self.cpu.bus.io.dtin_hz = 12_288_000.0;
+        self.cpu.bus.write16(0xFC07_8000, 0x0007);
+        self.cpu.bus.write32(0xFC07_800C, 0);
+        // The analog voice frame goes out on DSPI1 by eDMA channel 15; the
+        // sender (0x4010223e) first waits for TCF (SR bit 28) from the last
+        // one (0x4010222a). Transfers complete at once here [inferred].
+        self.cpu.bus.io.forced.insert(0xFC03_C02C, 0x9000_0000);
+        // Its analog voices and analog FX block, from that frame (stanalog.rs),
+        // into receive words read sign-extended (io.rs `rx_sign_extend`).
+        self.cpu.bus.io.ssi.rx_sign_extend = true;
+        if std::env::var_os("DTEMU_NO_ANALOG").is_none() {
+            self.cpu.bus.st = Some(Default::default());
+        }
     }
 
     fn install_hooks(&mut self) {
@@ -901,6 +1015,206 @@ impl Machine {
     }
 
     pub fn run_until(&mut self, until: u64) -> Stop {
+        if self.dsp_prof.is_none() {
+            return self.run_main(until);
+        }
+        // Two CPUs: CPU1 runs a slice, then the DSP catches up to the same
+        // clock, taking the kicks CPU1 made in it at their clocks; its IRQ
+        // edges reach CPU1 at the start of the next slice.
+        loop {
+            let t = until.min(self.now() + DSP_SLICE);
+            let s = self.run_main(t);
+            self.dsp_catch_up();
+            match s {
+                Stop::Budget if self.now() < until => {}
+                Stop::Stopped if self.now() < until => {
+                    // A sleeping CPU1 the DSP may wake.
+                    let io = &mut self.cpu.bus.io;
+                    io.now = io.now.max(t);
+                    io.service();
+                }
+                s => return s,
+            }
+        }
+    }
+
+    /// The DSP's rendered blocks since the last call, as frames of 8 words
+    /// (tracks 1..8, signed 32-bit), while `dsp_capture` is set.
+    pub fn dsp_take_capture(&mut self) -> Vec<i32> {
+        self.dsp
+            .as_mut()
+            .and_then(|c| c.bus.io.dsp_side.as_mut())
+            .and_then(|s| s.capture.as_mut())
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// One codec frame's DAC words (24-bit) as the speakers' stereo pair.
+    /// The Digitakt's frame is the pair (words 0/1). The Syntakt's digital
+    /// mix leaves on two stereo buses [measured: CPU1 `0x4008fca2..0x4008fde0`
+    /// writes 0x8000dad0's pair to words 7 and 2 and 0x8000dfd0's to words 5
+    /// and 3; FUNC + FX routing moves a track from 3/5 to 2/7]: the one into
+    /// the analog FX block and the one straight to the main mix, summed in
+    /// analog after the block. With the analog model (stanalog.rs) the block
+    /// is modelled there and its output joins the analog voices in
+    /// `Ssi::voices`, so this is the main pair alone, L = 5, R = 3; without it
+    /// the block passes its input through, L = 7 + 5, R = 2 + 3 [inferred:
+    /// which word of a pair is left]. Words 4, 1, 0 and 6 are the digital
+    /// layers of tracks 9..12 (docs/SYNTAKT-PORT.md section 12), inputs to the
+    /// analog voices.
+    pub fn speaker_pair(&self, w: &[i32]) -> (f32, f32) {
+        let s = |x: i32| x as f32 / 8_388_608.0;
+        if self.is_syntakt() && w.len() >= 8 {
+            if self.cpu.bus.st.is_some() {
+                return (s(w[5]), s(w[3]));
+            }
+            (s(w[7]) + s(w[5]), s(w[2]) + s(w[3]))
+        } else if w.len() >= 2 {
+            (s(w[0]), s(w[1]))
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
+    /// Whether the Syntakt's second CPU is a real core (not the stand-in).
+    pub fn dsp_real(&self) -> bool {
+        self.dsp_prof.is_some()
+    }
+
+    /// Start the DSP at clock `t`: section 7 in its DDR at its link address,
+    /// entered as section 6 leaves it (its stack at the top of SRAM, interrupts
+    /// masked) [inferred: section 6's own state; it is not run].
+    fn dsp_boot(&mut self, t: u64) {
+        let p = self.dsp_prof.clone().expect("DSP profile");
+        let mut c = self.dsp_core(t);
+        c.pc = p.entry;
+        c.sr = 0x2700;
+        // Section 6's stack (its SP 0x80010000); the entry keeps 4(a7).
+        c.a[7] = 0x8001_0000 - 8;
+        self.dsp = Some(Box::new(c));
+        self.dsp_stats.boots += 1;
+        self.dsp_stats.started_at = t;
+        self.dsp_stats.fault = None;
+        self.dsp_stats.idle_skipped = 0;
+        self.note(format!("DSP started (section 7 at 0x{:08x}, entry 0x{:08x})", crate::syntakt::DSP_LOAD, p.entry));
+    }
+
+    /// A second CPU at clock `t` with section 7 in its DDR, its link end, the
+    /// block cache and compiler as CPU1 has them, and its idle hooks.
+    pub fn dsp_core(&self, t: u64) -> Cpu {
+        let p = self.dsp_prof.as_ref().expect("DSP profile");
+        let mut bus = Bus::new(crate::syntakt::DSP_DDR_MB);
+        bus.poke_bytes(crate::syntakt::DSP_LOAD, &self.dsp_image);
+        if std::env::var_os("DTEMU_NO_ICACHE").is_none() {
+            bus.icache_enable(self.dsp_image.len() as u32);
+        }
+        bus.io.now = t;
+        bus.io.ips = self.cpu.bus.io.ips;
+        // The IRQ line starts high: section 7's own copy of it (0x40040054)
+        // starts at 1, so its first toggle drives it low [inferred: section 6
+        // leaves it so; a first edge is what CPU1 waits for].
+        bus.io.dsp_side = Some(Box::new(crate::syntakt::DspSide { irq_line: true, ..Default::default() }));
+        let mut c = Cpu::new(bus);
+        if self.cpu.jitw.is_some() {
+            c.jitw = Some(crate::jit::Worker::new());
+        } else if self.cpu.jit.is_some() {
+            c.jit = Some(Box::new(crate::jit::Jit::new(c.bus.icache_flushes)));
+        }
+        for &a in &p.idle_spins {
+            c.set_hook(a, true);
+        }
+        // DTEMU_DSP_PROFILE=1: sample its PCs (dtboot lists the hottest).
+        if std::env::var_os("DTEMU_DSP_PROFILE").is_some() {
+            c.profile = Some(Default::default());
+        }
+        c
+    }
+
+    /// Run the DSP up to CPU1's clock, then hand its IRQ edges to CPU1.
+    fn dsp_catch_up(&mut self) {
+        let now = self.now();
+        let Some(link) = self.cpu.bus.io.dsp.as_mut() else { return };
+        if link.dsp.phase == crate::syntakt::Phase::Off && self.dsp.is_some() {
+            self.dsp = None; // held in reset
+        }
+        if self.dsp.is_none() {
+            match link.boot_at {
+                Some(t) if t <= now => {
+                    link.boot_at = None;
+                    link.kick_times.retain(|&k| k >= t);
+                    self.dsp_boot(t);
+                }
+                _ => {
+                    link.kick_times.retain(|&k| link.boot_at.is_some_and(|b| k >= b));
+                    return;
+                }
+            }
+        }
+        let link = self.cpu.bus.io.dsp.as_mut().unwrap();
+        let core = self.dsp.as_mut().unwrap();
+        if self.dsp_stats.fault.is_some() {
+            link.kick_times.clear();
+            core.bus.io.now = now;
+            return;
+        }
+        let side = core.bus.io.dsp_side.as_mut().unwrap();
+        if self.dsp_capture != side.capture.is_some() {
+            side.capture = self.dsp_capture.then(Vec::new);
+        }
+        side.kicks.extend(link.kick_times.drain(..));
+        std::mem::swap(&mut link.mbox, &mut side.mbox);
+        core.bus.io.service();
+        let idle = &self.dsp_prof.as_ref().unwrap().idle_spins;
+        loop {
+            match core.run(now) {
+                Stop::Budget => break,
+                Stop::Event => {
+                    core.bus.io.service();
+                    core.bus.dma_service();
+                }
+                Stop::Stopped => {
+                    let io = &mut core.bus.io;
+                    io.now = io.deadline.min(now).max(io.now);
+                    if io.now >= now {
+                        break;
+                    }
+                    core.bus.io.service();
+                    core.bus.dma_service();
+                }
+                Stop::Hook(pc) => {
+                    if idle.contains(&pc) {
+                        // Only an interrupt ends it: on to the next event.
+                        let io = &mut core.bus.io;
+                        let target = io.deadline.min(now);
+                        if target > io.now {
+                            self.dsp_stats.idle_skipped += target - io.now;
+                            io.now = target;
+                        }
+                    }
+                    core.skip_hook = Some(pc);
+                }
+                Stop::Fault(v, p) => {
+                    self.dsp_stats.fault = Some((v, p));
+                    break;
+                }
+            }
+        }
+        let side = core.bus.io.dsp_side.as_mut().unwrap();
+        std::mem::swap(&mut link.mbox, &mut side.mbox);
+        let edges: Vec<u64> = side.irq_edges.drain(..).collect();
+        for t in edges {
+            link.raise(t, 0);
+        }
+        if link.irq_at.is_some() {
+            let io = &mut self.cpu.bus.io;
+            io.deadline = io.deadline.min(io.now);
+        }
+        if let Some((v, p)) = self.dsp_stats.fault {
+            self.note(format!("DSP FAULT: vector {v} at 0x{p:08x}"));
+        }
+    }
+
+    fn run_main(&mut self, until: u64) -> Stop {
         self.usb_microframes();
         self.run_nudges();
         self.cpu.bus.io.service();
@@ -1073,7 +1387,7 @@ impl Machine {
     /// PUSH_A..PUSH_H, LEVEL/DATA -> PUSH_LEVEL, SAMPLE -> SAMPLER; PTN and BANK
     /// have no single Rytm key and do nothing.
     pub fn key_compat(&mut self, code: u8, down: bool) {
-        if self.is_a4() || self.is_mk1() {
+        if self.is_a4() || self.is_mk1() || self.is_syntakt() {
             if let Some(name) = crate::panel::key_name(code) {
                 self.key_named(name, down);
             }
@@ -1116,6 +1430,11 @@ impl Machine {
         self.prof.device == Device::A4Mk2
     }
 
+    /// Whether this machine runs a Syntakt OS.
+    pub fn is_syntakt(&self) -> bool {
+        self.prof.device == Device::Syntakt
+    }
+
     /// Whether this machine is an MKI unit (Analog Rytm MKI, Analog Four MKI).
     pub fn is_mk1(&self) -> bool {
         self.prof.device.mk1()
@@ -1137,7 +1456,7 @@ impl Machine {
                 self.panel_send(&msg);
             }
         }
-        let msg = if self.is_rytm() || self.is_a4() || self.is_mk1() {
+        let msg = if self.is_rytm() || self.is_a4() || self.is_mk1() || self.is_syntakt() {
             crate::panel::rytm_key(name).and_then(|(ch, bit)| self.cpu.bus.io.panel.wire(ch, bit, down))
         } else {
             (0..=47u8)
@@ -1286,8 +1605,11 @@ impl Machine {
     /// the Rytm's sends about 8 - five turns of -2 left TRK LEVEL at 100, of -4
     /// moved it 1, of -8 moved it 4 (the first turn only shows the value)
     /// [measured, OS 1.73]; the A4 MKI takes one count per step (`nudge_steps`).
+    /// The Syntakt is like the Rytm: on its tempo screen five turns of 2
+    /// counts left the BPM alone, five of 4 or three of 8 moved it one step
+    /// [measured, OS 1.42; 8 per detent inferred from the Rytm's].
     pub fn counts_per_detent(&self) -> i8 {
-        if self.is_rytm() || self.is_a4() { 8 } else { 1 }
+        if self.is_rytm() || self.is_a4() || self.is_syntakt() { 8 } else { 1 }
     }
 
     /// Turn an encoder by `detents` steps, as a user's knob turn (the window).

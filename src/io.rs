@@ -169,6 +169,14 @@ pub struct Ssi {
     pub tx_last: [i32; 16],
     pub regs: [u32; 16],
     pub enabled: bool,
+    /// Receive words come sign-extended from 24 bits when SRCR's RXEXT (bit
+    /// 10) asks for it (MCF54418RM). On for the Syntakt, whose CPU1 reads
+    /// receive words 0..3 as signed 32-bit (0x400962ac) [measured: zero-extended,
+    /// every negative sample of a track read as a large positive one]; the
+    /// A4, Rytm and Digitakt set RXEXT too but keep the zero extension they
+    /// have always had here. Not in snapshots: carried over on load.
+    #[serde(skip)]
+    pub rx_sign_extend: bool,
 }
 
 pub const SSI_TX_CHAN: usize = 54;
@@ -286,6 +294,14 @@ pub struct Io {
     pub irq_taken: [u64; 256],
     /// Bytes per UART character time, in instructions.
     pub uart_byte_instr: u64,
+    /// The Syntakt's link to its second CPU (syntakt.rs): the FPGA mailbox at
+    /// 0x10000000, the kick and IRQ lines, the boot stream. None elsewhere.
+    #[serde(default)]
+    pub dsp: Option<Box<crate::syntakt::DspLink>>,
+    /// The Syntakt's second CPU's own `Io`: its end of that link (syntakt.rs).
+    /// Not in a snapshot of this `Io` (`snapshot.rs` saves the DSP apart).
+    #[serde(skip)]
+    pub dsp_side: Option<Box<crate::syntakt::DspSide>>,
 }
 
 impl Default for Io {
@@ -357,6 +373,7 @@ impl Io {
                 tx_last: [0; 16],
                 regs: [0; 16],
                 enabled: true,
+                rx_sign_extend: false,
             },
             gpio_d4: false,
             power_lost: false,
@@ -368,6 +385,8 @@ impl Io {
             pit_hold: 0,
             irq_taken: [0; 256],
             uart_byte_instr: 2000,
+            dsp: None,
+            dsp_side: None,
         }
     }
 
@@ -413,6 +432,8 @@ impl Io {
         self.set_line((2, 17), self.usb_irq);
         // EPORT IRQ1..7 are INTC0 sources 1..7.
         self.set_line((0, 2), self.epfr & 0x04 != 0);
+        // IRQ4: the Syntakt's DSP (syntakt.rs); nothing else raises it here.
+        self.set_line((0, 4), self.epfr & 0x10 != 0);
         // eDMA: channels 0-15 on INTC0 sources 8-23, 16-55 on INTC1 sources
         // 8-47 (source = channel - 8), 56-63 OR-ed onto INTC2 source 0.
         let int = self.edma.int;
@@ -1028,6 +1049,10 @@ impl Io {
         if self.ssi0.rx_pending > 0 {
             m |= 1 << SSI0_RX_CHAN;
         }
+        // The Syntakt's DSP clocks its boot stream out of DSPI2 (slave).
+        if self.dsp.as_ref().is_some_and(|d| d.streaming(self.edma.majors[crate::syntakt::BOOT_CHAN])) {
+            m |= 1 << crate::syntakt::BOOT_CHAN;
+        }
         m
     }
 
@@ -1123,7 +1148,11 @@ impl Io {
             0xFC0C_8000 if a & 0x3FFF < 0x40 => {
                 let off = a & 0x3F;
                 if (off == 0x08 || off == 0x0C) && size == 4 {
-                    return Some(self.ssi.input.pop_front().unwrap_or(0) as u32 & 0x00FF_FFFF);
+                    let v = self.ssi.input.pop_front().unwrap_or(0);
+                    if self.ssi.rx_sign_extend && self.ssi.regs[0x20 / 4] & 0x400 != 0 {
+                        return Some((v << 8 >> 8) as u32);
+                    }
+                    return Some(v as u32 & 0x00FF_FFFF);
                 }
                 if size == 4 && off & 3 == 0 {
                     return Some(self.ssi.regs[(off / 4) as usize]);
@@ -1144,6 +1173,11 @@ impl Io {
             // bit 2 is the power sense.
             0xEC09_4000 if a == 0xEC09_401A && size == 1 => {
                 return Some(if self.gpio_d4 { 0x08 } else { 0 } | if self.power_lost { 0 } else { 0x04 });
+            }
+            // The Syntakt DSP's XC3S50A: INIT_B (PPDSDR_E bit 0) and DONE
+            // (PPDSDR_F bit 7) read high: configured at once [inferred].
+            0xEC09_4000 if self.dsp_side.is_some() && size == 1 && (a == 0xEC09_401C || a == 0xEC09_401D) => {
+                return Some(if a == 0xEC09_401C { 0x01 } else { 0x80 });
             }
             // PPDSDR_A: bit 5 is the supercap's charged signal.
             0xEC09_4000 if a == 0xEC09_4018 && size == 1 => return Some(if self.supercap_flat { 0 } else { 0x20 }),
@@ -1243,6 +1277,51 @@ impl Io {
             }
             0xEC07_0000 if size == 1 && a & 3 == 0 => self.uart_write(8, a & 0x3F, v),
             0xEC07_4000 if size == 1 && a & 3 == 0 => self.uart_write(9, a & 0x3F, v),
+            0xEC03_8000 if self.dsp.is_some() => {
+                let majors = self.edma.majors[crate::syntakt::BOOT_CHAN];
+                let d = self.dsp.as_mut().unwrap();
+                // DSPI2 (slave): the DSP's boot port. MCR out of HALT (and
+                // not master) after a reset opens the stream; PUSHR's low
+                // byte is what the DSP reads.
+                if a == 0xEC03_8000 && size == 4 && v & 0x8000_0001 == 0 && d.dsp.phase == crate::syntakt::Phase::Off {
+                    d.stream_open(majors);
+                    self.edma.kick |= 1 << crate::syntakt::BOOT_CHAN;
+                }
+                if a == 0xEC03_8037 && size == 1 {
+                    d.boot_byte(v as u8);
+                }
+                false
+            }
+            // The Syntakt DSP's IRQ to CPU1: port G bit 2 (PPDSDR_G sets,
+            // PCLRR_G clears).
+            0xEC09_4000 if self.dsp_side.is_some() && size == 1 && (a == 0xEC09_401E || a == 0xEC09_402A) => {
+                let now = self.now;
+                let s = self.dsp_side.as_mut().unwrap();
+                if a == 0xEC09_401E && v & 0x04 != 0 {
+                    s.set_irq_line(true, now);
+                }
+                if a == 0xEC09_402A && v & 0x04 == 0 {
+                    s.set_irq_line(false, now);
+                }
+                false
+            }
+            0xEC09_4000 if self.dsp.is_some() && size == 1 && matches!(a, 0xEC09_4018 | 0xEC09_4024 | 0xEC09_4026) => {
+                let now = self.now;
+                let d = self.dsp.as_mut().unwrap();
+                match a {
+                    // Port A bit 4: the kick line (PPDSDR sets, PCLRR clears).
+                    0xEC09_4018 if v & 0x10 != 0 => d.set_kick_line(true, now),
+                    0xEC09_4024 if v & 0x10 == 0 => d.set_kick_line(false, now),
+                    // PCLRR_C bit 4 low starts each boot attempt (0x40082c6e):
+                    // the DSP is held in reset [inferred].
+                    0xEC09_4026 if v & 0x10 == 0 => d.hold_reset(),
+                    _ => {}
+                }
+                if let Some(t) = d.irq_at {
+                    self.lower_deadline(t as f64);
+                }
+                false
+            }
             0xEC09_4000 => {
                 // PPDSDR_D: writing 1 sets; PCLRR_D: writing 0 clears.
                 if a == 0xEC09_401B && size == 1 && v & 0x10 != 0 {
@@ -1378,6 +1457,35 @@ impl Io {
                 self.midi_next = Some(t.max(now) + period);
             }
             next = next.min(self.midi_next.unwrap());
+        }
+        // The Syntakt DSP: CPU1's kicks are edges on DTIN0, which DTIM0
+        // captures (DTMR CE, `0x40000e40`: 0xc1, either edge).
+        if let Some(s) = self.dsp_side.as_mut() {
+            let mut cap = false;
+            while s.kicks.front().is_some_and(|&t| t <= self.now) {
+                s.kicks.pop_front();
+                s.kicks_taken += 1;
+                cap = true;
+            }
+            if let Some(&t) = s.kicks.front() {
+                next = next.min(t as f64);
+            }
+            if cap && self.dtim[0].dtmr & 0xC0 != 0 && self.dtim[0].dtmr & 1 != 0 {
+                self.dtim[0].dter |= 0x01;
+                self.dtim[0].dtcr = self.dtim_counter(0);
+            }
+        }
+        if let Some(d) = self.dsp.as_mut() {
+            let majors = self.edma.majors[crate::syntakt::BOOT_CHAN];
+            if let Some(t) = d.service(self.now, majors) {
+                next = next.min(t as f64);
+            }
+            if d.take_irq(self.now) {
+                self.epfr |= 0x10;
+            }
+            if let Some(t) = d.irq_at {
+                next = next.min(t as f64);
+            }
         }
         for ch in 0..64 {
             let b = self.edma.busy_until[ch];

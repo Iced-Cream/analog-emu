@@ -14,6 +14,8 @@ pub const A4_156_SHA256: &str = "748fec15ddc61bc3ff66047facba74328934c5fb59f427d
 /// The MKI units' MAIN OS (ELE2 files, depacked to the end of input).
 pub const A4MK1_156_SHA256: &str = "cc19347b11d220aba73e4fd7203b2ce4e6d6d9553308d713648885682c714c26";
 pub const ARMK1_174_SHA256: &str = "6d021e22e8912cfc1ee84e619c35db0174455cbc42bf64dbec1f1d06a5ab811d";
+/// Syntakt OS 1.42 (two ColdFires; this is CPU1's MAIN OS, section 3).
+pub const ST_142_SHA256: &str = "1a9723b19fb54d0566c1f690379d2e6dfe43227f77e170ad731dd029430eb3e7";
 pub const MAIN_LOAD: u32 = 0x4000_0400;
 
 /// Which unit an OS image is for: it selects the board around the CPU (memory
@@ -27,6 +29,9 @@ pub enum Device {
     RytmMk1,
     /// Analog Four MKI / Analog Keys: as the Rytm MKI, with 64 MB of DDR.
     A4Mk1,
+    /// Syntakt: a Digitakt-style main CPU plus a second ColdFire ("DSP") for
+    /// the digital voices behind an FPGA mailbox (docs/SYNTAKT-PORT.md).
+    Syntakt,
 }
 
 impl Device {
@@ -183,6 +188,7 @@ impl Profile {
             A4_156_SHA256 => Ok(Self::a4_156(h, idle_spins)),
             A4MK1_156_SHA256 => Ok(Self::a4mk1_156(h, idle_spins)),
             ARMK1_174_SHA256 => Ok(Self::rytm_mk1_174(h, idle_spins)),
+            ST_142_SHA256 => Ok(Self::syntakt_142(h, idle_spins)),
             _ => {
                 // A modified image (rytm-mods build): stock code at every
                 // address the profile hooks.
@@ -628,6 +634,77 @@ impl Profile {
             boot_blob: (0x4028_C770, 0x402A_1B84),
             boot_ver: 0x4028_C768,
             boot_ver_flash: 0x1_FFF8,
+            idle_spins,
+        }
+    }
+
+    /// Syntakt OS 1.42 (CPU1's MAIN OS), matched from Digitakt OS 1.53 (and
+    /// the Rytm MKII 1.73 for the MIDI fields) by tools/xmatch.py, 2026-10-13
+    /// (docs/SYNTAKT-PORT.md section 5): code by unique masked match, data by
+    /// the references' votes [measured]. Weak (one vote): usb_midi_queue,
+    /// midi_short_ring; uart8_* weak.
+    fn syntakt_142(sha256: String, idle_spins: Vec<u32>) -> Profile {
+        Profile {
+            name: "Syntakt OS 1.42",
+            device: Device::Syntakt,
+            sha256,
+            entry: 0x4000_04E8,
+            flash_read: 0x4011_6D7A,
+            ctx_switch: 0x4000_0410,
+            current_tcb: 0x454E_49A8,
+            prio_heads: 0x454E_4968,
+            task_create: 0x4000_1640,
+            sem_pend: 0x4000_1792,
+            pend_b: 0x4000_171E,
+            queue_send: 0x4000_1C0E,
+            queue_recv: 0x4000_1CBE,
+            mainloop: 0,
+            panel_diff: 0x4011_391A,
+            fb_front: 0x402D_7110,
+            fb_back: 0x402D_7114,
+            intro_pit3_isr: 0,
+            intro_done: 0,
+            intro_park: 0,
+            frame_sem: 0x43BB_F678,
+            display_sem: 0x444B_AD58,
+            completion_sem: 0x444D_B2B4,
+            pend_call: 0x4011_6384,
+            depack_copy: 0x4011_8334,
+            sd_flag: 0x444B_A6FC,
+            sd_status: 0x444B_A72C,
+            sd_cmd_sem: 0x444B_A748,
+            sd_data_sem: 0x444B_A740,
+            sd_dma_sem: 0x444B_A738,
+            sd_capacity: 0x444B_A720,
+            uart8_ring_ptr: 0x405D_37C8,
+            uart8_consume_idx: 0x405D_37E8,
+            transport_state: 0x43BD_8424,
+            panel_button_names: 0x401D_7400,
+            mounted: 0,
+            first_boot_error: 0x4065_33FC,
+            progress_done: 0x444B_B1E0,
+            progress_total: 0x444B_B1DC,
+            abort_loop: 0x4011_AA42,
+            usb_midi_queue: 0x4449_1554,
+            // The MIDI task (0x40103e0a) pends on it; the Rytm's offset from
+            // the queue (-0x28) [measured: the task's pend in a booted run].
+            midi_event: 0x4449_152C,
+            sem_post: 0x4000_18D4,
+            midi_pool: 0x4551_46F8,
+            midi_pool_map: 0x4551_226C,
+            midi_pool_sem: 0x4551_2264,
+            usb_midi_send: 0x4000_4A20,
+            usb_midi_send_short: 0x4000_4974,
+            midi_short_ring: 0x4551_22EC,
+            midi_short_idx: 0x443D_B264,
+            usb_audio_copy: 0,
+            sysex_send: 0x4010_6976,
+            voice_output_mix: 0,
+            ob_in_buf: 0,
+            ob_in_index: 0,
+            boot_blob: (0, 0),
+            boot_ver: 0,
+            boot_ver_flash: 0,
             idle_spins,
         }
     }

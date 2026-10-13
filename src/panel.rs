@@ -51,6 +51,10 @@ pub const CARD_RYTM: [u8; 4] = [0x07, 0x05, 0x05, 0x01];
 /// byte is copied from the first [inferred].
 pub const CARD_A4: [u8; 4] = [0x06, 0x0A, 0x0A, 0x01];
 
+/// The Syntakt's UI card: type 0x0B (`0x40080434`; "WRONG UI CARD" otherwise)
+/// [measured]; versions as the Digitakt's [inferred].
+pub const CARD_SYNTAKT: [u8; 4] = [0x0B, 0x02, 0x00, 0x01];
+
 fn default_card() -> [u8; 4] {
     CARD
 }
@@ -111,6 +115,10 @@ pub fn key_name(code: u8) -> Option<&'static str> {
 /// The LED that lights key `code`, if it has one (reference `[panel.leds]`).
 pub fn led_for_key(code: u8) -> Option<usize> {
     if code >= RYTM_CODE_BASE {
+        if syntakt_panel() {
+            let name = key_name(code)?;
+            return SYNTAKT_LEDS.iter().find(|k| k.0 == name).map(|k| k.1);
+        }
         if rytmmk1_panel() {
             let name = key_name(code)?;
             return RYTMMK1_LEDS.iter().find(|k| k.0 == name).map(|k| k.1);
@@ -601,15 +609,62 @@ pub fn rytmmk1_panel() -> bool {
     PANEL_KIND.load(std::sync::atomic::Ordering::Relaxed) == 3
 }
 
+pub fn use_syntakt_panel() {
+    PANEL_KIND.store(4, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The Syntakt's panel tables are in use.
+pub fn syntakt_panel() -> bool {
+    PANEL_KIND.load(std::sync::atomic::Ordering::Relaxed) == 4
+}
+
 /// The key table of the loaded device: the A4's or the Rytm's.
 fn device_keys() -> &'static [(&'static str, u8, u8, u8)] {
     match PANEL_KIND.load(std::sync::atomic::Ordering::Relaxed) {
         1 => &A4_KEYS,
         2 => &A4MK1_KEYS,
         3 => &RYTMMK1_KEYS,
+        4 => &SYNTAKT_KEYS,
         _ => &RYTM_KEYS,
     }
 }
+
+/// Syntakt OS 1.42 front panel: (name, wire group, bit, OS key id). The panel
+/// MCU firmware is the Digitakt's, byte for byte, and the OS's button-name
+/// table (`0x401D7400`, 48 entries) has the Digitakt's order with SAMPLE -> FX
+/// and SRC -> SYN [measured, docs/SYNTAKT-PORT.md]; so the wiring is the
+/// Digitakt's (`WIRE`) and the id is the name table's index [inferred from the
+/// Digitakt's]. MENU is the `...` key (the OS's "PATTERN MENU"; FUNC: Sound),
+/// PUSH_LEVEL the Level/Data push (Sound Browser), PUSH_A..H the knobs'
+/// pushes. Checked on screen: see docs/SYNTAKT-PORT.md section 10.
+pub const SYNTAKT_KEYS: [(&str, u8, u8, u8); 48] = [
+    ("T1", 0, 0, 0x00), ("T2", 0, 1, 0x01), ("T3", 0, 2, 0x02), ("T4", 0, 3, 0x03),
+    ("T5", 0, 4, 0x04), ("T6", 0, 5, 0x05), ("T7", 0, 6, 0x06), ("T8", 0, 7, 0x07),
+    ("T9", 1, 0, 0x08), ("T10", 1, 1, 0x09), ("T11", 1, 2, 0x0a), ("T12", 1, 3, 0x0b),
+    ("T13", 1, 4, 0x0c), ("T14", 1, 5, 0x0d), ("T15", 1, 6, 0x0e), ("T16", 1, 7, 0x0f),
+    ("TRK", 2, 0, 0x12), ("FUNC", 2, 1, 0x13), ("TRIG", 2, 2, 0x1b), ("SYN", 2, 3, 0x1c),
+    ("PUSH_LEVEL", 2, 4, 0x2f), ("FLTR", 2, 5, 0x1d), ("AMP", 2, 6, 0x1e), ("LFO", 2, 7, 0x1f),
+    ("GLOBAL", 3, 0, 0x15), ("FX", 3, 1, 0x16), ("TEMPO", 3, 2, 0x17), ("NO", 3, 3, 0x21),
+    ("LEFT", 3, 4, 0x22), ("DOWN", 3, 5, 0x24), ("RIGHT", 3, 6, 0x25), ("PAGE", 3, 7, 0x26),
+    ("BANK", 4, 0, 0x10), ("PTN", 4, 1, 0x11), ("MENU", 4, 2, 0x14), ("RECORD", 4, 3, 0x18),
+    ("PLAY", 4, 4, 0x19), ("STOP", 4, 5, 0x1a), ("YES", 4, 6, 0x20), ("UP", 4, 7, 0x23),
+    ("PUSH_G", 5, 0, 0x2d), ("PUSH_F", 5, 1, 0x2c), ("PUSH_E", 5, 2, 0x2b), ("PUSH_B", 5, 3, 0x28),
+    ("PUSH_A", 5, 4, 0x27), ("PUSH_D", 5, 5, 0x2a), ("PUSH_C", 5, 6, 0x29), ("PUSH_H", 5, 7, 0x2e),
+];
+
+/// The Syntakt keys' LEDs (RGB, the Digitakt's protocol: `0x2g` selectors,
+/// `Bs id vv` slots, `B5` palette).
+pub const SYNTAKT_LEDS: [(&str, usize); 38] = [
+    ("T1", 0), ("T2", 1), ("T3", 2), ("T4", 3), ("T5", 4), ("T6", 5), ("T7", 6), ("T8", 7),
+    ("T9", 8), ("T10", 9), ("T11", 10), ("T12", 11), ("T13", 12), ("T14", 13), ("T15", 14), ("T16", 15),
+    ("BANK", 16), ("PTN", 17), ("TRIG", 18), ("SYN", 19), ("FLTR", 20), ("AMP", 21), ("LFO", 22), ("PAGE", 23),
+    ("STOP", 24), ("TEMPO", 25), ("YES", 26), ("NO", 27), ("UP", 28), ("LEFT", 29), ("DOWN", 30), ("RIGHT", 31),
+    ("FUNC", 32), ("MENU", 33), ("GLOBAL", 34), ("FX", 35), ("RECORD", 36), ("PLAY", 37),
+];
+/// The LED under TRK: lit red in keyboard mode (FUNC + TRK) [measured].
+pub const SYNTAKT_TRK_LED: usize = 39;
+/// The Syntakt's pattern page LEDs, 1:4 .. 4:4.
+pub const SYNTAKT_PAGE_LEDS: [usize; 4] = [43, 42, 41, 40];
 
 /// Analog Four MKI OS 1.56 front panel: (name, wire group, bit, OS key id).
 /// The slot table is the OS's own, `0x401ebaf8` (11 groups of 8, slot = 8 group

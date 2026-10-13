@@ -47,7 +47,11 @@ counts (suffixes k, M, G).
   --raw HEX@AT         send raw panel-MCU bytes at clock AT (e.g. 4064@5G)
   --midi HEX@AT        DIN MIDI in at clock AT, at 31250 baud (e.g. 903c64@5G)
   --midi-file F@AT     a file's bytes on DIN MIDI in (a .syx dump)
-  --wav OUT.wav        record the audio output
+  --wav OUT.wav        record the audio output (every DAC word of the codec frame)
+  --main-wav OUT.wav   record the speakers' stereo mix (Machine::speaker_pair; the
+                       Syntakt's adds its modelled analog voices and FX block)
+  --dsp-wav OUT.wav    (Syntakt) record tracks 1..8 as the second CPU renders
+                       them, one channel each
   --break ADDR         stop at a PC (hex); --break-after N arms it after N
   --poke ADDR=VALUE    write a 32-bit word (hex) once before the run
   --watch ADDR         log writes to a DDR or SRAM (0x8000....) address (hex;
@@ -56,7 +60,8 @@ counts (suffixes k, M, G).
   --usb-midi HEX@AT    bytes on the USB MIDI port (Rytm)
   --usb-midi-file F@AT[xN/SPACING]  a file's bytes on the USB MIDI port, N times
   --analog-wav FILE    record the modelled analog voices' mix (Rytm; A4 with its
-                       effects' return), stereo
+                       effects' return; Syntakt: tracks 9..12 and the analog FX
+                       block, without the DAC's main pair), stereo
   --usb-wav FILE       record the USB audio stream (12 channels: MAIN L/R, voices, AUDIO IN L/R)
   --audio-in FILE.wav  play a 16-bit WAV into AUDIO IN L/R from the start (Rytm)
   --ob-in FILE.wav[:CH]  a WAV's first channel as Overbridge input channel CH
@@ -86,7 +91,10 @@ counts (suffixes k, M, G).
 Environment:
   DTBOOT_OLED          end with the panel MCU's OLED, not the last captured frame
   DTBOOT_END_PNG=FILE  the screen at the end of the run as a PNG
-  DTBOOT_LEDS          print the LED selector byte of each group at the end
+  DTBOOT_DSP_STREAM=F  (Syntakt) write the bytes CPU1 streamed to the DSP's boot port
+  DTEMU_SYNTAKT_DSP=stub  (Syntakt) the stage 1 stand-in instead of the second CPU
+  DTEMU_DSP_PROFILE=1  (Syntakt) sample the second CPU's PCs; the hottest are listed
+  DTBOOT_LEDS          (=rgb: also each LED's colour) print the LED selector byte of each group at the end
   DTBOOT_PEEK=A,B,..   print those words (hex addresses) on each status line
   DTBOOT_STEPS         after each key release, settle 40M and show the screen
                        (as PNGs in DTBOOT_PNG_DIR if set)
@@ -120,6 +128,7 @@ fn main() {
     let mut usb_wav: Option<String> = None;
     let mut ext_in: Option<String> = None;
     let mut analog: Vec<i32> = Vec::new();
+    let mut analog_mix: Vec<(f32, f32)> = Vec::new();
     let mut breaks: Vec<u32> = Vec::new();
     let mut trace = 0usize;
     let mut break_after = 0u64;
@@ -127,6 +136,8 @@ fn main() {
     let mut profile_after: Option<u64> = None;
     let mut save: Option<String> = None;
     let mut wav: Option<String> = None;
+    let mut main_wav: Option<String> = None;
+    let mut dsp_wav: Option<String> = None;
     let mut card: Option<String> = None;
     let mut card_save = false;
     let mut power_off: Option<u64> = None;
@@ -232,6 +243,8 @@ fn main() {
                 raws.push((bytes, num(at)));
             }
             "--wav" => wav = it.next().cloned(),
+            "--main-wav" => main_wav = it.next().cloned(),
+            "--dsp-wav" => dsp_wav = it.next().cloned(),
             "--card" => card = it.next().cloned(),
             "--card-save" => card_save = true,
             "--power-off" => power_off = Some(num(it.next().unwrap())),
@@ -362,6 +375,8 @@ fn main() {
         }
     }
     m.cpu.bus.io.usb_audio_capture = usb_wav.is_some();
+    m.dsp_capture = dsp_wav.is_some();
+    let mut dsp_pcm: Vec<i32> = Vec::new();
     for &(a, x) in &pokes {
         m.cpu.bus.poke32(a, x);
     }
@@ -498,7 +513,12 @@ fn main() {
             None => m.run_until(target),
         };
         {
+            // The Syntakt's speakers' mix adds its analog side (stanalog.rs).
+            let st = m.cpu.bus.st.is_some() && main_wav.is_some();
             let v = &mut m.cpu.bus.io.ssi.voices;
+            if st {
+                analog_mix.extend(v.iter().copied());
+            }
             if analog_wav.is_some() {
                 for (l, r) in v.drain(..) {
                     analog.push((l.clamp(-1.0, 1.0) * 8_388_607.0) as i32);
@@ -508,7 +528,10 @@ fn main() {
                 v.clear();
             }
         }
-        if wav.is_some() {
+        if dsp_wav.is_some() {
+            dsp_pcm.extend(m.dsp_take_capture());
+        }
+        if wav.is_some() || main_wav.is_some() {
             // Whole frames only, so channels keep their places.
             let fw = m.cpu.bus.io.ssi_frame_words().max(1) as usize;
             let out = &mut m.cpu.bus.io.ssi.out;
@@ -577,6 +600,24 @@ fn main() {
         if powered_off {
             break;
         }
+    }
+    if let Some(p) = &main_wav {
+        let fw = m.cpu.bus.io.ssi_frame_words().max(2) as usize;
+        let st: Vec<i32> = pcm.chunks(fw).enumerate().flat_map(|(i, f)| {
+            let (l, r) = m.speaker_pair(f);
+            let (al, ar) = analog_mix.get(i).copied().unwrap_or((0.0, 0.0));
+            [l + al, r + ar].map(|x| (x.clamp(-1.0, 1.0) * 8_388_607.0) as i32)
+        }).collect();
+        write_wav(p, &st, 2);
+        let peak = st.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
+        println!("wrote {p}: {} stereo frames (the speakers' mix), peak {peak} (of 8388607)", st.len() / 2);
+    }
+    if let Some(p) = &dsp_wav {
+        // The DSP's words are 32-bit; write_wav takes 24.
+        let w: Vec<i32> = dsp_pcm.iter().map(|&x| x >> 8).collect();
+        write_wav(p, &w, dtemu::syntakt::TRACKS as u16);
+        let peak = dsp_pcm.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
+        println!("wrote {p}: {} frames of tracks 1..8 as the DSP rendered them, peak {peak} (of 2^31)", dsp_pcm.len() / dtemu::syntakt::TRACKS);
     }
     if let Some(p) = &wav {
         write_wav(p, &pcm, m.cpu.bus.io.ssi_frame_words().max(2) as u16);
@@ -700,6 +741,43 @@ fn main() {
         }
     }
     println!("+Drive mounted: {}", m.drive_mounted());
+    if let Some(d) = m.cpu.bus.io.dsp.as_ref() {
+        println!(
+            "dsp link: {:?}, version {:#06x}, boot stream {} B, kicks {}, irqs {}, data blocks {}, audio blocks {}",
+            d.dsp.phase, d.dsp.version, d.boot_stream.len(), d.kicks, d.irqs, d.dsp.blocks, d.dsp.frames
+        );
+        if let Some(c) = m.dsp.as_ref() {
+            let st = &m.dsp_stats;
+            let ran = c.bus.io.now - st.started_at;
+            println!(
+                "dsp core: boots {}, pc {:08x}, sr {:04x}, ran {} (idle {}: {:.1}% busy), kicks taken {}, irq edges {}, mbox +0..+10 {:02x?}, fault {:?}",
+                st.boots,
+                c.pc,
+                c.sr,
+                ran,
+                st.idle_skipped,
+                100.0 * (ran - st.idle_skipped.min(ran)) as f64 / ran.max(1) as f64,
+                c.bus.io.dsp_side.as_ref().map_or(0, |s| s.kicks_taken),
+                d.irqs,
+                &d.mbox[0..16],
+                st.fault
+            );
+            if let Some(p) = c.profile.as_ref() {
+                let total: u64 = p.values().sum();
+                let mut v: Vec<(u32, u64)> = p.iter().map(|(a, n)| (*a, *n)).collect();
+                v.sort_by_key(|b| std::cmp::Reverse(b.1));
+                println!("dsp hottest blocks ({total} samples):");
+                for (a, n) in v.iter().take(20) {
+                    println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total.max(1) as f64);
+                }
+            }
+        } else if m.dsp_real() {
+            println!("dsp core: not started");
+        }
+        if let Ok(f) = std::env::var("DTBOOT_DSP_STREAM") {
+            std::fs::write(&f, &d.boot_stream).expect("DTBOOT_DSP_STREAM");
+        }
+    }
     println!("icache: {} decodes, {} invalidating stores", m.cpu.bus.icache_decodes, m.cpu.bus.icache_invalidations);
     let c = &m.cpu;
     for (pc, a, n, v) in c.bus.watch_log.iter().take(40) {
@@ -743,6 +821,12 @@ fn main() {
         // each is 8 single-colour LEDs, one bit each.
         let sel: Vec<String> = m.cpu.bus.io.panel.selectors.iter().map(|s| s.map_or("--".into(), |v| format!("{v:02x}"))).collect();
         println!("led groups: {}", sel.join(" "));
+        if std::env::var("DTBOOT_LEDS").is_ok_and(|v| v == "rgb") {
+            // DTBOOT_LEDS=rgb: every colour LED that is defined, as 8-bit RGB.
+            let p = &m.cpu.bus.io.panel;
+            let lit: Vec<String> = (0..dtemu::panel::ALL_LEDS).filter_map(|i| p.led_rgb(i).map(|(r, g, b)| format!("{i}:{r:02x}{g:02x}{b:02x}"))).collect();
+            println!("led rgb: {}", lit.join(" "));
+        }
     }
 }
 

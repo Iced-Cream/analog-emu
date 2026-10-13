@@ -32,7 +32,7 @@ const TUNE_PER_PITCH_LEVEL: f32 = 678.0 * 7.0 / 15.0;
 /// Envelope levels per 6 dB: the amplitude level is taken as logarithmic, as an
 /// exponential VCA's control is, so 127 is full scale and 255 levels span 96 dB;
 /// a linear ramp in level then decays exponentially [inferred].
-const LEVELS_PER_6DB: f32 = 16.0;
+pub(crate) const LEVELS_PER_6DB: f32 = 16.0;
 
 /// Analog imperfections, so no two hits are quite alike (after the approach of
 /// kitbasher's analog recreations for the Machinedrum, not measured on a Rytm)
@@ -151,16 +151,16 @@ fn bit(f: &[u8], n: usize) -> bool {
 /// level, 0 continues from the current level toward the target (BD and SD each
 /// write 0x4000 once when a hit begins, then 0 while it runs) [measured].
 #[derive(Clone, Copy, Debug)]
-struct Record {
-    start_cmd: bool,
-    start: f32,
-    target: f32,
+pub(crate) struct Record {
+    pub(crate) start_cmd: bool,
+    pub(crate) start: f32,
+    pub(crate) target: f32,
     /// Levels per sample.
-    step: f32,
+    pub(crate) step: f32,
 }
 
 impl Record {
-    fn parse(r: &[u8]) -> Record {
+    pub(crate) fn parse(r: &[u8]) -> Record {
         let w = u32::from_be_bytes([r[4], r[5], r[6], r[7]]);
         let exp = (w >> 16) & 0xF;
         let mant = w & 0xFFFF;
