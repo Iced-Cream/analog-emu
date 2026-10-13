@@ -179,6 +179,7 @@ impl A4Voices {
     pub fn frame(&mut self, f: &[u8]) -> Out {
         let mut mix = (0.0f32, 0.0f32);
         let mut send = [0.0f32; 4];
+        #[allow(clippy::needless_range_loop)]
         for vi in 0..4 {
             let b = 13 * vi;
             let sw = word(f, 64 + vi);

@@ -358,6 +358,7 @@ impl Bus {
         addr >= 0xE000_0000
     }
 
+    #[allow(clippy::nonminimal_bool)]
     fn sparse_page(&mut self, addr: u32, write: bool) -> &mut [u8; SPARSE_PAGE as usize] {
         let base = addr & !(SPARSE_PAGE - 1);
         if self.strict

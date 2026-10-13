@@ -521,7 +521,7 @@ fn main() {
         logged = m.log.len();
         let io = &m.cpu.bus.io;
         let mut top: Vec<(usize, u64)> = io.irq_taken.iter().copied().enumerate().filter(|x| x.1 > 0).collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.sort_by_key(|b| std::cmp::Reverse(b.1));
         let irqs: Vec<String> = top.iter().take(8).map(|(v, n)| format!("v{v}:{n}")).collect();
         let lit = m.frame.as_ref().map(|f| Machine::lit(f)).unwrap_or(0);
         println!(
@@ -673,13 +673,13 @@ fn main() {
             *by_fn.entry(pc & !0xFF).or_insert(0) += n;
         }
         let mut v: Vec<_> = by_fn.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|b| std::cmp::Reverse(b.1));
         let mut ops: std::collections::HashMap<u16, u64> = Default::default();
         for (pc, n) in p {
             *ops.entry(m.cpu.bus.peek16(*pc)).or_insert(0) += n;
         }
         let mut ov: Vec<_> = ops.into_iter().collect();
-        ov.sort_by(|a, b| b.1.cmp(&a.1));
+        ov.sort_by_key(|b| std::cmp::Reverse(b.1));
         let mut acc = 0.0;
         println!("opcodes:");
         for (o, n) in ov.iter().take(40) {
@@ -689,7 +689,7 @@ fn main() {
         }
         println!("distinct opcodes: {}", ov.len());
         let mut blocks: Vec<(u32, u64)> = p.iter().map(|(a, n)| (*a, *n)).collect();
-        blocks.sort_by(|a, b| b.1.cmp(&a.1));
+        blocks.sort_by_key(|b| std::cmp::Reverse(b.1));
         println!("hottest blocks:");
         for (a, n) in blocks.iter().take(20) {
             println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);

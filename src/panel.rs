@@ -340,24 +340,6 @@ impl PanelMcu {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selectors_and_palette() {
-        let mut p = PanelMcu::default();
-        let mut r = Vec::new();
-        for &b in &[0xb8u8, 0x20, 0x01, 0x21, 0x02, 0xb5, 0x03, 0x1f, 0x00, 0x00, 0xb1, 0x00, 0x03] {
-            p.from_host(b, &mut r);
-        }
-        assert_eq!(p.selectors[0], Some(0x01));
-        assert_eq!(p.selectors[1], Some(0x02));
-        assert_eq!(p.palette[3], Some((31, 0, 0)));
-        // LED 0: selector 0 bits 1:0 = 1 -> slot 1 -> palette 3.
-        assert_eq!(p.led_rgb(0), Some((255, 0, 0)));
-    }
-}
 
 /// Analog Rytm MKII OS 1.73 front panel: (name, wire group, bit, OS key id).
 /// The slot table is the OS's own (`*0x40285610`, 11 groups of 8, read from a
@@ -631,7 +613,7 @@ fn device_keys() -> &'static [(&'static str, u8, u8, u8)] {
 
 /// Analog Four MKI OS 1.56 front panel: (name, wire group, bit, OS key id).
 /// The slot table is the OS's own, `0x401ebaf8` (11 groups of 8, slot = 8 group
-/// + bit; the parser `0x40062b1c` indexes it) [measured]; the OS takes it when
+/// plus bit; the parser `0x40062b1c` indexes it) [measured]; the OS takes it when
 /// boot-flag bit 20 is clear, which is the Analog Four (bit 20 set boots as the
 /// Analog Keys: "analog KEYS" logo, `0x400f1110`) [measured]. The A4 MKI sends
 /// its keys as the MKII does, `0x2g mask` [measured]. Names [measured on
@@ -817,4 +799,23 @@ pub fn rytm_code(name: &str) -> u8 {
 /// A Rytm key by name (case-insensitive). -> (wire group, bit).
 pub fn rytm_key(name: &str) -> Option<(u8, u8)> {
     device_keys().iter().find(|k| k.0.eq_ignore_ascii_case(name)).map(|k| (k.1, k.2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selectors_and_palette() {
+        let mut p = PanelMcu::default();
+        let mut r = Vec::new();
+        for &b in &[0xb8u8, 0x20, 0x01, 0x21, 0x02, 0xb5, 0x03, 0x1f, 0x00, 0x00, 0xb1, 0x00, 0x03] {
+            p.from_host(b, &mut r);
+        }
+        assert_eq!(p.selectors[0], Some(0x01));
+        assert_eq!(p.selectors[1], Some(0x02));
+        assert_eq!(p.palette[3], Some((31, 0, 0)));
+        // LED 0: selector 0 bits 1:0 = 1 -> slot 1 -> palette 3.
+        assert_eq!(p.led_rgb(0), Some((255, 0, 0)));
+    }
 }

@@ -946,7 +946,7 @@ impl Analog {
                 *last = now;
             }
         }
-        if self.frames % 96 == 0 && std::env::var_os("DTEMU_ANALOG_TRACE").is_some() {
+        if self.frames.is_multiple_of(96) && std::env::var_os("DTEMU_ANALOG_TRACE").is_some() {
             let d = &self.duals[0];
             let ar = Record::parse(&f[d.spec.env + 16..]);
             eprintln!(

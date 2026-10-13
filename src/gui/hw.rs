@@ -152,6 +152,7 @@ impl Canvas {
     }
 
     /// `round_fill` shaded from `top` to `bottom`.
+    #[allow(clippy::too_many_arguments)]
     pub fn round_grad(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, top: u32, bottom: u32) {
         let r = r.min(w / 2).min(h / 2).max(0);
         for yy in y.max(0)..(y + h).min(self.h as i32) {
@@ -165,6 +166,7 @@ impl Canvas {
     }
 
     /// The outline of `round_fill`, `t` pixels thick.
+    #[allow(clippy::too_many_arguments)]
     pub fn round_frame(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, t: i32, c: u32) {
         let r = r.min(w / 2).min(h / 2).max(0);
         let ri = (r - t).max(0);
@@ -230,8 +232,7 @@ pub fn layout(dev: Dev) -> Vec<Place> {
 
 /// The Analog Four MKII, after a community drawing of the panel.
 fn layout_a4() -> Vec<Place> {
-    let mut v = Vec::new();
-    v.push(knob(A4_ENC_LEVEL, "PUSH_LEVEL", 298, 98, 27));
+    let mut v = vec![knob(A4_ENC_LEVEL, "PUSH_LEVEL", 298, 98, 27)];
     v.push(key("GLOBAL", 60, 166, 56, 40));
     v.push(key("QPER", 168, 166, 56, 40));
     v.push(key("TEMPO", 276, 166, 56, 40));
@@ -355,8 +356,7 @@ fn ay(py: i32) -> i32 {
 
 /// The Analog Four MKI, after a photo of the panel.
 fn layout_a4mk1() -> Vec<Place> {
-    let mut v = Vec::new();
-    v.push(knob(A4_ENC_LEVEL, "PUSH_LEVEL", ax(505), ay(293), 21));
+    let mut v = vec![knob(A4_ENC_LEVEL, "PUSH_LEVEL", ax(505), ay(293), 21)];
     v.push(keyc("SONGMODE", ax(260), ay(472), 52, 22));
     v.push(keyc("CHAIN", ax(388), ay(472), 52, 22));
     v.push(keyc("TEMPO", ax(508), ay(472), 28, 28));
@@ -700,6 +700,7 @@ fn dot(cv: &mut Canvas, th: &Theme, x: i32, y: i32, c: Option<(u8, u8, u8)>) {
 
 /// A knob: shadow and body. Only a pot (`pot`) has a position mark; the
 /// encoders are endless and have none.
+#[allow(clippy::too_many_arguments)]
 fn draw_knob(cv: &mut Canvas, dev: Dev, th: &Theme, cx: i32, cy: i32, r: i32, pressed: bool, pot: bool) {
     cv.disc(cx + 2, cy + 3, r, th.shadow);
     if dev.mk1() {
@@ -970,6 +971,7 @@ fn icon(cv: &mut Canvas, name: &str, cx: i32, cy: i32, s: i32, c: u32) -> bool {
 }
 
 /// An MKII key (dark rounded key, trig key, pad or piano key).
+#[allow(clippy::too_many_arguments)]
 fn draw_key_mk2(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, name: &str, down: bool, latched: bool) {
     let lit = panel::led_for_key(panel::rytm_code(name)).and_then(|l| led(view, l));
     let has_led = panel::led_for_key(panel::rytm_code(name)).is_some();
@@ -1068,6 +1070,7 @@ fn draw_key_mk2(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, n
 }
 
 /// An MKI key (light round or pill button, pad), its LED dot and its labels.
+#[allow(clippy::too_many_arguments)]
 fn draw_key_mk1(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, name: &str, down: bool, latched: bool) {
     let code = panel::rytm_code(name);
     let lit = panel::led_for_key(code).and_then(|l| led(view, l));

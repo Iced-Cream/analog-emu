@@ -713,3 +713,26 @@ speed) is not modelled; Master Volume is an analog pot.
   that appears to be marked ColdFire (consistent with MCF5441x), a ribbon cable to
   the UI board, a QFP mid-board and a dense analog section.
 - Chip part numbers are not legible at these resolutions.
+
+## Later: the Teensy voice expander on a Rytm MKI (noted 2026-10-13, not started)
+
+Our Teensy setup targets the Rytm MKII (OS 1.73, Overbridge at USB high speed). Three things must change for an MKI:
+
+1. **Bandwidth** [manual: Overbridge manual, appendix C].
+   - The MKI is a USB Full Speed device (12 Mbit/s), limited to 8 channels per direction and 10 in total.
+   - The MKII uses 12 per direction.
+   - A realistic split is 6-8 Teensy voices into the Rytm plus 0-2 channels back (MAIN), with no per-voice stems.
+2. **The Teensy host.**
+   - `RytmHost` assumes the MKII's high-speed link: 368-byte blocks, 12 channels, alt setting 3.
+   - The MKI needs a full-speed mode with its own block layout and channel count.
+   - Its descriptors aren't dumped yet. Overwitch supports the MKI and is the reference.
+3. **The OS mods.**
+   - rytm-mods targets MKII OS 1.73: the trig reports, Overbridge inputs into each track's analog chain, machine names, and user slots.
+   - All of them would need porting to MKI OS 1.74. This emulator boots that OS, so the port can be found and tested here.
+
+Research step first, before building anything:
+- the MKI's Overbridge channel map in each direction (Overwitch, and the emulator's USB model once added);
+- whether host-to-Rytm audio can reach a track's analog chain on the MKI at all (the deciding question);
+- how much of the 1.73 mods can be located in the 1.74 MKI OS.
+
+Order: after the MKII hardware test.
