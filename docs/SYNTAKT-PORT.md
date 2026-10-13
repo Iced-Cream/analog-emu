@@ -731,7 +731,7 @@ analog side) and `--analog-wav` (the analog side alone). `DTEMU_NO_ANALOG=1` tur
 | 35, 36 | FX block VCA L/R (0x08a4 at DRIVE 1.00, VOL 110; DRIVE lowers them, PAN splits them) | FX SYN, AMP |
 | 37, 38 | FX block cutoff L/R, `2 FREQ * 256 - 0x8000` signed | FX FLTR FREQ, code |
 | 39 | FX block resonance, signed: 0xfa71 at RESO 0, 0x02c1 at 127 with LP4; shifted per type (0xeae9, NO1 0xbff1) | FX FLTR RESO, TYPE |
-| 80 high / 80 low / 81 high / 81 low | the switch byte of voice 0 / 1 / 2 / 3: filter type in bits 4-6 (drum voices) or 0-2 (cymbal): **1 LP, 2 BP, 3 HP, 4 notch (NO), 5 low shelf (LS), 6 peak (PK)**, 7 high shelf and 0 off [these two inferred by order]; on the drum voices bits 0-3 the oscillator nibble (BD HARD's WAV moves 0101 -> 1101, BD SHARP's 0101 -> 1001); on the cymbal bits 4-5 the banks' mode (0 hats, 1 metallic hats, 2 CB / CY METALLIC, 3 CB METALLIC) and bit 3 set on the CLASSIC / LAB / CY CLASSIC / CB CLASSIC machines | FLTR TYPE on each track, screens |
+| 80 high / 80 low / 81 high / 81 low | the switch byte of voice 0 / 1 / 2 / 3: filter type in bits 4-6 (drum voices) or 0-2 (cymbal): **1 LP, 2 BP, 3 HP, 4 notch (NO), 5 low shelf (LS), 6 peak (PK)**, 7 high shelf and 0 off [these two inferred by order]; on the drum voices bits 0-3 the a and b bits of oscillator 1's and 2's waveform codes (section 13; the voices' other oscillator switches are scattered over words 80-83); on the cymbal bits 4-5 the banks' mode (0 hats, 1 metallic hats, 2 CB / CY METALLIC, 3 CB METALLIC) and bit 3 set on the CLASSIC / LAB / CY CLASSIC / CB CLASSIC machines | FLTR TYPE on each track, screens |
 | 82 bits 8-11 | FX block filter type: **0xe LP4, 0xd LP2, 0xb BP, 0xa HP, 0x8 NO1, 0x9 NO2, 0xc LPN, 0xf OFF** (HP by elimination) | FX FLTR TYPE, screens |
 | 82 bit 12, 82 bit 3, 83 bit 10, 83 bit 11 | track 9, 10, 11, 12 routed to the FX block (FUNC + FX) | routing menu |
 | 84 + 4v, 104 + 4v | the voice's amp envelope (AMP ATK, HOLD, DEC), two copies (L and R as on the Rytm [inferred]); start command 0x4000 on the trig | AMP knobs |
@@ -831,12 +831,115 @@ analog oscillators off and change nothing in the frame: they are the digital lay
 
 ### Open after stage 3
 
-- Which oscillator switches mean FM, ring modulation and sync (BD FM, BD PLASTIC's TYPE, SY
-  DUAL VCO's CNFG, SY RAW's ring modulator; word 80 bit 15, word 81 bits 15, 6, 7 on track
-  9's notes): not decoded, so those machines mix their oscillators instead.
-- The oscillator nibble's waveform codes beyond sine / triangle, the cymbal mode bits and
-  CY RIDE's types; the shelf and peak filters' gain; the hardware's curves and levels
-  (overdrive, resonance, the VCA's unity, the FX drive, which word of a DAC pair is left).
+- ~~Which oscillator switches mean FM, ring modulation and sync; the waveform codes beyond
+  sine / triangle; which word of a DAC pair is left~~: section 13.
+- The cymbal mode bits and CY RIDE's types; the shelf and peak filters' gain; the
+  hardware's curves and levels (overdrive, resonance, the VCA's unity, the FX drive).
 - Words 10..13's slow drift after a note (an LFO on the cutoff [inferred]) is followed but
   not explained; the calibration words (352..411) and what a calibrated unit sends there.
 - Receive words 6/7 (the inputs) are left at zero.
+
+## 13. Oscillator switches: waveforms, reset, FM, ring modulation (2026-10-13) [measured unless tagged]
+
+Branch `osc-mod`. The drum voices' oscillator switches are decoded and modelled in a
+dual-oscillator core shared with the Rytm MKII (`src/vco.rs`; the Rytm's side is in
+docs/RYTM-PORT.md).
+
+### How it was decoded
+
+Every setting of SY DUAL VCO's CNFG (all 80, on tracks 9, 10 and 11), SY RAW's WAV1 and
+WAV2, BD SHARP's and BD ACOUSTIC's WAVE, BD HARD's and BD CLASSIC's WAV, SY CHIP's WAVE and
+BD PLASTIC's TYPE, and sweeps of BD FM's FM A, BD PLASTIC's MOD and SY RAW's LEV2, each set
+by MIDI CC (the SYN page's knobs A..H are CC 17..24 on the track's channel; a discrete
+parameter takes the CC value as its index) before a note, with the frame dumped
+(`DTEMU_ST_FRAME_DUMP`) at the trig and a few blocks later. Only words 80-83 (switches), the
+levels (20 + 4v, 21 + 4v) and, for SY CHIP's digital waves, the frequencies and 368..370
+change.
+
+### The switches
+
+| | voice 0 (track 9) | voice 1 (track 10) | voice 2 (track 11) |
+|---|---|---|---|
+| reset (set in the trig's frame only) | 80.7 | 82.14 | 82.5 |
+| oscillator 1 waveform a, b, c | 80.8, 80.9, 80.15 | 80.0, 80.1 [inferred], 82.13 | 81.8, 81.9 [inferred], 82.4 |
+| oscillator 2 waveform a, b, c | 80.10, 80.11, 81.15 | 80.2, 80.3, 82.15 | 81.10, 81.11, 82.6 |
+| FM on | 81.7 | 82.1 | 83.8 |
+| ring modulation, **active low** | 81.6 | 82.0 | 82.7 |
+
+(word.bit; the inferred b bits by symmetry with voice 0, where SY RAW's WAV1 sets it.)
+
+- **Waveform codes** (a b c), from BD SHARP's and SY RAW's lists in the manual's order:
+  **101 sine, 001 asymmetric sine, 111 triangle, 100 sinesaw, 110 saw, 011 square**; 000 is
+  sent only with both frequencies 0 (SY CHIP's noise waves: the oscillators off); 010 never.
+  SY DUAL VCO's oscillator 1 uses sine and sinesaw, its oscillator 2 the first five.
+- **Reset**: the waveforms the manual marks with a small square (BD SHARP's and BD
+  ACOUSTIC's anchored waves, SY DUAL VCO's and SY RAW's square-prefixed settings) set the
+  reset bit in the trig's frame; the others leave it clear and the oscillators run free.
+  The model resets both phases on it (it used to reset on every trig).
+- **CNFG** (SY DUAL VCO): index = 20 mode + 10 osc1 + 2 osc2 + free, mode 0 "+" (FM off, ring
+  off), 1 "R" (ring), 2 "FM" (FM; levels then 0x79f4 / 0x0a0b whatever BAL says), 3 "F+R".
+- **FM**: oscillator 2's level word is the depth: BD FM's FM A writes it linearly (0 at 0,
+  0x0cc5 at the default, 0x2fe5 at 120, 102 units a step), BD PLASTIC's MOD on a curve (0x003b
+  at 8, 0x03b6 at 32, 0x343c at 120); FM D moves oscillator 2's amp record. BD FM, BD
+  PLASTIC, SD FM and SY DUAL VCO's FM settings set it.
+- **Ring modulation**: BD PLASTIC's second TYPE (FM + ring), SY DUAL VCO's R and F+R, SY RAW's
+  seventh WAV2 (osc 2's code stays sine), SY CHIP's square and its Anim waves, and BD
+  ACOUSTIC's "square" (ring on, oscillator 1's frequency word 0 and level 0x1fff, oscillator
+  2's level 0): the square there is oscillator 2's square through a stopped oscillator 1,
+  as SY RAW's manual entry describes the ring modulator ("using a square wave").
+- **Sync**: none. Every switch bit of the three voices is one of the above, and no machine
+  or setting offers sync.
+- SD FM is on the snapshot the stage 3 sweep listed as SD CLASSIC (its frame is the Rytm's
+  SD FM's: 0x0a84 / 0x1dc0, depth 0x32b0, FM on); the one listed as SD FM does not set FM.
+  The stage 3 per-machine SD labels are therefore suspect.
+
+### The model (`src/vco.rs`, used by `stanalog.rs` and `analog.rs`) [inferred unless noted]
+
+- Shapes: every wave crosses zero rising at phase 0; the asymmetric sine's first half-cycle
+  takes 35 % of the period; sinesaw is 0.7 sine + 0.3 saw (the Rytm model's); square 50 %.
+- FM: linear through the core, f1 x (1 + depth x osc 2), depth = level word / 4096 times
+  oscillator 2's amp record (linear in its level: on the audible amp's 6 dB-a-16-levels law
+  the default FM D would end the FM within 20 ms); through zero, so the carrier keeps its
+  pitch; oscillator 2 is not heard while it modulates. The scale (4096) keeps the Rytm's
+  default BD FM near the index the earlier Rytm model gave it.
+- Ring: oscillator 1 times the square of oscillator 2's core; oscillator 2 still mixed at
+  its level. A stopped oscillator (frequency word 0) outputs +1, so the BD ACOUSTIC / Rytm BD
+  SHARP square comes out a square.
+- What a hardware recording would settle: the FM depth scale and envelope law (BD FM at
+  FM A 0 / 32 / 64 / 127 with FM T at a non-harmonic ratio), whether FM is through-zero, the
+  waveform shapes (single notes of SY RAW's six WAV1 settings), and the ring modulator's
+  square (SY RAW WAV2 ring, LEV2 0).
+
+### The DAC pairs' sides [measured]
+
+A digital track panned hard left (AMP PAN, CC 10 = 0) plays on DAC word 5 only (-30 dB RMS,
+word 3 silent); hard right on word 3 (word 5 at -105 dB). Routed to the FX block and panned
+left (FUNC + FX, trig 1): word 7 only. So **5/3 are the main pair L/R and 7/2 the FX block's
+input L/R**, as `Machine::speaker_pair` and the model already took them.
+
+### Measurements (dtboot, OS 1.42, the stage 3 machine snapshots, FLTR FREQ 127, `--analog-wav`)
+
+- **Ring** (SY RAW, osc 1 sine 261.5 Hz, osc 2 391.9 Hz, LEV2 0, 50..140 ms): f2 - f1 and
+  f2 + f1 at 0 dB, the carrier at -46 dB, |f1 - 3 f2| -5.6 dB, f1 + 3 f2 -11.9 dB (the
+  square's third harmonic); WAV2 sine instead: all of these below -51 dB. SY DUAL VCO's R
+  (523.1 / 830.5 Hz): the carrier 56 dB under the sum and difference.
+- **FM** (BD FM, FM T 100: f1 92.5 Hz, f2 740 Hz; FM D 127; 20..120 ms), f1 +- f2 against the
+  carrier: FM A 0 -71 / -67 dB, 32 -26 / -26, 64 -22 / -21, 96 -19 / -20, 127 -17 / -17 (at the
+  default FM D the depth decays with the FM's envelope and the sidebands are 20-30 dB lower).
+  SY DUAL VCO's FM (523.1 / 830.5 Hz, depth 0x0a0b): f1 +- f2 at -16.5 dB, f2 itself at
+  -84 dB. Pitch (SY DUAL VCO FM, notes 48 / 60 / 72): -0.5 / +0.1 / +0.0 cents from oscillator
+  1's word.
+- **Waveforms** (SY RAW WAV1, 261.5 Hz, LEV2 0), harmonics 2..5 against the fundamental: saw
+  -6.4 / -10.0 / -12.5 / -14.4 dB; square -70 / -9.5 / -73 / -14.0; triangle -76 / -20.9 / -74 /
+  -29.9; sine -85 / -28.6 (the overdrive) / -79 / -55.
+- **Levels**: BD FM, BD PLASTIC (both types), SY DUAL VCO's four modes, SY RAW sine / ring,
+  BD SHARP's and BD ACOUSTIC's squares peak between -17.6 and -22.3 dBFS.
+- **Unchanged**: the end screens of all seven devices, and the Rytm's renders of machines
+  that use neither FM nor ring modulation (RYTM-PORT.md), are byte-identical to main's; the
+  Syntakt window (headless, null audio, the demo playing) holds SPEED 100 % with 0 dropouts.
+
+### Open after section 13
+
+- The FM depth scale and law, the shapes and the ring modulator's square are inferred (see
+  above); SY CHIP's Anim waves are switched per block by the firmware and follow the bits
+  as they come.

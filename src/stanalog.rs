@@ -12,9 +12,12 @@
 //!   14 + v; amp envelope records (L, R) at 84 + 4v and 104 + 4v; filter
 //!   envelope record at 124 + 4v (its first word the ENV depth); a switch byte
 //!   (v0 word 80 high, v1 word 80 low, v2 word 81 high, v3 word 81 low): filter
-//!   type (1 LP, 2 BP, 3 HP, 4 notch, 5 low shelf, 6 peak) in bits 4-6 and the
-//!   oscillator nibble in bits 0-3 on the drum voices, the type in bits 0-2 and
-//!   the banks' mode in bits 4-5 on the cymbal voice; routing to the FX block:
+//!   type (1 LP, 2 BP, 3 HP, 4 notch, 5 low shelf, 6 peak) in bits 4-6 and
+//!   bits a, b of both oscillators' waveform codes in bits 0-3 on the drum
+//!   voices, the type in bits 0-2 and the banks' mode in bits 4-5 on the cymbal
+//!   voice; the drum voices' other oscillator switches (reset, the waveform
+//!   codes' c bits, FM, ring modulation) are scattered over words 80-83
+//!   (`OSC_BITS`, section 13); routing to the FX block:
 //!   word 82 bit 12 (v0), word 82 bit 3 (v1), word 83 bits 10 and 11 (v2, v3).
 //! - drum voice v: oscillator 1 and 2 frequency at 18 + 4v and 19 + 4v (8 units
 //!   a Hz), their levels at 20 + 4v and 21 + 4v (0x1fff nominal, higher with
@@ -39,6 +42,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::analog::{Record, LEVELS_PER_6DB};
+use crate::vco::{Osc2Set, Pair, Wave};
 
 /// The frame's two buffers (0x800051e0 + 0x830 k; the 0x8000AAAA word at
 /// +0xC, then 500 data words 0x8001wwww, then 0x08005555) [measured].
@@ -202,29 +206,42 @@ fn cutoff_hz(cv: f32) -> f32 {
     (440.0 * ((frq - 60.0) / 12.0).exp2()).clamp(10.0, 22_000.0)
 }
 
-/// One oscillator waveform from a 2-bit code of the oscillator nibble:
-/// 1 sine, 3 triangle, 2 saw, 0 sine [inferred from BD HARD's WAV knob, which
-/// moves the audible oscillator's code from 1 to 3 at its triangle].
-fn wave(ph: f32, code: u16) -> f32 {
-    match code & 3 {
-        3 => 1.0 - 4.0 * (ph - 0.5).abs(),
-        2 => 2.0 * ph - 1.0,
-        _ => (TAU * ph).sin(),
-    }
+/// A drum voice's oscillator switches: (word, bit) of the reset pulse, of
+/// oscillator 1's and 2's waveform bits a, b, c, of FM on and of ring
+/// modulation (active low) [measured on voices 0, 1 and 2 by sweeping SY DUAL
+/// VCO's CNFG on tracks 9, 10 and 11, and on voice 0 the WAV / WAVE / TYPE
+/// settings of every machine; the a and b bits of oscillator 1 on voices 1
+/// and 2 by symmetry with voice 0, where SY RAW's WAV1 sets them, inferred].
+struct OscBits {
+    reset: (usize, u32),
+    wave: [[(usize, u32); 3]; 2],
+    fm: (usize, u32),
+    ring_n: (usize, u32),
 }
 
-/// An analog drum voice's source: two oscillators with a pitch and an amp
-/// envelope each.
+const OSC_BITS: [OscBits; 3] = [
+    OscBits { reset: (80, 7), wave: [[(80, 8), (80, 9), (80, 15)], [(80, 10), (80, 11), (81, 15)]], fm: (81, 7), ring_n: (81, 6) },
+    OscBits { reset: (82, 14), wave: [[(80, 0), (80, 1), (82, 13)], [(80, 2), (80, 3), (82, 15)]], fm: (82, 1), ring_n: (82, 0) },
+    OscBits { reset: (82, 5), wave: [[(81, 8), (81, 9), (82, 4)], [(81, 10), (81, 11), (82, 6)]], fm: (83, 8), ring_n: (82, 7) },
+];
+
+fn bit(img: &[u8], (i, b): (usize, u32)) -> bool {
+    (w(img, i) >> b) & 1 != 0
+}
+
+/// An analog drum voice's source: two oscillators (`vco::Pair`) with a pitch
+/// and an amp envelope each.
 #[derive(Clone, Copy, Default)]
 struct Drum {
-    ph: [f32; 2],
+    osc: Pair,
+    reset: bool,
     pitch: [StEnv; 2],
     amp: [StEnv; 2],
     recs: [Rec; 4],
 }
 
 impl Drum {
-    fn update(&mut self, img: &[u8], v: usize, trig: bool) {
+    fn update(&mut self, img: &[u8], v: usize) {
         for k in 0..4 {
             self.recs[k] = Rec::at(img, 140 + 16 * v + 4 * k, k < 2);
         }
@@ -232,12 +249,17 @@ impl Drum {
             self.pitch[k].update(&self.recs[k], false);
             self.amp[k].update(&self.recs[2 + k], false);
         }
-        if trig {
-            self.ph = [0.0; 2]; // reset by the trig [inferred]
+        // The reset bit is set in the trig's frame only, by the machines and
+        // waveform settings that reset the phases (BD SHARP's anchored waves,
+        // SY DUAL VCO's square-prefixed CNFGs); the others run free [measured].
+        let reset = bit(img, OSC_BITS[v].reset);
+        if reset && !self.reset {
+            self.osc.reset();
         }
+        self.reset = reset;
     }
 
-    fn sample(&mut self, img: &[u8], v: usize, sw: u16) -> f32 {
+    fn sample(&mut self, img: &[u8], v: usize) -> f32 {
         for k in 0..2 {
             self.pitch[k].tick(&self.recs[k]);
             self.amp[k].tick(&self.recs[2 + k]);
@@ -246,18 +268,28 @@ impl Drum {
         if a == [0.0, 0.0] {
             return 0.0;
         }
-        let mut out = 0.0;
+        let b = &OSC_BITS[v];
+        let mut s = Osc2Set { hz: [0.0; 2], stopped: [false; 2], wave: [Wave::Off; 2], level: [0.0; 2], depth_word: 0.0, fm: bit(img, b.fm), ring: !bit(img, b.ring_n) };
         for k in 0..2 {
-            let hz = w(img, 18 + 4 * v + k) as f32 / OSC_UNITS_PER_HZ + self.pitch[k].level.max(0.0) * HZ_PER_PITCH_LEVEL;
-            let o = wave(self.ph[k], sw >> (2 * k));
-            self.ph[k] = (self.ph[k] + hz.min(FS * 0.45) / FS).fract();
+            let word = w(img, 18 + 4 * v + k);
+            s.hz[k] = word as f32 / OSC_UNITS_PER_HZ + self.pitch[k].level.max(0.0) * HZ_PER_PITCH_LEVEL;
+            s.stopped[k] = word == 0;
+            let [x, y, z] = b.wave[k];
+            s.wave[k] = Wave::from_bits(bit(img, x), bit(img, y), bit(img, z));
             // Levels: 0x1fff nominal, 0x7fff with OVER at its top [measured];
             // nominal is taken as the overdrive's full input, about 3x the
             // digital layer's (UT NOISE's VCA word is 3x a drum's) [inferred].
-            let l = w(img, 20 + 4 * v + k) as f32 / 8191.0;
-            out += o * l * a[k];
+            let lw = w(img, 20 + 4 * v + k) as f32;
+            s.level[k] = lw / 8191.0 * a[k];
+            if k == 1 {
+                // As FM depth, oscillator 2's level word follows its amp
+                // record (BD FM's FM D decays the FM), taken as linear in the
+                // record's level: on the 6 dB-a-16-levels law of the audible
+                // amp, the default FM D would end the FM within 20 ms [inferred].
+                s.depth_word = lw * (self.amp[1].level / 127.0).clamp(0.0, 1.0);
+            }
         }
-        out
+        self.osc.sample(&s, FS)
     }
 }
 
@@ -538,11 +570,9 @@ impl StAnalog {
         }
         let img = &self.img;
         for v in 0..4 {
-            let was = self.chains[v].vca[0].w0;
             self.chains[v].update(img, v);
-            let trig = was != 0x4000 && self.chains[v].vca[0].w0 == 0x4000;
             if v < 3 {
-                self.drums[v].update(img, v, trig);
+                self.drums[v].update(img, v);
             }
         }
         self.cym.update(img);
@@ -584,7 +614,7 @@ impl StAnalog {
         let mut fx_in = [s(dac[7]), s(dac[2])];
         for v in 0..4 {
             let sw = (w(img, SWITCH[v].0) >> SWITCH[v].1) & 0xFF;
-            let src = if v < 3 { self.drums[v].sample(img, v, sw & 0xF) } else { self.cym.sample(img) } + s(dac[LAYER_DAC[v]]);
+            let src = if v < 3 { self.drums[v].sample(img, v) } else { self.cym.sample(img) } + s(dac[LAYER_DAC[v]]);
             // Each voice's overdrive: a soft clip; OVER raises the levels into
             // it and lowers the VCA words after it [measured words; curve inferred].
             let x = if src == 0.0 { 0.0 } else { src.tanh() };

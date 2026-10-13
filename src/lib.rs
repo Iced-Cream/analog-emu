@@ -23,3 +23,4 @@ pub mod nor;
 pub mod mk1;
 pub mod syntakt;
 pub mod stanalog;
+pub mod vco;

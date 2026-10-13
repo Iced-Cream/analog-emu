@@ -11,9 +11,12 @@
 //! So far: the three dual-oscillator voices, BD (physical voice 0), SD (2) and
 //! RS/CP (7), one circuit design at three places in the frame; the hihat
 //! (CH/OH, voice 4); the toms (BT 1, LT 3, MT/HT 5); cymbal/cowbell (CY/CB, 6). Their two
-//! oscillators, levels, FM and ring-mod switches and pitch and amplitude envelopes
+//! oscillators, levels, FM and ring-mod switches (the dual-oscillator core
+//! shared with the Syntakt, `vco.rs`) and pitch and amplitude envelopes
 //! come from the frame; everything about how a value sounds is approximate and
 //! marked [inferred].
+
+use crate::vco::{Osc2Set, Pair, Wave};
 
 /// Offsets in the control frame (OS 1.73/1.74; RAM did not move between them).
 pub const FRAME_ADDR: u32 = 0x8000_63C0;
@@ -120,7 +123,10 @@ impl Drift {
 /// voice-controls.md]: its CV block (TUNE1, TUNE2, LEVEL1, LEVEL2), its four
 /// envelope records (a pitch pair, then an amplitude pair) and its seven switch
 /// bits by table index (0 trig, 1 osc 1 wave, 2/3/6 osc 2 wave, 4 FM on, 5 ring
-/// mod, active low).
+/// mod, active low). Osc 1's bit set is its sine, clear its sinesaw; 2/3/6 are
+/// the c, b, a bits of osc 2's waveform code (`vco::Wave`) [measured: every
+/// waveform and CFG setting of BD SHARP, BD ACOUSTIC, SY DUAL VCO and SY RAW
+/// against the Syntakt's codes, 2026-10-13]. No bit means sync.
 #[derive(Clone, Copy)]
 struct DualSpec {
     voice: usize,
@@ -203,6 +209,11 @@ struct DualOsc {
     ph2: f32,
     pitch: Env,
     amp: Env,
+    /// Oscillator 2's amp record (the pair's second, +24): the FM depth's
+    /// envelope (BD FM's FMD) [inferred from the Syntakt's BD FM, whose FM D
+    /// moves the same record].
+    last_m: [u8; 8],
+    amp2: Env,
     trig: bool,
     /// This hit's detune and the slow drift, per oscillator.
     det: [f32; 2],
@@ -212,7 +223,7 @@ struct DualOsc {
 impl DualOsc {
     /// Silent until the first trig: the amplitude envelope rests at its floor.
     fn new(spec: DualSpec) -> Self {
-        DualOsc { spec, last_p: [0; 8], last_a: [0; 8], ph1: 0.0, ph2: 0.0, pitch: Env::default(), amp: Env { level: -128.0 }, trig: false, det: [1.0; 2], drift: [Drift::default(); 2] }
+        DualOsc { spec, last_p: [0; 8], last_a: [0; 8], ph1: 0.0, ph2: 0.0, pitch: Env::default(), amp: Env { level: -128.0 }, last_m: [0; 8], amp2: Env { level: -128.0 }, trig: false, det: [1.0; 2], drift: [Drift::default(); 2] }
     }
 }
 
@@ -249,23 +260,52 @@ impl DualOsc {
         let f2 = (word(f, s.cv + 2) as f32 + sweep) * HZ_PER_TUNE * self.det[1] * self.drift[1].tick(w);
         let l1 = word(f, s.cv + 4) as f32 / 32767.0;
         let l2 = word(f, s.cv + 6) as f32 / 32767.0;
+        let rm = &f[s.env + 24..s.env + 32];
+        if rm != self.last_m {
+            let r = Record::parse(rm);
+            if r.start_cmd {
+                self.amp2.level = r.start;
+            }
+            self.last_m.copy_from_slice(rm);
+        }
+        self.amp2.tick(&Record::parse(rm));
+        let fm = bit(f, s.sw[4]);
+        let ring = !bit(f, s.sw[5]);
+        let gain = if self.amp.level <= -127.5 { 0.0 } else { ((self.amp.level - 127.0) / LEVELS_PER_6DB).exp2() };
+        if fm || ring {
+            // The shared dual-oscillator core (vco.rs): FM, ring modulation and
+            // the full waveform codes. Oscillator 1 has the c bit only (index
+            // 1: sine or sinesaw); oscillator 2's code is (a, b, c) = indices
+            // (6, 3, 2) [measured: the Syntakt's codes for the same settings].
+            let set = Osc2Set {
+                hz: [f1, f2],
+                stopped: [word(f, s.cv) == 0, word(f, s.cv + 2) == 0],
+                wave: [Wave::from_bits(true, false, bit(f, s.sw[1])), Wave::from_bits(bit(f, s.sw[6]), bit(f, s.sw[3]), bit(f, s.sw[2]))],
+                level: [l1, l2],
+                depth_word: word(f, s.cv + 6) as f32 * (self.amp2.level / 127.0).clamp(0.0, 1.0),
+                fm,
+                ring,
+            };
+            let mut p = Pair { ph: [self.ph1, self.ph2] };
+            let y = p.sample(&set, FS);
+            [self.ph1, self.ph2] = p.ph;
+            return y * gain;
+        }
         let tau = std::f32::consts::TAU;
         let o2 = (tau * self.ph2).sin();
-        let fm = bit(f, s.sw[4]);
-        // FM as phase modulation by oscillator 2, its index from LEVEL2 [inferred].
-        let mut o1 = if fm { (tau * self.ph1 + 8.0 * l2 * o2).sin() } else { (tau * self.ph1).sin() };
+        // Without FM or ring modulation: the model as it was before the
+        // switches were decoded (osc 1 a sine, "sinesaw" with index 1 set,
+        // though the codes say index 1 set is the sine; kept so these
+        // machines sound as before).
+        let mut o1 = (tau * self.ph1).sin();
         if bit(f, s.sw[1]) {
             // "sinesaw": a sine with some saw added [inferred shape].
             o1 = 0.7 * o1 + 0.3 * (2.0 * self.ph1 - 1.0);
         }
-        if !bit(f, s.sw[5]) {
-            o1 *= o2;
-        }
         self.ph1 = (self.ph1 + f1 / FS).fract();
         self.ph2 = (self.ph2 + f2 / FS).fract();
-        let osc = o1 * l1 + if fm { 0.0 } else { o2 * l2 };
+        let osc = o1 * l1 + o2 * l2;
         // 127 is full scale, -128 the floor (silent); logarithmic between.
-        let gain = if self.amp.level <= -127.5 { 0.0 } else { ((self.amp.level - 127.0) / LEVELS_PER_6DB).exp2() };
         osc * gain
     }
 }

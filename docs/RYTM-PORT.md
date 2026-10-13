@@ -719,3 +719,65 @@ Checked (2026-10-09, `DTEMU_STRICT=1` unless noted; rytm-mods efm-173 at
   cold boot and only switches on what is off: its YES presses toggle, and the
   old fixed sequence turned clock and transport send OFF on a card that had a
   power-off with them on [measured].
+
+## Oscillator switches: FM, ring modulation, waveforms (2026-10-13)
+
+Branch `osc-mod`. The dual-oscillator voices' seven switch bits (BD, SD, RS/CP; table
+in `analog.rs` `DualSpec`) are decoded against the Syntakt, whose analog drum voices are
+the same design (docs/SYNTAKT-PORT.md section 13), and FM and ring modulation now run
+through a core shared with it (`src/vco.rs`).
+
+**Decoding** [measured]: the machine set by CC 15 (Track Machine Type) on the track's
+channel (BD channel 1, SD 2), its SYN knobs by CC 16..23 (a discrete parameter takes the
+CC value as its index), a hit by a note on the auto channel (note 0 BD, 1 SD, 2 RS), and
+`DTEMU_FRAME_TRACE` on the CV block and switch bytes. Every value of SY DUAL VCO's CFG
+(80), SY RAW's two waveform parameters, BD SHARP's and BD ACOUSTIC's WAV, and BD FM, SD FM,
+BD PLASTIC at their defaults:
+
+- index 0 is the reset (pulsed on the trig only for the settings the manual marks
+  with a small square; free-running settings leave it clear);
+- index 1 is oscillator 1's waveform: **set = sine, clear = sinesaw** (the earlier model
+  took set as sinesaw);
+- indices 2, 3, 6 are the c, b, a bits of oscillator 2's waveform code, the Syntakt's
+  code: CFG's five oscillator 2 waves are 101 sine, 100 skewed sine, 111 triangle, 001
+  sinesaw, 011 saw in index order 2-3-6; BD SHARP's and BD ACOUSTIC's first five waves the
+  same, their sixth the ring-modulation square below;
+- index 4 is FM on, index 5 ring modulation (active low), as rytm-mods' TEST machines
+  named them;
+- the square of BD SHARP and BD ACOUSTIC is ring modulation with oscillator 1's tune
+  word 0 and its level up (0x284e), oscillator 2's level 0; SY RAW's first waveform
+  parameter drives oscillator 2's code (the Rytm's oscillator 1 has one waveform bit),
+  and its fifth value sends code 000, which the Syntakt only sends with the oscillators
+  off (open);
+- **no sync**: the seven bits are all accounted for, and no machine offers it;
+- the FM depth is LEVEL2 (+96 for BD): BD FM's FMA 0x0cc5 at its default, 0x32b0 at
+  127, the same words as the Syntakt's BD FM; FMD sets oscillator 2's amp record (the
+  pair's second record, +384 for BD). FM is on for BD FM, SD FM, BD PLASTIC and CFG's
+  FM settings; ring for BD PLASTIC's second TYP, CFG's R settings, the squares above, and
+  **the default kit's RS/CP machine** (ring on, oscillator 1 sinesaw, oscillator 2 sine).
+  The default kit's BD is BD PLASTIC (FM on).
+
+**Model** [inferred]: only when FM or ring modulation is on does a voice go through the
+shared core (`vco::Pair`): the full waveform codes, FM linear through the core and through
+zero, f1 x (1 + LEVEL2 / 4096 x osc 2 x the amp record's level / 127), oscillator 2 not
+heard while it modulates; ring = oscillator 1 x the square of oscillator 2, oscillator 2
+still mixed; a stopped oscillator gives +1. This replaces the phase modulation with index
+8 x LEVEL2 / 32767 (independent of FMT) and the ring as a product of sines. The scale 4096
+gives the same index as before at BD FM's default FMT (oscillator 2 about 1.1x oscillator
+1). Voices with both switches off take the old code path unchanged, waveforms included, so
+they sound exactly as before. A recording of BD FM on the user's Rytm at FMA 0 / 32 / 64 /
+127 (FMT at a non-harmonic ratio, FMD up) would settle the scale, the zero crossing and the
+depth's envelope.
+
+**Measured on the emulator** (`--analog-wav`, `DTEMU_ANALOG_IDEAL=1`, filter FRQ 127):
+- byte-identical to main: BD HARD, BD CLASSIC, BD SHARP (sine), SY DUAL VCO (CFG 0) on BD,
+  the default kit's SD and CH hits;
+- BD FM (FMT 70: f1 60.0 Hz, f2 240.1 Hz; FMD 127; 10..100 ms), f1 + f2 against the carrier:
+  FMA 0 -46, 32 -21, 64 -16, 96 -13, 127 -10 dB (the old model: +9 dB at 64, its index not
+  falling with FMT); peaks unchanged within 0.5 dB (-29 dBFS);
+- ring (SY DUAL VCO CFG 20, 169.7 / 240.0 Hz): sum and difference at 0 dB, carrier -52 dB,
+  3 f2 +- f1 at -9.3 dB (the square's third harmonic; -39 / -44 dB with the old sine product);
+- BD SHARP's square: odd harmonics at -9.5 (3rd) and -14.0 dB (5th), even ones under -70 dB,
+  peak -10.2 dBFS (the old model: -21.1, oscillator 1 at 0 Hz stayed silent);
+- the default kit: BD PLASTIC peaks -8.9 dBFS (was -13.5), RS -14.1 (was -12.1);
+- the end screens of all seven devices unchanged; the Rytm window holds SPEED 100 %.

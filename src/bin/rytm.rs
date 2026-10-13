@@ -637,8 +637,8 @@ pub fn main() {
         }
     }
     let ports = o.midi && (!o.headless || o.midi_headless);
-    let a4v = view.lock().unwrap().a4;
-    let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if a4v { "a4-emu" } else { "rytm-emu" }.into());
+    // The same names as the output ports.
+    let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let _midi_in = if ports { midi::start_in(tx.clone(), &format!("{pname} in"), false) } else { None };
     let _usb_in = if ports && view.lock().unwrap().rytm { midi::start_in(tx.clone(), &format!("{pname} usb in"), true) } else { None };
     // --midi-from NAME: an existing MIDI source (a real Rytm, a keyboard) into
