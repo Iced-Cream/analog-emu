@@ -15,8 +15,9 @@
 //!   06 / 04          write enable / disable (WEL)
 //!   05               read status (WIP always 0, WEL), repeated while selected
 //!   03 a a a / 0B a a a d   read / fast read
-//!   02 a a a data    page program: bits only clear, wraps in its 256-byte page
-//!   20 / 52 / D8 a a a     erase 4 KB / 32 KB / 64 KB
+//!   02 a a a data    page program: bits only clear, wraps in its page
+//!   D8 a a a         erase a sector (the part's: 256 KB on the default)
+//!   20 / 52 a a a    erase 4 KB / 32 KB, on parts that have them
 //!   C7 / 60          erase the chip
 //!   9F               JEDEC ID (`SpiFlash::id`)
 //!   30               clear status (Spansion's CLSR; the OS sends it after
@@ -25,9 +26,10 @@
 //!
 //! Program and erase need WEL, act when the chip select goes high (a word
 //! without CONT), and clear WEL; they complete at once, so a status poll
-//! never sees WIP. Which part the board carries, and so its erase sizes and
-//! ID, is [inferred]; any other command is counted in `unknown` and answers
-//! 0xFF. Nothing here reaches real hardware: the image is a byte vector
+//! never sees WIP. The part is `Part`: by default the owner's Rytm MKII's,
+//! read with the factory-test console's #STATUS (FLASH `01 2018 00`,
+//! 2026-10-22) [measured]. Any other command is counted in `unknown` and
+//! answers 0xFF. Nothing here reaches real hardware: the image is a byte vector
 //! (written back to a file only by the tools' `--flash` option).
 
 use std::collections::{BTreeMap, VecDeque};
@@ -37,16 +39,30 @@ pub const DSPI0_PUSHR: u32 = 0xFC05_C034;
 pub const DSPI0_POPR: u32 = 0xFC05_C038;
 /// PUSHR's PCS field (bits 23:16) for the flash.
 const PCS_FLASH: u32 = 0x0002_0000;
-const PAGE: usize = 256;
 
-/// A Winbond W25Q128 (EF 4018). The OS's part check (Rytm MKII OS 1.74
-/// `0x40136b50`, on the first five 9F bytes) knows Spansion 01 2018 (byte 4
-/// 0: 512-byte pages, 256 KB sectors; 1: 256-byte pages, 64 KB sectors),
-/// ISSI 9D 6017/6018, Macronix C2 2017/2018, Winbond EF 4014/7015/4017/4018
-/// and EON 1C 7015; all but the first take 256-byte pages and 64 KB sectors
-/// [measured]. Any other ID fails every program and erase. Which of them a
-/// unit carries is not known; this one has the plain JEDEC command set.
-pub const ID_W25Q128: [u8; 5] = [0xEF, 0x40, 0x18, 0x00, 0x00];
+/// A flash part: its 9F answer and geometry. The OS's part check (Rytm MKII
+/// OS 1.74 `0x40136b50`, on the first five 9F bytes) knows Spansion 01 2018
+/// (byte 4 = 0: 512-byte pages, 256 KB sectors; 1: 256-byte pages, 64 KB
+/// sectors), ISSI 9D 6017/6018, Macronix C2 2017/2018, Winbond EF
+/// 4014/7015/4017/4018 and EON 1C 7015 (256-byte pages, 64 KB sectors)
+/// [measured]. Any other ID fails every program and erase.
+#[derive(Clone, Copy, Debug)]
+pub struct Part {
+    pub id: [u8; 6],
+    pub page: usize,
+    /// What D8 erases.
+    pub sector: usize,
+    /// 20 (4 KB) and 52 (32 KB) erases exist.
+    pub small_erases: bool,
+}
+
+/// Spansion S25FL128S with uniform 256 KB sectors: 01 2018, byte 4 = 00, as
+/// the owner's Rytm MKII reports [measured]; bytes 3 and 5 (4D, 80) are the
+/// datasheet's [inferred: the console prints neither].
+pub const S25FL128S_256K: Part = Part { id: [0x01, 0x20, 0x18, 0x4D, 0x00, 0x80], page: 512, sector: 0x4_0000, small_erases: false };
+
+/// A Winbond W25Q128 (EF 4018), another part the OS accepts.
+pub const W25Q128: Part = Part { id: [0xEF, 0x40, 0x18, 0x00, 0x00, 0x00], page: 256, sector: 0x1_0000, small_erases: true };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -56,8 +72,8 @@ pub enum Op {
 
 pub struct SpiFlash {
     pub mem: Vec<u8>,
-    /// What 9F answers (the OS reads five bytes).
-    pub id: [u8; 5],
+    /// The part: what 9F answers (the OS reads five bytes) and its geometry.
+    pub part: Part,
     wel: bool,
     /// Bytes into the current selection, and its command and address.
     idx: u32,
@@ -83,7 +99,7 @@ impl SpiFlash {
     pub fn new(mem: Vec<u8>) -> SpiFlash {
         SpiFlash {
             mem,
-            id: ID_W25Q128,
+            part: S25FL128S_256K,
             wel: false,
             idx: 0,
             cmd: 0,
@@ -143,12 +159,12 @@ impl SpiFlash {
         }
         match self.cmd {
             0x05 => (self.wel as u8) << 1,
-            0x9F => self.id.get(i as usize - 1).copied().unwrap_or(0xFF),
+            0x9F => self.part.id.get(i as usize - 1).copied().unwrap_or(0xFF),
             0x03 => self.read_next(),
             0x0B if i == 4 => 0xFF,
             0x0B => self.read_next(),
             0x02 => {
-                if self.prog.len() < PAGE {
+                if self.prog.len() < self.part.page {
                     self.prog.push(b);
                 }
                 0xFF
@@ -173,10 +189,11 @@ impl SpiFlash {
         if self.trace_all {
             eprintln!("[spi flash] cmd {cmd:02x} addr {addr:06x} {n} bytes wel {}", self.wel);
         }
+        let small = self.part.small_erases;
         let erase = match cmd {
-            0x20 => Some(0x1000),
-            0x52 => Some(0x8000),
-            0xD8 => Some(0x1_0000),
+            0x20 if small => Some(0x1000),
+            0x52 if small => Some(0x8000),
+            0xD8 => Some(self.part.sector),
             0xC7 | 0x60 => Some(self.mem.len()),
             _ => None,
         };
@@ -192,9 +209,10 @@ impl SpiFlash {
         } else if cmd == 0x02 && n >= 4 {
             if self.wel && !prog.is_empty() {
                 let a = addr % self.mem.len();
-                let page = a & !(PAGE - 1);
+                let size = self.part.page;
+                let page = a & !(size - 1);
                 for (k, d) in prog.iter().enumerate() {
-                    self.mem[page + (a + k) % PAGE] &= d;
+                    self.mem[page + (a - page + k) % size] &= d;
                 }
                 self.done(Op::Program { at: a as u32, len: prog.len() as u32 });
                 self.programmed_bytes += prog.len() as u64;
@@ -242,6 +260,7 @@ mod tests {
     #[test]
     fn erase_program_read() {
         let mut f = SpiFlash::new(vec![0u8; 1 << 20]);
+        f.part = W25Q128;
         // Without WREN nothing changes.
         tx(&mut f, &[0x20, 0x00, 0x10, 0x00]);
         assert_eq!(f.mem[0x1000], 0);
@@ -259,6 +278,26 @@ mod tests {
         let r = tx(&mut f, &[0x03, 0x00, 0x10, 0xFE, 0, 0]);
         assert_eq!(&r[4..], &[0x12, 0x34]);
         assert_eq!(f.ops.len(), 2);
+    }
+
+    #[test]
+    fn default_part_256k_sectors_512_byte_pages() {
+        let mut f = SpiFlash::new(vec![0u8; 1 << 20]);
+        assert_eq!(&tx(&mut f, &[0x9F, 0, 0, 0, 0, 0])[1..], &[0x01, 0x20, 0x18, 0x4D, 0x00]);
+        tx(&mut f, &[0x06]);
+        tx(&mut f, &[0x20, 0x04, 0x00, 0x00]); // no 4 KB erase on this part
+        assert_eq!(f.mem[0x4_0000], 0);
+        tx(&mut f, &[0x06]);
+        tx(&mut f, &[0xD8, 0x05, 0x00, 0x00]);
+        assert!(f.mem[0x4_0000..0x8_0000].iter().all(|&b| b == 0xFF));
+        assert_eq!(f.mem[0x8_0000], 0);
+        tx(&mut f, &[0x06]);
+        let mut cmd = vec![0x02, 0x04, 0x01, 0xFF];
+        cmd.extend([0x11, 0x22]);
+        tx(&mut f, &cmd);
+        // 0x401FF is the last byte of the 512-byte page at 0x40000.
+        assert_eq!(f.mem[0x4_01FF], 0x11);
+        assert_eq!(f.mem[0x4_0000], 0x22);
     }
 
     #[test]

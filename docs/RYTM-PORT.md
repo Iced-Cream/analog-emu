@@ -809,8 +809,10 @@ upgrade path does not use.
 sector size or fails every program and erase: Spansion 01 2018 (byte 4 = 0:
 512-byte pages, 256 KB sectors; 1: 256 B, 64 KB), ISSI 9D 6017/6018, Macronix C2
 2017/2018, Winbond EF 4014/7015/4017/4018, EON 1C 7015 (all 256 B, 64 KB). The
-emulator answers EF 40 18 (a W25Q128); which part a unit carries is not known
-[inferred]. Before this model the 9F read returned junk, and that is why the
+owner's Rytm MKII reports Spansion 01 2018 with byte 4 = 00 (the factory-test
+console's #STATUS, below) [measured]: an S25FL128S with uniform 256 KB sectors
+and 512-byte pages, which the emulator now answers as (`spiflash::Part`;
+`W25Q128` stays as a 64 KB-sector alternative). Before this model the 9F read returned junk, and that is why the
 earlier test stopped on OS UPGRADE RECEIVING with no prompt: with a known ID
 the prompt comes.
 
@@ -818,9 +820,9 @@ the prompt comes.
 - start (0x50) -> status 0, OS UPGRADE RECEIVING. Writes in 32 KiB (58) or
   2 KiB (919) pieces, open loop or at fixed clocks, all answered in order; the
   last with status 1. Then UPGRADE OS NOW? CONFIRM YES/NO.
-- YES -> ERASING FLASH...: 23 sectors of 64 KB from 0x80000 (0x4009f404:
-  `(size + sector - 1) / sector` erases), then "Writing Flash": 5798 page
-  programs from 0x80000, 1,484,288 bytes, which is the new `.syx`'s ELE3
+- YES -> ERASING FLASH...: 6 sectors of 256 KB from 0x80000 (0x4009f404:
+  `(size + sector - 1) / sector` erases), then "Writing Flash": 2899 page
+  programs of 512 bytes from 0x80000 (with the W25Q128: 23 x 64 KB, 5798 x 256), 1,484,288 bytes, which is the new `.syx`'s ELE3
   container byte for byte (`dtboot` compares them: no "different OS" note).
 - "Success! Rebooting": a wait (0x40098c84(3000000); 3 s if microseconds
   [inferred]), 0 to 0x48000000, then RCR (0xEC090000) = 0x80, a software reset
@@ -873,13 +875,14 @@ Commands (strings in 0x4013a234): #HELLO, #STATUS, #READ_SERIAL, #READ_TEMP,
 #DUMP_CALIBRATION and other reads; also #UPGRADE (writes the bootstrap),
 #FULL_UPGRADE, #FORMAT_FS, #WRITE_SERIAL and more that write the flash or the
 card. #STATUS prints a block per part; its FLASH line is the first bytes of
-the 9F ID (`EF 4018 00 ...` with the emulator's part).
+the 9F ID (`01 2018 00 ...` on the owner's unit and the emulator alike; the
+words after it differ per unit and are not recorded here).
 
 In the emulator: `dtboot FW --poke 407ffffc=00140040 --usb-serial "#STATUS@3.5G"`
 (boot flags 0x00140040; `--usb-serial` turns on the USB host as a serial
 driver, `UsbHost::cdc`, and prints what comes back). Measured on 1.74:
 #HELLO -> HOW DO YOU DO?; #STATUS -> START, VERSION 1, OS 0176 1.74, PLATFORM,
-FLASH EF 4018, DRAM, FPGA, SUPERCAP, UI (WRONG UI CARD), MMC, CODEC (FAIL).
+FLASH 01 2018 (EF 4018 before the part was changed), DRAM, FPGA, SUPERCAP, UI (WRONG UI CARD), MMC, CODEC (FAIL).
 
 `usbdev.rs` now keeps OTGSC's line-state bits (8..14) read-only: the
 firmware's USB setup write (0x08000000) cleared the host's VBUS before, and a
