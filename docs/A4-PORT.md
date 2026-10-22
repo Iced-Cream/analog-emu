@@ -595,9 +595,12 @@ OS 1.56 (the only A4 MKII OS file to hand, so the upgrade reinstalls 1.56):
   256 KB erases from 0x80000 and 2114 page programs, 1,082,368 bytes, the
   file's ELE3 container byte for byte; RCR software reset at 19.448G (from
   0x4007db72); the emulator boots 1.56 from the flash. The A4's flash driver
-  is the Rytm's: the 9F part check at 0x40114ee8 accepts the S25FL128S (01
-  2018 00, 512-byte pages, 256 KB sectors) [measured; the routines located by
-  their DSPI0 words].
+  is the Rytm's, and so is its part check (0x40114f7c: the same accepted IDs
+  and geometries), which takes the emulator's S25FL128S (01 2018 00, 512-byte
+  pages, 256 KB sectors) [measured; read from the code]. Which part a real A4
+  MKII carries is not known: that ID was read on a Rytm MKII. A 64 KB-sector
+  part would make the upgrade erase about 17 x 64 KB instead of 5 x 256 KB,
+  with the same outcome.
 - **State save before the erase**: as on the Rytm. The working state is the
   'COKI' block at 0x4045c870 (version 0x0b, header size 0x78, project name
   at +0x30, the Rytm's checksum rule). Renamed "Analog Keys" to "Znalog Keys"
