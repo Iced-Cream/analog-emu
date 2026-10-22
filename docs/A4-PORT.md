@@ -624,6 +624,11 @@ OS 1.56 (the only A4 MKII OS file to hand, so the upgrade reinstalls 1.56):
   #HELLO and #STATUS (VERSION 2, OS 0204 1.56, FLASH 01 2018 00, SUPERCAP
   FAIL "NEVER AT DISCHARGED STATE": the emulator's supercap is always
   charged), and #REBOOT comes back in test mode [measured]. The power-on key
-  combination for the A4's test mode was not looked for.
+  combination (bootstrap `0x80000ac2`): PERF, TRK, PTN, SONG and [TRIG 4] held,
+  with FUNC, KIT, SND, MIX, [TRIG 3] and [TRIG 5] up (codes 0x30, 0x92, 0x93,
+  0x94, 0x03 held; 0x80, 0x90, 0x91, 0xB3, 0x02, 0x04 up; named by
+  `panel::A4_KEYS`, which the bootstrap shares with the OS - inferred, as on
+  the Rytm, where the same reading proved right on a unit) [read from the
+  code; not tried on an A4].
 - **The window**: `a4` opens `a4-emu in` / `a4-emu out` / `a4-emu usb in` /
   `a4-emu usb out`; on Windows create those in loopMIDI.
