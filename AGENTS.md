@@ -49,7 +49,7 @@ Environment switches:
 - `DTEMU_SYNTAKT_DSP=stub` runs the Syntakt with the scripted stand-in for its second CPU; `DTEMU_DSP_PROFILE=1` samples the second CPU's PCs (dtboot lists them).
 - Syntakt analog side: `DTEMU_NO_ANALOG=1` turns the model off; `DTEMU_ST_FRAME_TRACE=1` prints the voice frame's changed words, `DTEMU_ST_FRAME_DUMP=FILE` dumps it (500 u16 every 32 codec frames); `DTEMU_ST_RX_TONE=k[:AMP]` / `DTEMU_ST_RX_MASK=HEX` inject a test tone on / zero codec receive words.
 
-The window creates the virtual MIDI ports `rytm-emu in` and `rytm-emu out` (`a4-emu ...` on an A4). See `README.md` for MIDI, samples, keys and the USB/Overbridge options.
+The window creates the virtual MIDI ports `rytm-emu in` and `rytm-emu out` (`a4-emu ...` on an A4); on Windows, which has none, it opens existing ports of those names (a loopback driver such as loopMIDI makes them), so the window builds and `cargo test --release` runs there too. See `README.md` for MIDI, samples, keys and the USB/Overbridge options.
 Window mouse: click presses, shift-click latches; on a knob drag/wheel turns, a click pushes, ctrl-drag is push + turn (`gui::KnobDrag`).
 
 ## Architecture

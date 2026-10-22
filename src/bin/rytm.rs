@@ -1026,8 +1026,29 @@ fn write_wav(path: &std::path::Path, s: &[f32]) {
 /// what the firmware sends comes out of "rytm-emu out".
 mod midi {
     use super::Ev;
+    #[cfg(unix)]
     use midir::os::unix::{VirtualInput, VirtualOutput};
     use std::sync::mpsc;
+
+    /// Windows has no virtual MIDI ports: the window opens existing ports by
+    /// name instead, which a loopback driver (loopMIDI, for one) provides.
+    /// The best match for `name`: the exact name, else the first port whose
+    /// name starts with it (Windows may number duplicates, "NAME 1").
+    #[cfg(not(unix))]
+    fn find_port<T: midir::MidiIO>(io: &T, name: &str) -> Option<T::Port> {
+        let ports = io.ports();
+        let names: Vec<String> = ports.iter().map(|p| io.port_name(p).unwrap_or_default()).collect();
+        let at = names.iter().position(|n| n.eq_ignore_ascii_case(name)).or_else(|| {
+            names.iter().position(|n| n.to_lowercase().starts_with(&name.to_lowercase()))
+        });
+        if at.is_none() {
+            eprintln!(
+                "midi: no port named \"{name}\" (have: {}); on Windows create it with a loopback driver such as loopMIDI",
+                if names.is_empty() { "none".to_string() } else { names.join(", ") }
+            );
+        }
+        at.map(|i| ports[i].clone())
+    }
 
     /// DTEMU_MIDI_LOG=FILE: every message through the virtual ports, both ways,
     /// with the time since the first one, appended to FILE.
@@ -1043,15 +1064,24 @@ mod midi {
         }
     }
 
-    /// A virtual input port `name`; `usb`: its messages go to the USB MIDI port.
+    /// A virtual input port `name` (on Windows, the existing port `name`);
+    /// `usb`: its messages go to the USB MIDI port.
     pub fn start_in(tx: mpsc::Sender<Ev>, name: &str, usb: bool) -> Option<midir::MidiInputConnection<()>> {
         let mut input = midir::MidiInput::new("rytm-emu").map_err(|e| eprintln!("midi in: {e}")).ok()?;
         input.ignore(midir::Ignore::None); // SysEx, clock and active sensing too
-        match input.create_virtual(name, move |_, msg, _| {
+        let on_msg = move |_: u64, msg: &[u8], _: &mut ()| {
             let _ = tx.send(if usb { Ev::UsbMidi(msg.to_vec()) } else { Ev::Midi(msg.to_vec()) });
-        }, ()) {
+        };
+        #[cfg(unix)]
+        let (conn, kind) = (input.create_virtual(name, on_msg, ()), "virtual input");
+        #[cfg(not(unix))]
+        let (conn, kind) = {
+            let port = find_port(&input, name)?;
+            (input.connect(&port, name, on_msg, ()), "input")
+        };
+        match conn {
             Ok(c) => {
-                eprintln!("midi: virtual input \"{name}\"");
+                eprintln!("midi: {kind} \"{name}\"");
                 Some(c)
             }
             Err(e) => {
@@ -1098,12 +1128,20 @@ mod midi {
     }
 
     impl Out {
-        /// A virtual output port `name`; `tag` labels it in DTEMU_MIDI_LOG.
+        /// A virtual output port `name` (on Windows, the existing port `name`);
+        /// `tag` labels it in DTEMU_MIDI_LOG.
         pub fn start(name: &str, tag: &'static str) -> Option<Out> {
             let out = midir::MidiOutput::new("rytm-emu").map_err(|e| eprintln!("midi out: {e}")).ok()?;
-            match out.create_virtual(name) {
+            #[cfg(unix)]
+            let (conn, kind) = (out.create_virtual(name), "virtual output");
+            #[cfg(not(unix))]
+            let (conn, kind) = {
+                let port = find_port(&out, name)?;
+                (out.connect(&port, name), "output")
+            };
+            match conn {
                 Ok(conn) => {
-                    eprintln!("midi: virtual output \"{name}\"");
+                    eprintln!("midi: {kind} \"{name}\"");
                     Some(Out { conn, tag, msg: Vec::new(), running: 0, sysex: false })
                 }
                 Err(e) => {

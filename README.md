@@ -105,7 +105,11 @@ pad, clicking higher strikes harder. Every key is also reachable by name in
 
 **MIDI**: the window creates two virtual MIDI ports, `rytm-emu in` and `rytm-emu out`,
 wired to the emulated DIN MIDI port (`--no-midi` to skip). Connect a keyboard, a DAW
-or a SysEx tool to them as to a real Rytm's DIN MIDI. Headless tests can send MIDI
+or a SysEx tool to them as to a real Rytm's DIN MIDI. Windows has no virtual MIDI
+ports: there the window opens existing ports with those names, so create them first
+with a loopback driver such as loopMIDI (`rytm-emu in`, `rytm-emu out`, and for the
+USB MIDI port `rytm-emu usb in` / `rytm-emu usb out`); a missing one is reported
+and skipped. Headless tests can send MIDI
 with `dtboot --midi 9d0064@5G` or a SysEx file with `--midi-file dump.syx@5G`.
 `DTEMU_MIDI_LOG=FILE` logs every message through the ports. Elektron's own protocol
 (Transfer, elektroid), which the Rytm only serves over USB, is answered on these
