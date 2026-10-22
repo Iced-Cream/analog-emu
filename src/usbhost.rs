@@ -137,6 +137,14 @@ pub struct UsbHost {
     /// microframes [measured]. Ticked only with `midi_in`, so the default
     /// mode runs as before.
     gpt: [Option<i64>; 2],
+    /// A serial (CDC ACM) device instead of Overbridge: what the factory-test
+    /// mode enumerates as (boot flag 0x40: 1935:ffff, data interface 1 with
+    /// bulk endpoints 0x02 OUT and 0x82 IN; its console reads lines on 0x02,
+    /// docs/RYTM-PORT.md) [measured, OS 1.74]. The host writes `cdc_to_device`
+    /// and collects `cdc_from_device`; no audio stream runs.
+    pub cdc: bool,
+    pub cdc_to_device: VecDeque<u8>,
+    pub cdc_from_device: Vec<u8>,
     pub stats: UsbStats,
 }
 
@@ -180,6 +188,9 @@ impl UsbHost {
             suspended: false,
             midi_out: Vec::new(),
             gpt: [None, None],
+            cdc: false,
+            cdc_to_device: VecDeque::new(),
+            cdc_from_device: Vec::new(),
             stats: UsbStats::default(),
         }
     }
@@ -273,7 +284,9 @@ impl UsbHost {
                 bus.poke32(FRINDEX, fr);
                 raise(bus, STS_SRI);
                 self.control(bus, now);
-                if self.phase == Phase::Stream {
+                if self.phase == Phase::Stream && self.cdc {
+                    self.serial(bus);
+                } else if self.phase == Phase::Stream {
                     self.stream(bus, to_rytm);
                     if self.midi_in {
                         self.midi(bus);
@@ -558,6 +571,28 @@ impl UsbHost {
                 self.midi_out.extend_from_slice(&p[1..1 + n]);
             }
         }
+    }
+
+    /// The serial device's data endpoints: read 0x82, and send what is waiting
+    /// on 0x02, one high-speed bulk packet (512 bytes) per microframe each way.
+    fn serial(&mut self, bus: &mut Bus) {
+        let (b, _) = self.run_dtds(bus, 2, true, &[]);
+        self.cdc_from_device.extend_from_slice(&b);
+        if self.cdc_to_device.is_empty() || bus.peek32(EPSR) & (1 << 2) == 0 {
+            return;
+        }
+        let td = Self::next_dtd(bus, Self::qh(bus, 2, false));
+        if td & 1 != 0 {
+            return;
+        }
+        let tok = bus.peek32((td & !0x1F) + 4);
+        if tok & 0x80 == 0 {
+            return;
+        }
+        let total = ((tok >> 16) & 0x7FFF) as usize;
+        let n = total.min(512).min(self.cdc_to_device.len());
+        let data: Vec<u8> = self.cdc_to_device.drain(..n).collect();
+        self.run_dtds(bus, 2, false, &data);
     }
 
     /// The audio stream: take what the Rytm sends on 0x83, answer on 0x03 with as

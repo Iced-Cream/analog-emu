@@ -90,6 +90,10 @@ counts (suffixes k, M, G).
                        written back at the end: what the OS wrote (an OS upgrade)
                        persists. With no .syx given, boots the OS the flash holds.
                        A host file only; nothing here reaches a unit
+  --usb-serial TEXT@AT  (implies --usb-host) the host as a serial (CDC ACM) device's
+                       driver, as the factory-test mode enumerates (boot flag 0x40:
+                       --poke 407ffffc=00140040): TEXT and a newline on its data
+                       port at clock AT; what comes back is printed at the end
   --reboot             when the firmware resets (RCR SOFTRST, as at the end of an
                        OS upgrade), boot again from the OS in the flash, keeping
                        the flash and the card; events not yet due run on the new
@@ -149,6 +153,7 @@ fn main() {
     let mut card: Option<String> = None;
     let mut card_save = false;
     let mut flash: Option<String> = None;
+    let mut serials: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut reboot = false;
     let mut power_off: Option<u64> = None;
     let mut pcm: Vec<i32> = Vec::new();
@@ -258,6 +263,17 @@ fn main() {
             "--card" => card = it.next().cloned(),
             "--card-save" => card_save = true,
             "--flash" => flash = it.next().cloned(),
+            "--usb-serial" => {
+                // TEXT@CLOCK: a line to the serial device; a newline ends it.
+                let v = it.next().unwrap();
+                let (what, at) = v.rsplit_once('@').unwrap();
+                let mut b = what.as_bytes().to_vec();
+                if !b.ends_with(b"\n") {
+                    b.push(b'\n');
+                }
+                serials.push((b, num(at)));
+                usb_host = true;
+            }
             "--reboot" => reboot = true,
             "--power-off" => power_off = Some(num(it.next().unwrap())),
             "--usb-midi-real" => usb_midi_real = true,
@@ -394,6 +410,7 @@ fn main() {
         let mut h = dtemu::usbhost::UsbHost::new();
         h.suspend = usb_sleep;
         h.midi_sleep = usb_noread;
+        h.cdc = !serials.is_empty();
         m.usb_host = Some(h);
     }
     if usb_midi_real {
@@ -451,6 +468,9 @@ fn main() {
         for (i, n) in nudges.iter().enumerate() {
             events.push((n.0, 6, i, 0));
         }
+        for (i, (_, at)) in serials.iter().enumerate() {
+            events.push((*at, 8, i, 0));
+        }
         if let Some(at) = power_off {
             events.push((at, 7, 0, 0));
         }
@@ -485,6 +505,13 @@ fn main() {
                 early = Some(r.stop);
                 powered_off = true;
                 break;
+            }
+            if kind == 8 {
+                if let Some(h) = m.usb_host.as_mut() {
+                    h.cdc_to_device.extend(serials[code].0.iter().copied());
+                }
+                println!("[{:>12}] usb serial out: {:?}", m.now(), String::from_utf8_lossy(&serials[code].0));
+                continue;
             }
             if kind == 6 {
                 let (_, e, d, func, big) = nudges[code];
@@ -738,6 +765,9 @@ fn main() {
         }
     }
     if let Some(h) = &m.usb_host {
+        if h.cdc {
+            println!("usb serial in ({} bytes):\n{}", h.cdc_from_device.len(), String::from_utf8_lossy(&h.cdc_from_device));
+        }
         println!("usb host: streaming={} {:?}", h.streaming(), h.stats);
         println!("usb host: device descriptor {:02x?}", h.device_desc);
         println!("usb host: configuration ({} bytes) {:02x?}", h.config_desc.len(), h.config_desc);

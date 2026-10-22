@@ -848,3 +848,30 @@ Tools: `dtboot --flash FILE` (load if present, write back at the end; with no
 events not yet due run on the new boot's clock), `rytm --flash FILE` (the
 window reboots by itself and saves the flash with the card),
 `DTEMU_SPI_TRACE=1` (each erase and program; `=all` every command).
+
+## The factory-test console (2026-10-22)
+
+Boot flag 0x40 (bit 6 of the entry's argument, kept at 0x40272874 on OS 1.74)
+starts a text console beside the normal UI: 0x401006ee registers its input
+parser (0x400816c4) and task (0x4013c164 -> 0x4013a234) and sets USB up in
+mode 4, a CDC ACM serial device (1935:ffff; data interface 1, bulk 0x02 OUT
+and 0x82 IN) [measured, OS 1.74]. Lines start with `#` and end with a newline
+(`!` and `$$$$` start binary blocks). Which bootstrap path sets the flag on a
+unit has not been traced.
+
+Commands (strings in 0x4013a234): #HELLO, #STATUS, #READ_SERIAL, #READ_TEMP,
+#DUMP_CALIBRATION and other reads; also #UPGRADE (writes the bootstrap),
+#FULL_UPGRADE, #FORMAT_FS, #WRITE_SERIAL and more that write the flash or the
+card. #STATUS prints a block per part; its FLASH line is the first bytes of
+the 9F ID (`EF 4018 00 ...` with the emulator's part).
+
+In the emulator: `dtboot FW --poke 407ffffc=00140040 --usb-serial "#STATUS@3.5G"`
+(boot flags 0x00140040; `--usb-serial` turns on the USB host as a serial
+driver, `UsbHost::cdc`, and prints what comes back). Measured on 1.74:
+#HELLO -> HOW DO YOU DO?; #STATUS -> START, VERSION 1, OS 0176 1.74, PLATFORM,
+FLASH EF 4018, DRAM, FPGA, SUPERCAP, UI (WRONG UI CARD), MMC, CODEC (FAIL).
+
+`usbdev.rs` now keeps OTGSC's line-state bits (8..14) read-only: the
+firmware's USB setup write (0x08000000) cleared the host's VBUS before, and a
+cold boot with `--usb-host` stayed at "VBUS on" in every USB mode; it now
+enumerates (USB MIDI as 1935:0011 on 1.73, the serial device in test mode).

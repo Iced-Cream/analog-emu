@@ -48,8 +48,14 @@ pub fn write(off: u32, size: u32, v: u32, plain: impl Fn(u32) -> u32) -> Option<
     }
     match off {
         USBSTS | EPSETUPSR | EPCOMPLETE | EPNAK => Some(vec![(off, plain(off) & !v)]),
-        // OTGSC: status bits 16..22 clear when written with 1; the rest is plain.
-        OTGSC => Some(vec![(OTGSC, (v & !0x007F_0000) | (plain(OTGSC) & 0x007F_0000 & !v))]),
+        // OTGSC: status bits 16..22 clear when written with 1; the line states
+        // in bits 8..14 (ID, AVV, ASV, BSV, BSE, 1MST, DPS) are read-only, so a
+        // host's VBUS survives the firmware's setup write (OS 1.74 writes
+        // 0x08000000, 0x40004ea4); the rest is plain.
+        OTGSC => {
+            let keep = plain(OTGSC);
+            Some(vec![(OTGSC, (v & !0x007F_7F00) | (keep & 0x0000_7F00) | (keep & 0x007F_0000 & !v))])
+        }
         EPFLUSH => {
             if std::env::var_os("DTEMU_USB_LOG").is_some() {
                 eprintln!("usb dev: flush {v:08x} (EPSR was {:08x})", plain(EPSR));
