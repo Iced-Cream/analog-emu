@@ -809,7 +809,7 @@ upgrade path does not use.
 sector size or fails every program and erase: Spansion 01 2018 (byte 4 = 0:
 512-byte pages, 256 KB sectors; 1: 256 B, 64 KB), ISSI 9D 6017/6018, Macronix C2
 2017/2018, Winbond EF 4014/7015/4017/4018, EON 1C 7015 (all 256 B, 64 KB). The
-owner's Rytm MKII reports Spansion 01 2018 with byte 4 = 00 (the factory-test
+contributor's Rytm MKII reports Spansion 01 2018 with byte 4 = 00 (the factory-test
 console's #STATUS, below) [measured]: an S25FL128S with uniform 256 KB sectors
 and 512-byte pages, which the emulator now answers as (`spiflash::Part`;
 `W25Q128` stays as a 64 KB-sector alternative). Before this model the 9F read returned junk, and that is why the
@@ -892,7 +892,7 @@ Commands (strings in 0x4013a234): #HELLO, #STATUS, #READ_SERIAL, #READ_TEMP,
 #DUMP_CALIBRATION and other reads; also #UPGRADE (writes the bootstrap),
 #FULL_UPGRADE, #FORMAT_FS, #WRITE_SERIAL and more that write the flash or the
 card. #STATUS prints a block per part; its FLASH line is the first bytes of
-the 9F ID (`01 2018 00 ...` on the owner's unit and the emulator alike; the
+the 9F ID (`01 2018 00 ...` on a contributor's unit and the emulator alike; the
 words after it differ per unit and are not recorded here).
 
 In the emulator: `dtboot FW --poke 407ffffc=00140040 --usb-serial "#STATUS@3.5G"`

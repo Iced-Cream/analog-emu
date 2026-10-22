@@ -29,7 +29,7 @@
 //! (`Part::t_*`, datasheet typicals [inferred]): status reads WIP (and WEL)
 //! meanwhile, other commands are ignored, and the change lands in the image
 //! when the time is up (`settle`). A power cut (`cut`) leaves the share of
-//! the operation done by then. `DTEMU_SPI_INSTANT=1` completes them at once. The part is `Part`: by default the owner's Rytm MKII's,
+//! the operation done by then. `DTEMU_SPI_INSTANT=1` completes them at once. The part is `Part`: by default a contributor's Rytm MKII's,
 //! read with the factory-test console's #STATUS (FLASH `01 2018 00`,
 //! 2026-10-22) [measured]. Any other command is counted in `unknown` and
 //! answers 0xFF. Nothing here reaches real hardware: the image is a byte vector
@@ -80,7 +80,7 @@ impl Part {
 }
 
 /// Spansion S25FL128S with uniform 256 KB sectors: 01 2018, byte 4 = 00, as
-/// the owner's Rytm MKII reports [measured]; bytes 3 and 5 (4D, 80) are the
+/// a contributor's Rytm MKII reports [measured]; bytes 3 and 5 (4D, 80) are the
 /// datasheet's [inferred: the console prints neither]. Times: the datasheet's
 /// typicals, 340 us a 512-byte page, 520 ms a 256 KB sector, 33 s the chip
 /// [inferred].
