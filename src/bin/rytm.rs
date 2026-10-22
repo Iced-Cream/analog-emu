@@ -1069,8 +1069,21 @@ mod midi {
     pub fn start_in(tx: mpsc::Sender<Ev>, name: &str, usb: bool) -> Option<midir::MidiInputConnection<()>> {
         let mut input = midir::MidiInput::new("rytm-emu").map_err(|e| eprintln!("midi in: {e}")).ok()?;
         input.ignore(midir::Ignore::None); // SysEx, clock and active sensing too
+        // midir on Windows hands a long SysEx over in 1024-byte pieces (its
+        // WinMM buffers; elsewhere it arrives whole): put them back together
+        // so a piece without its F0 is not taken for stray data bytes.
+        let mut sysex: Vec<u8> = Vec::new();
         let on_msg = move |_: u64, msg: &[u8], _: &mut ()| {
-            let _ = tx.send(if usb { Ev::UsbMidi(msg.to_vec()) } else { Ev::Midi(msg.to_vec()) });
+            let whole = if msg.first() == Some(&0xF0) || !sysex.is_empty() && msg.first().is_some_and(|&b| b < 0x80) {
+                sysex.extend_from_slice(msg);
+                if sysex.last() != Some(&0xF7) {
+                    return;
+                }
+                std::mem::take(&mut sysex)
+            } else {
+                msg.to_vec()
+            };
+            let _ = tx.send(if usb { Ev::UsbMidi(whole) } else { Ev::Midi(whole) });
         };
         #[cfg(unix)]
         let (conn, kind) = (input.create_virtual(name, on_msg, ()), "virtual input");
