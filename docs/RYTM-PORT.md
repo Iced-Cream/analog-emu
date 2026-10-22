@@ -839,9 +839,28 @@ the prompt comes.
 typicals on the emulated clock (`spiflash::Part`, [inferred]): status reads
 busy meanwhile, other commands are ignored, and the change lands at the end.
 `dtboot --power-off AT` during an upgrade runs the OS's power-fail handler as
-before, then cuts a flash operation still under way, leaving the share of its
-bytes its elapsed time covers [inferred: neither the order a part works in nor
-how long the supercap keeps the flash up is known]. Measured: 1.73 receiving
+before, then cuts a flash operation still under way. Neither how far a part
+gets with an interrupted operation nor how long the supercap keeps the flash
+powered after the CPU parks is known, so both are settings:
+`DTEMU_SPI_CUT=share|none|done` (the share of its bytes its elapsed time
+covers, the default; nothing; all of it) and `DTEMU_SPI_HOLD_MS=N` (the flash
+keeps power N ms after the handler; default 0).
+
+**Sweep** (2026-10-22, from a snapshot just before YES; 1.73 receiving 1.74,
+YES at 18G): the power off at 35 points from 18.00G to 19.70G (every 0.05G)
+with each of the three cut settings, and at 18 points with holds of 50, 520
+and 5000 ms; then a boot from the flash left. Result: the settings never
+changed an outcome, and no flash operation was ever under way when the CPU
+parked. Page programs (340 us) finish inside the handler's 3M instructions
+(15 ms); during an erase the handler does not finish until the erase has
+(44M-94M instructions) [measured; why it waits was not traced]. So the
+outcome depends only on when the power goes:
+- before the first erase (18.00G): the old OS is untouched and boots (1.73);
+- from the first erase to the last page (18.05G to 18.95G: 256 KB to 1.5 MB
+  erased, then 0 to 1.27 MB written): no bootable OS (the container's header
+  without its MAIN OS, or nothing at all);
+- after the last page (19.00G on, including the 3 s before the reset): the
+  new OS boots (1.74). For example, 1.73 receiving
 1.74 with YES at 18G and the power off at 18.85G leaves six sectors erased and
 828,416 of 1,484,288 bytes written; booting that flash (`dtboot --flash F`, no
 `.syx`) finds the container's header but a MAIN OS no profile knows, and

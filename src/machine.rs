@@ -1460,10 +1460,12 @@ impl Machine {
         let card = &self.cpu.bus.io.esdhc.card;
         let slots = [0x7a000u32, 0x7c000].map(|s| card.sectors.get(&s).is_some_and(|d| &d[..4] == b"COKI"));
         let (writes, instructions) = (card.writes - writes0, self.now() - t0);
-        // The CPU has parked: an erase or program under way stops here
-        // [inferred: how long the supercap keeps the flash powered beyond the
-        // handler is not known].
-        let now = self.now();
+        // The CPU has parked; the flash keeps power for DTEMU_SPI_HOLD_MS more
+        // (default 0), then an erase or program still under way stops. How
+        // long the supercap holds the flash's rail is a board property the
+        // firmware does not show, so this is a setting.
+        let hold_ms: f64 = std::env::var("DTEMU_SPI_HOLD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let now = self.now() + (hold_ms * 1e-3 * self.cpu.bus.io.ips) as u64;
         let flash_cut = self.cpu.bus.spi.as_mut().and_then(|f| f.cut(now));
         PowerOff { armed, done, instructions, sectors_written: writes, slots, stop, flash_cut }
     }

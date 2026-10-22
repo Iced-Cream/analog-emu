@@ -449,6 +449,9 @@ fn main() {
     let mut logged = 0;
     let mut target = m.now();
     while target < instr {
+        // Events in [from, target): run_until can overshoot a chunk's end, so an
+        // event on the boundary would otherwise fall between two chunks.
+        let from = target;
         target = (target + every).min(instr);
         if let Some(pa) = profile_after {
             if m.now() >= pa && m.cpu.profile.is_none() {
@@ -489,7 +492,7 @@ fn main() {
         let mut early: Option<Stop> = None;
         let mut powered_off = false;
         for (at, kind, code, d) in events {
-            if at < m.now() || at >= target {
+            if at < from || at >= target {
                 continue;
             }
             let s = m.run_until(at);

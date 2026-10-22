@@ -28,8 +28,9 @@
 //! word without CONT). They then take the part's time on the emulated clock
 //! (`Part::t_*`, datasheet typicals [inferred]): status reads WIP (and WEL)
 //! meanwhile, other commands are ignored, and the change lands in the image
-//! when the time is up (`settle`). A power cut (`cut`) leaves the share of
-//! the operation done by then. `DTEMU_SPI_INSTANT=1` completes them at once. The part is `Part`: by default a contributor's Rytm MKII's,
+//! when the time is up (`settle`). A power cut (`cut`) leaves what `CutMode`
+//! says of an operation under way (`DTEMU_SPI_CUT`: share, none or done;
+//! how far a part gets is not specified anywhere, so this is a setting). `DTEMU_SPI_INSTANT=1` completes them at once. The part is `Part`: by default a contributor's Rytm MKII's,
 //! read with the factory-test console's #STATUS (FLASH `01 2018 00`,
 //! 2026-10-22) [measured]. Any other command is counted in `unknown` and
 //! answers 0xFF. Nothing here reaches real hardware: the image is a byte vector
@@ -110,6 +111,27 @@ pub const W25Q128: Part = Part {
     t_chip: 40_000_000.0,
 };
 
+/// What a power cut leaves of an operation under way (`DTEMU_SPI_CUT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutMode {
+    /// The share of its bytes its elapsed time covers (the default).
+    Share,
+    /// Nothing: the bytes stay as they were.
+    None,
+    /// All of it, as if it had finished.
+    Done,
+}
+
+impl CutMode {
+    pub fn from_env() -> CutMode {
+        match std::env::var("DTEMU_SPI_CUT").as_deref() {
+            Ok("none") => CutMode::None,
+            Ok("done") => CutMode::Done,
+            _ => CutMode::Share,
+        }
+    }
+}
+
 /// An operation under way: the bytes it leaves, at their addresses, in the
 /// order the part works through them, and its clock span.
 struct Pending {
@@ -149,6 +171,7 @@ pub struct SpiFlash {
     pending: Option<Pending>,
     /// `DTEMU_SPI_INSTANT=1`: operations complete at once.
     pub instant: bool,
+    pub cut_mode: CutMode,
     trace: bool,
     trace_all: bool,
 }
@@ -171,6 +194,7 @@ impl SpiFlash {
             ops: Vec::new(),
             pending: None,
             instant: std::env::var_os("DTEMU_SPI_INSTANT").is_some(),
+            cut_mode: CutMode::from_env(),
             trace: std::env::var_os("DTEMU_SPI_TRACE").is_some(),
             trace_all: std::env::var("DTEMU_SPI_TRACE").is_ok_and(|v| v == "all"),
         }
@@ -215,13 +239,16 @@ impl SpiFlash {
         }
     }
 
-    /// The power goes at clock `now`: an operation under way stops with the
-    /// share of its bytes its elapsed time covers [inferred: how far a part
-    /// gets, and in which order, is not specified]. -> what was cut, if any.
+    /// The power goes at clock `now`: an operation under way stops, leaving
+    /// what `cut_mode` says. -> what was cut, if any.
     pub fn cut(&mut self, now: u64) -> Option<String> {
         self.settle(now);
         let p = self.pending.take()?;
-        let f = (now.saturating_sub(p.start) as f64 / (p.end - p.start).max(1) as f64).clamp(0.0, 1.0);
+        let f = match self.cut_mode {
+            CutMode::Share => (now.saturating_sub(p.start) as f64 / (p.end - p.start).max(1) as f64).clamp(0.0, 1.0),
+            CutMode::None => 0.0,
+            CutMode::Done => 1.0,
+        };
         let n = (p.bytes.len() as f64 * f) as usize;
         for &(a, b) in &p.bytes[..n] {
             self.mem[a] = b;
@@ -438,9 +465,19 @@ mod tests {
         at(&mut f, 600_000, &[0x06]);
         f.mem[0x8_0000..0xC_0000].fill(0);
         at(&mut f, 600_000, &[0xD8, 0x08, 0x00, 0x00]);
+        f.cut_mode = CutMode::Share;
         assert!(f.cut(860_000).is_some());
         assert_eq!(f.mem[0x8_0000], 0xFF);
         assert_eq!(f.mem[0xB_FFFF], 0);
+        // The other settings: nothing, or all of it.
+        for (mode, want) in [(CutMode::None, 0u8), (CutMode::Done, 0xFF)] {
+            at(&mut f, 900_000, &[0x06]);
+            f.mem[0x8_0000..0xC_0000].fill(0);
+            at(&mut f, 900_000, &[0xD8, 0x08, 0x00, 0x00]);
+            f.cut_mode = mode;
+            assert!(f.cut(900_010).is_some());
+            assert_eq!((f.mem[0x8_0000], f.mem[0xB_FFFF]), (want, want));
+        }
     }
 
     #[test]
