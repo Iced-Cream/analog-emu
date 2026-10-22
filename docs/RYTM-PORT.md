@@ -853,7 +853,22 @@ and 5000 ms; then a boot from the flash left. Result: the settings never
 changed an outcome, and no flash operation was ever under way when the CPU
 parked. Page programs (340 us) finish inside the handler's 3M instructions
 (15 ms); during an erase the handler does not finish until the erase has
-(44M-94M instructions) [measured; why it waits was not traced]. So the
+(44M-94M instructions) [measured]. Why: the power-fail save (1.73
+`0x40122266`, called at level 5 from `0x40000486` after the level-7 handler
+`0x400004b0` forces INTC2 source 30) first asks whether the flash driver's
+lock is held (`0x40137124`: `*0x419f00d0 != 0`; every flash routine takes
+it). If it is, a flash routine was interrupted: the save finishes the SPI
+transfer under way (zeros, then an end-of-queue word, so the chip select
+goes high and a started command executes), then polls RDSR (`0x80020005`,
+`0x08020000`) until WIP clears (`0x401224a0`..`0x4012252c`), and only then
+goes on to its card work and the CMD0 that parks the card [read from the
+code, 1.73; the same RDSR poll is at 1.74 `0x4012256a`]. The interrupted
+code ran at SR 0x2000 (the erase routine's delay loop at 1.73 `0x40136730`),
+so the interrupt itself is taken at once [measured]. So the OS completes any
+erase or program it started before the board loses power, as long as the
+supercap lasts the rest of it (at most one 256 KB erase: 520 ms typical, 2.6
+s maximum on the S25FL128S); `DTEMU_SPI_HOLD_MS` and `DTEMU_SPI_CUT` matter
+only if it does not. So the
 outcome depends only on when the power goes:
 - before the first erase (18.00G): the old OS is untouched and boots (1.73);
 - from the first erase to the last page (18.05G to 18.95G: 256 KB to 1.5 MB
