@@ -80,7 +80,7 @@ fn main() {
                 Stop::Hook(pc) => {
                     cpu.skip_hook = Some(pc);
                 }
-                Stop::Budget | Stop::Event => {
+                Stop::Budget | Stop::Event | Stop::Reset => {
                     eprintln!("call {addr:08x}: did not return");
                     std::process::exit(1);
                 }

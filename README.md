@@ -112,6 +112,18 @@ with `dtboot --midi 9d0064@5G` or a SysEx file with `--midi-file dump.syx@5G`.
 ports too: the emulator hands it to the OS as USB input and returns the replies
 (docs/RYTM-PORT.md, DIN MIDI). `tools/ekproto.py` encodes and decodes it for tests.
 
+**OS upgrades** (MKII units): the SPI flash is writable (`src/spiflash.rs`), so an OS
+upgrade sent by Transfer, elektroid or elkflash runs as on a unit: the transfer, the
+UPGRADE OS NOW? prompt, ERASING FLASH..., the write and the reset. With `--flash
+FILE` (window and dtboot) the flash lives in FILE and survives the run; the window
+then boots the new OS, and `dtboot --reboot` does the same. With no `.syx` named, the
+tools boot the OS the flash holds. A flash image holds the OS: name it `*.img` so git
+ignores it. Nothing in the emulator reaches a real unit.
+
+    ./target/release/dtboot fw/Analog-Rytm_MKII_OS1.73.syx --card rytm.img --flash rytm-flash.img \
+        --reboot --instr 26G --usb-midi-file upgrade.syx@5G --press YES@18G
+    ./target/release/dtboot --card rytm.img --flash rytm-flash.img --instr 4G   # boots the upgraded OS
+
 **Overbridge input** (Rytm): `--ob-link [ADDR]` (window and dtboot) serves the
 host->Rytm Overbridge stream over TCP (default 127.0.0.1:7301; `src/oblink.rs`):
 a host such as rytm-teensy's `sim/obhost.py` sends 12 channels a frame and each

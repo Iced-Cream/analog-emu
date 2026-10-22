@@ -55,6 +55,8 @@ pub enum Stop {
     Event,
     /// An exception whose vector is empty or points nowhere sensible.
     Fault(u8, u32),
+    /// The firmware asked for a software reset (`Io::reset_request`).
+    Reset,
 }
 
 #[derive(Clone, Copy)]

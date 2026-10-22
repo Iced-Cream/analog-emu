@@ -174,7 +174,16 @@ impl Firmware {
                 None => Err(Error::Container("no ELE3 or ELE2 magic".into())),
             };
         };
-        let c = dec[off..].to_vec();
+        Self::from_container(&dec[off..])
+    }
+
+    /// An ELE3 container from its magic, e.g. as it sits in the SPI flash
+    /// (whatever follows its last section is kept, unread).
+    pub fn from_container(c: &[u8]) -> Result<Firmware> {
+        if !c.starts_with(b"ELE3") {
+            return Err(Error::Container("no ELE3 magic".into()));
+        }
+        let c = c.to_vec();
         if c.len() < TABLE_OFF {
             return Err(Error::Container("truncated header".into()));
         }

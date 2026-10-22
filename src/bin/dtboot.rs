@@ -86,6 +86,14 @@ counts (suffixes k, M, G).
   --count ADDR         count visits to a PC (hex)
   --trace N            keep the last N PCs for fault reports
   --profile-after N    sample guest PCs from clock N on
+  --flash FILE         the SPI flash (MKII units, Syntakt) from FILE if it exists,
+                       written back at the end: what the OS wrote (an OS upgrade)
+                       persists. With no .syx given, boots the OS the flash holds.
+                       A host file only; nothing here reaches a unit
+  --reboot             when the firmware resets (RCR SOFTRST, as at the end of an
+                       OS upgrade), boot again from the OS in the flash, keeping
+                       the flash and the card; events not yet due run on the new
+                       boot's clock. Without it the run ends at the reset
   --no-masks           ignore interrupt masks
 
 Environment:
@@ -140,6 +148,8 @@ fn main() {
     let mut dsp_wav: Option<String> = None;
     let mut card: Option<String> = None;
     let mut card_save = false;
+    let mut flash: Option<String> = None;
+    let mut reboot = false;
     let mut power_off: Option<u64> = None;
     let mut pcm: Vec<i32> = Vec::new();
     let mut presses: Vec<(String, u64, u64)> = Vec::new();
@@ -247,6 +257,8 @@ fn main() {
             "--dsp-wav" => dsp_wav = it.next().cloned(),
             "--card" => card = it.next().cloned(),
             "--card-save" => card_save = true,
+            "--flash" => flash = it.next().cloned(),
+            "--reboot" => reboot = true,
             "--power-off" => power_off = Some(num(it.next().unwrap())),
             "--usb-midi-real" => usb_midi_real = true,
             "--usb-host-sleep" | "--usb-host-noread" => {
@@ -297,8 +309,26 @@ fn main() {
             _ => syx = Some(a.clone()),
         }
     }
-    let syx = syx.unwrap_or_else(|| "fw/Digitakt_OS1.53.syx".into());
-    let fw = Firmware::from_file(std::path::Path::new(&syx)).unwrap();
+    // --flash FILE without a .syx: boot the OS the flash holds, as a unit does.
+    let flash_image = flash.as_ref().and_then(|p| std::fs::read(p).ok());
+    let fw = match (&syx, &flash_image) {
+        (None, Some(img)) if img.len() > dtemu::machine::FLASH_SLOT => {
+            let fw = Firmware::from_container(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| panic!("--flash: no OS at 0x80000: {e}"));
+            println!("booting the OS in the flash: build {} version {}", fw.build, fw.version);
+            fw
+        }
+        _ => {
+            let syx = syx.clone().unwrap_or_else(|| "fw/Digitakt_OS1.53.syx".into());
+            Firmware::from_file(std::path::Path::new(&syx)).unwrap()
+        }
+    };
+    if let (Some(_), Some(img)) = (&syx, &flash_image) {
+        let c = &fw.container;
+        let at = dtemu::machine::FLASH_SLOT;
+        if img.len() >= at + c.len() && img[at..at + c.len()] != c[..] {
+            println!("note: the flash holds a different OS from the .syx; this run boots the .syx's (leave the .syx out to boot the flash's)");
+        }
+    }
     let mut m = Machine::new(&fw, 128).unwrap();
     if let Some(i) = ips {
         m.cpu.bus.io.ips = i as f64;
@@ -329,6 +359,13 @@ fn main() {
         let o = a & 0x07FF_FFFF;
         m.cpu.bus.watch = Some((o, o + n));
         m.cpu.bus.watch_reads = true;
+    }
+    if let Some(p) = &flash {
+        match m.load_flash(std::path::Path::new(p)) {
+            Ok(true) => println!("flash {p}: loaded"),
+            Ok(false) => println!("flash {p}: new (built from the .syx)"),
+            Err(e) => panic!("--flash {e}"),
+        }
     }
     if let Some(p) = &card {
         let fresh = m.attach_card(std::path::Path::new(p)).unwrap();
@@ -381,7 +418,7 @@ fn main() {
         m.cpu.bus.poke32(a, x);
     }
     let t0 = Instant::now();
-    let (clock0, idle0) = (m.now(), m.stats.idle_skipped);
+    let (mut clock0, mut idle0) = (m.now(), m.stats.idle_skipped);
     let mut logged = 0;
     let mut target = m.now();
     while target < instr {
@@ -426,7 +463,7 @@ fn main() {
                 continue;
             }
             let s = m.run_until(at);
-            if matches!(s, Stop::Hook(_) | Stop::Fault(..)) {
+            if matches!(s, Stop::Hook(_) | Stop::Fault(..) | Stop::Reset) {
                 early = Some(s);
                 break;
             }
@@ -597,6 +634,36 @@ fn main() {
             println!("STOPPED with nothing to wake it at pc=0x{:08x}", m.cpu.pc);
             break;
         }
+        if let Stop::Reset = stop {
+            let at = m.now();
+            println!("[{at:>12}] reset (RCR SOFTRST) at pc=0x{:08x}", m.cpu.pc);
+            if let Some(f) = m.cpu.bus.spi.as_ref() {
+                println!("{}", f.summary());
+            }
+            if !reboot {
+                break;
+            }
+            match m.reboot_from_flash() {
+                Ok(name) => println!("[{at:>12}] rebooting from the flash: {name}"),
+                Err(e) => {
+                    println!("cannot reboot: {e}");
+                    break;
+                }
+            }
+            // The new boot's clock starts at 0: what was due is done.
+            presses.retain(|p| p.1 > at);
+            turns.retain(|t| t.0 > at);
+            raws.retain(|r| r.1 > at);
+            midis.retain(|x| x.1 > at);
+            usb_midis.retain(|x| x.1 > at);
+            nudges.retain(|n| n.0 > at);
+            power_off = power_off.filter(|&t| t > at);
+            instr -= at.min(instr);
+            target = 0;
+            (clock0, idle0) = (0, 0);
+            logged = 0;
+            continue;
+        }
         if powered_off {
             break;
         }
@@ -624,6 +691,13 @@ fn main() {
         let peak = pcm.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
         let nz = pcm.iter().filter(|&&x| x != 0).count();
         println!("wrote {p}: {} frames, peak {peak} (of 8388607), {nz} nonzero samples", pcm.len() / 2);
+    }
+    if let Some(p) = &flash {
+        if let Some(f) = m.cpu.bus.spi.as_ref() {
+            println!("{}", f.summary());
+        }
+        m.save_flash(std::path::Path::new(p)).expect("--flash");
+        println!("flash written back to {p}");
     }
     if card_save {
         m.cpu.bus.io.esdhc.card.dirty = true;

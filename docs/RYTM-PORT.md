@@ -667,7 +667,8 @@ then the emulated run doing exactly this]:
   made synchronously (0x4012285c): flashing an OS keeps the working state.
   So a Rytm flashed with a mod build boots the stock state, and going back to
   stock boots the mod's state - the HIGH 2 case [inferred from the code; the
-  emulator does not run an OS upgrade].
+  emulator runs the upgrade now ("OS upgrade over USB MIDI" below), but this
+  save has not been checked there].
 - Strings "MRAM STATE NOT WRITTEN", "MRAM WRITE IN PROGRESS" (0x41352d28,
   0x41352d24) belong to the factory test's status report; "SHUTDOWN" is a
   random-name word and "TURN POWER OFF" the end of the factory test - none
@@ -784,3 +785,66 @@ depth's envelope.
   peak -10.2 dBFS (the old model: -21.1, oscillator 1 at 0 Hz stayed silent);
 - the default kit: BD PLASTIC peaks -8.9 dBFS (was -13.5), RS -14.1 (was -12.1);
 - the end screens of all seven devices unchanged; the Rytm window holds SPEED 100 %.
+
+## OS upgrade over USB MIDI (2026-10-22)
+
+The OS upgrade runs end to end on the emulated Rytm MKII: the SPI flash takes
+erase and program commands (`src/spiflash.rs`), and the reset at the end boots
+the new OS from it. Measured with stock OS 1.73 receiving stock OS 1.74, the
+requests as Transfer sends them (Knowledge Base, overbridge-transfer-protocols
+section 3.6, encoded by elkflash), on a scratch card. Addresses are OS 1.74's
+unless marked.
+
+**The flash driver** [measured, Ghidra read-only and the emulator's trace]:
+DSPI0 at 0xFC05C000, chip select PCS1, polled. Every routine clears the FIFOs
+(MCR |= 0xC00), pushes words with CONT until the last byte and pops one POPR
+word per push. Commands in the image: 06 WREN, 05 RDSR (bit 0 busy; 0x60 = an
+erase/program error, then 30 CLSR), 03 READ (`flash_read` 0x40136482, which
+the emulator still serves itself, from the same image), 02 page program
+(0x401365aa, from 0x4013717a in page-sized pieces), D8 sector erase (0x401368a2),
+9F ID, plus OTP/SFDP/protection reads (4B, 5A, 48, 42, 44, 2B, E0-E4) that the
+upgrade path does not use.
+
+**The part check** (0x40136b50, on the first five 9F bytes) sets the page and
+sector size or fails every program and erase: Spansion 01 2018 (byte 4 = 0:
+512-byte pages, 256 KB sectors; 1: 256 B, 64 KB), ISSI 9D 6017/6018, Macronix C2
+2017/2018, Winbond EF 4014/7015/4017/4018, EON 1C 7015 (all 256 B, 64 KB). The
+emulator answers EF 40 18 (a W25Q128); which part a unit carries is not known
+[inferred]. Before this model the 9F read returned junk, and that is why the
+earlier test stopped on OS UPGRADE RECEIVING with no prompt: with a known ID
+the prompt comes.
+
+**The sequence** in the emulator (1.73 receiving 1.74, 1.88 MB `.syx`):
+- start (0x50) -> status 0, OS UPGRADE RECEIVING. Writes in 32 KiB (58) or
+  2 KiB (919) pieces, open loop or at fixed clocks, all answered in order; the
+  last with status 1. Then UPGRADE OS NOW? CONFIRM YES/NO.
+- YES -> ERASING FLASH...: 23 sectors of 64 KB from 0x80000 (0x4009f404:
+  `(size + sector - 1) / sector` erases), then "Writing Flash": 5798 page
+  programs from 0x80000, 1,484,288 bytes, which is the new `.syx`'s ELE3
+  container byte for byte (`dtboot` compares them: no "different OS" note).
+- "Success! Rebooting": a wait (0x40098c84(3000000); 3 s if microseconds
+  [inferred]), 0 to 0x48000000, then RCR (0xEC090000) = 0x80, a software reset
+  (`move.b` at 0x4009f53a). `Io::reset_request` catches it and
+  `Machine::run_until` returns `Stop::Reset` (1.73: clock 18.68G with YES at
+  18G; erase and program are instant here, as WIP never sets).
+- `Machine::reboot_from_flash` builds a new machine from the container at
+  0x80000, keeping the flash and the card: it boots OS 1.74 to the same screen
+  as a cold boot of the 1.74 `.syx` on that card.
+
+Not modelled: erase and program times (WIP never reads busy); the bootstrap
+that a unit runs first (the emulator loads MAIN OS from the container as it
+does from a `.syx`, so only builds `symbols.rs` knows boot); the flash is not
+in snapshots (a snapshot resumed with `--flash` sees the file's flash);
+interrupting the upgrade (power off mid-write). The upgrade's synchronous state
+save before the erase was not checked.
+
+The memory note that open-loop feeds lost chunks around 17G could not be
+reproduced: the same 2 KiB and 32 KiB streams in one feed, and the earlier
+per-file schedule (one file of ten writes a second of emulated time), arrived
+in full on this build and on main (c5732f0) alike [measured, 2026-10-22].
+
+Tools: `dtboot --flash FILE` (load if present, write back at the end; with no
+`.syx`, boot the flash's OS), `dtboot --reboot` (continue across the reset;
+events not yet due run on the new boot's clock), `rytm --flash FILE` (the
+window reboots by itself and saves the flash with the card),
+`DTEMU_SPI_TRACE=1` (each erase and program; `=all` every command).

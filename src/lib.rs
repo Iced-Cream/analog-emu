@@ -20,6 +20,7 @@ pub mod usbdev;
 pub mod usbhost;
 pub mod a4voice;
 pub mod nor;
+pub mod spiflash;
 pub mod mk1;
 pub mod syntakt;
 pub mod stanalog;
