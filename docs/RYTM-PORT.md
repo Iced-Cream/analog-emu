@@ -856,8 +856,18 @@ starts a text console beside the normal UI: 0x401006ee registers its input
 parser (0x400816c4) and task (0x4013c164 -> 0x4013a234) and sets USB up in
 mode 4, a CDC ACM serial device (1935:ffff; data interface 1, bulk 0x02 OUT
 and 0x82 IN) [measured, OS 1.74]. Lines start with `#` and end with a newline
-(`!` and `$$$$` start binary blocks). Which bootstrap path sets the flag on a
-unit has not been traced.
+(`!` and `$$$$` start binary blocks).
+
+Where the flag comes from: the bootstrap (OS 1.74's, 0x80000ac4, Ghidra
+read-only; the emulator does not run it) sets 0x40 in three cases: FUNC,
+GLOBAL, SAMPLER and CHRO held at power-on with PLAYMODE, MUTE, SCNE, PERF and
+QPER up (and the OS check 0x8000214c passing); a software reset with
+0xB0B0DADA at 0x48000000 (what #REBOOT_INTO_MAINTENANCE_MODE presumably
+leaves; the OS upgrade writes 0 there before its reset); or no panel answer
+(0xC0, which also parks the UI). FUNC alone opens the STARTUP MENU (0x8000356c),
+whose 1 ... TEST MODE is the bootstrap's own key/encoder/pad test, not this
+console [read from the code; key codes named by panel::RYTM_KEYS, which the
+bootstrap shares with the OS - inferred; not tried on a unit].
 
 Commands (strings in 0x4013a234): #HELLO, #STATUS, #READ_SERIAL, #READ_TEMP,
 #DUMP_CALIBRATION and other reads; also #UPGRADE (writes the bootstrap),
