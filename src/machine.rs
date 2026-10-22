@@ -782,9 +782,9 @@ impl Machine {
         };
         m.cpu.bus.spi = Some(flash);
         if maintenance {
-            let f = m.cpu.bus.peek32(INITIAL_SP - 4);
-            m.cpu.bus.poke32(INITIAL_SP - 4, f | 0x40);
-            m.note("reboot into test mode (0xB0B0DADA at 0x48000000): boot flag 0x40".into());
+            if let Some(flag) = m.set_test_mode() {
+                m.note(format!("reboot into test mode (0xB0B0DADA at 0x48000000): boot flag 0x{flag:x}"));
+            }
         }
         let card = &mut self.cpu.bus.io.esdhc.card;
         match card.path.clone() {
@@ -796,6 +796,17 @@ impl Machine {
         }
         *self = m;
         Ok(self.prof.name)
+    }
+
+    /// Boot into the factory-test console, as the bootstrap does for its key
+    /// combo or a maintenance reboot: OR the device's flag into the boot
+    /// flags (call before the first instruction). -> the flag, or None on a
+    /// device without one here.
+    pub fn set_test_mode(&mut self) -> Option<u32> {
+        let flag = self.prof.device.test_mode_flag()?;
+        let f = self.cpu.bus.peek32(INITIAL_SP - 4);
+        self.cpu.bus.poke32(INITIAL_SP - 4, f | flag);
+        Some(flag)
     }
 
     pub fn add_breakpoint(&mut self, pc: u32) {

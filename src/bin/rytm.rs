@@ -244,7 +244,7 @@ fn emulate(
     // so a second emulator can run beside a window without their ports colliding.
     let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let mut midi_out = if ports { midi::Out::start(&format!("{pname} out"), "out") } else { None };
-    let mut usb_out = if ports && m.is_rytm() { midi::Out::start(&format!("{pname} usb out"), "uout") } else { None };
+    let mut usb_out = if ports && (m.is_rytm() || m.is_a4()) { midi::Out::start(&format!("{pname} usb out"), "uout") } else { None };
     let slice = (ips / 500.0) as u64; // 2 ms of emulated time
     let target_ms = o.latency;
     let mut t0 = Instant::now();
@@ -686,7 +686,7 @@ pub fn main() {
     // The same names as the output ports.
     let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let _midi_in = if ports { midi::start_in(tx.clone(), &format!("{pname} in"), false) } else { None };
-    let _usb_in = if ports && view.lock().unwrap().rytm { midi::start_in(tx.clone(), &format!("{pname} usb in"), true) } else { None };
+    let _usb_in = if ports && { let v = view.lock().unwrap(); v.rytm || v.a4 } { midi::start_in(tx.clone(), &format!("{pname} usb in"), true) } else { None };
     // --midi-from NAME: an existing MIDI source (a real Rytm, a keyboard) into
     // the DIN MIDI input, without a routing app.
     let _from = o.midi_from.as_deref().and_then(|n| midi::connect_from(tx.clone(), n));

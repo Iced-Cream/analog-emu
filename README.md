@@ -108,7 +108,7 @@ wired to the emulated DIN MIDI port (`--no-midi` to skip). Connect a keyboard, a
 or a SysEx tool to them as to a real Rytm's DIN MIDI. Windows has no virtual MIDI
 ports: there the window opens existing ports with those names, so create them first
 with a loopback driver such as loopMIDI (`rytm-emu in`, `rytm-emu out`, and for the
-USB MIDI port `rytm-emu usb in` / `rytm-emu usb out`); a missing one is reported
+USB MIDI port `rytm-emu usb in` / `rytm-emu usb out`; `a4-emu ...` for the A4); a missing one is reported
 and skipped. Headless tests can send MIDI
 with `dtboot --midi 9d0064@5G` or a SysEx file with `--midi-file dump.syx@5G`.
 `DTEMU_MIDI_LOG=FILE` logs every message through the ports. Elektron's own protocol

@@ -91,9 +91,11 @@ counts (suffixes k, M, G).
                        persists. With no .syx given, boots the OS the flash holds.
                        A host file only; nothing here reaches a unit
   --usb-serial TEXT@AT  (implies --usb-host) the host as a serial (CDC ACM) device's
-                       driver, as the factory-test mode enumerates (boot flag 0x40:
-                       --poke 407ffffc=00140040): TEXT and a newline on its data
+                       driver, as the factory-test mode enumerates (--test-mode):
+                       TEXT and a newline on its data
                        port at clock AT; what comes back is printed at the end
+  --test-mode          boot into the factory-test console (Rytm MKII, A4 MKII): the
+                       boot flag the bootstrap sets for its power-on key combo
   --reboot             when the firmware resets (RCR SOFTRST, as at the end of an
                        OS upgrade), boot again from the OS in the flash, keeping
                        the flash and the card; events not yet due run on the new
@@ -163,6 +165,7 @@ fn main() {
     let mut card_save = false;
     let mut flash: Option<String> = None;
     let mut flash_loaded: Option<Vec<u8>> = None;
+    let mut test_mode = false;
     let mut serials: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut reboot = false;
     let mut power_off: Option<u64> = None;
@@ -285,6 +288,7 @@ fn main() {
                 usb_host = true;
             }
             "--reboot" => reboot = true,
+            "--test-mode" => test_mode = true,
             "--power-off" => power_off = Some(num(it.next().unwrap())),
             "--usb-midi-real" => usb_midi_real = true,
             "--usb-host-sleep" | "--usb-host-noread" => {
@@ -386,6 +390,12 @@ fn main() {
         let o = a & 0x07FF_FFFF;
         m.cpu.bus.watch = Some((o, o + n));
         m.cpu.bus.watch_reads = true;
+    }
+    if test_mode {
+        match m.set_test_mode() {
+            Some(f) => println!("test mode: boot flag 0x{f:x}"),
+            None => println!("test mode: not known for {}", m.prof.name),
+        }
     }
     if let Some(p) = &flash {
         match m.load_flash(std::path::Path::new(p)) {

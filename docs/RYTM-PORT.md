@@ -953,9 +953,11 @@ card. #STATUS prints a block per part; its FLASH line is the first bytes of
 the 9F ID (`01 2018 00 ...` on a contributor's unit and the emulator alike; the
 words after it differ per unit and are not recorded here).
 
-In the emulator: `dtboot FW --poke 407ffffc=00140040 --usb-serial "#STATUS@3.5G"`
-(boot flags 0x00140040; `--usb-serial` turns on the USB host as a serial
-driver, `UsbHost::cdc`, and prints what comes back). Measured on 1.74:
+In the emulator: `dtboot FW --test-mode --usb-serial "#STATUS@3.5G"`
+(`--test-mode` ORs the device's flag into the boot flags, here 0x00140040,
+`Device::test_mode_flag`; `--usb-serial` turns on the USB host as a serial
+driver, `UsbHost::cdc`, and prints what comes back). The A4 MKII has the same
+console with flag 0x20 (docs/A4-PORT.md section 14). Measured on 1.74:
 #HELLO -> HOW DO YOU DO?; #STATUS -> START, VERSION 1, OS 0176 1.74, PLATFORM,
 FLASH 01 2018 (EF 4018 before the part was changed), DRAM, FPGA, SUPERCAP, UI (WRONG UI CARD), MMC, CODEC (FAIL).
 
