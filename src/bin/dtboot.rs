@@ -698,7 +698,17 @@ fn main() {
                 break;
             }
             match m.reboot_from_flash() {
-                Ok(name) => println!("[{at:>12}] rebooting from the flash: {name}"),
+                Ok(name) => {
+                    println!("[{at:>12}] rebooting from the flash: {name}");
+                    // The new machine starts without the tools' attachments.
+                    if usb_host {
+                        let mut h = dtemu::usbhost::UsbHost::new();
+                        h.suspend = usb_sleep;
+                        h.midi_sleep = usb_noread;
+                        h.cdc = !serials.is_empty();
+                        m.usb_host = Some(h);
+                    }
+                }
                 Err(e) => {
                     println!("cannot reboot: {e}");
                     break;
@@ -711,6 +721,7 @@ fn main() {
             midis.retain(|x| x.1 > at);
             usb_midis.retain(|x| x.1 > at);
             nudges.retain(|n| n.0 > at);
+            serials.retain(|x| x.1 > at);
             power_off = power_off.filter(|&t| t > at);
             instr -= at.min(instr);
             target = 0;

@@ -824,8 +824,11 @@ the prompt comes.
   `(size + sector - 1) / sector` erases), then "Writing Flash": 2899 page
   programs of 512 bytes from 0x80000 (with the W25Q128: 23 x 64 KB, 5798 x 256), 1,484,288 bytes, which is the new `.syx`'s ELE3
   container byte for byte (`dtboot` compares them: no "different OS" note).
-- "Success! Rebooting": a wait (0x40098c84(3000000); 3 s if microseconds
-  [inferred]), 0 to 0x48000000, then RCR (0xEC090000) = 0x80, a software reset
+- "Success! Rebooting": a wait (0x40098c84(3000000): DTIM1 counts to its
+  argument with DTMR 0x841b, a /133 prescaler on the internal bus clock, so
+  about 1 us a count and 3 s here; 3.0 s in the emulator, 0.6G instructions
+  between the last page and the reset [read from the code; measured]), 0 to
+  0x48000000, then RCR (0xEC090000) = 0x80, a software reset
   (`move.b` at 0x4009f53a). `Io::reset_request` catches it and
   `Machine::run_until` returns `Stop::Reset` (1.73, YES at 18G: the reset at
   19.60G with the part's times, 18.68G with `DTEMU_SPI_INSTANT=1`; the
@@ -862,7 +865,8 @@ transfer under way (zeros, then an end-of-queue word, so the chip select
 goes high and a started command executes), then polls RDSR (`0x80020005`,
 `0x08020000`) until WIP clears (`0x401224a0`..`0x4012252c`), and only then
 goes on to its card work and the CMD0 that parks the card [read from the
-code, 1.73; the same RDSR poll is at 1.74 `0x4012256a`]. The interrupted
+code, 1.73; 1.74's save `0x401222d2` has the same structure: the lock test
+`0x401372f0`, the RDSR poll at `0x4012256a`]. The interrupted
 code ran at SR 0x2000 (the erase routine's delay loop at 1.73 `0x40136730`),
 so the interrupt itself is taken at once [measured]. So the OS completes any
 erase or program it started before the board loses power, as long as the
@@ -933,8 +937,10 @@ Where the flag comes from: the bootstrap (OS 1.74's, 0x80000ac4, Ghidra
 read-only; the emulator does not run it) sets 0x40 in three cases: FUNC,
 GLOBAL, SAMPLER and CHRO held at power-on with PLAYMODE, MUTE, SCNE, PERF and
 QPER up (and the OS check 0x8000214c passing); a software reset with
-0xB0B0DADA at 0x48000000 (what #REBOOT_INTO_MAINTENANCE_MODE presumably
-leaves; the OS upgrade writes 0 there before its reset); or no panel answer
+0xB0B0DADA at 0x48000000 (the console's #REBOOT and
+#REBOOT_INTO_MAINTENANCE_MODE both write it, then RCR = 0x80, 1.74
+`0x4013a234` [read from the code]; the OS upgrade writes 0 there before its
+reset); or no panel answer
 (0xC0, which also parks the UI). FUNC alone opens the STARTUP MENU (0x8000356c),
 whose 1 ... TEST MODE is the bootstrap's own key/encoder/pad test, not this
 console [read from the code; key codes named by panel::RYTM_KEYS, which the
@@ -957,3 +963,19 @@ FLASH 01 2018 (EF 4018 before the part was changed), DRAM, FPGA, SUPERCAP, UI (W
 firmware's USB setup write (0x08000000) cleared the host's VBUS before, and a
 cold boot with `--usb-host` stayed at "VBUS on" in every USB mode; it now
 enumerates (USB MIDI as 1935:0011 on 1.73, the serial device in test mode).
+
+**Checked later (2026-10-23):**
+- *Downgrade.* OS 1.74 receiving 1.73 (32 KiB chunks, YES at 18G) accepts it,
+  erases six sectors, writes 1,483,776 bytes and resets (19.603G); the
+  emulator reboots into 1.73. The OS does not refuse an older image; the
+  bootstrap's "DOWNGRADE NOT POSSIBLE" belongs to its own SysEx upgrade
+  [measured; the bootstrap path not run].
+- *Maintenance reboot.* `Machine::reboot_from_flash` keeps the bootstrap's
+  rule for 0xB0B0DADA at 0x48000000 and boots with flag 0x40. In dtboot, test
+  mode, #HELLO, #REBOOT (a reset 3.5k instructions later), then #HELLO on the
+  new boot: HOW DO YOU DO? [measured]. dtboot re-attaches its USB host after
+  a `--reboot`.
+- *Transfer.* Not run against the window. It pairs MIDI ports by product name
+  and otherwise asks the user to pick them ("Select MIDI ports for your
+  device", overbridge-transfer-protocols 3.5): choose input `rytm-emu usb out`
+  and output `rytm-emu usb in` [inferred].

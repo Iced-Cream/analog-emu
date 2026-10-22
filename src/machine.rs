@@ -23,6 +23,10 @@ pub const DEFAULT_VBR: u32 = 0x4000_0000;
 /// twenty places; 0x40|0x20 would mean "no panel" and park the OS.
 pub const BOOT_FLAGS: u32 = 0x0014_0000;
 
+/// What the factory console leaves at 0x48000000 before a software reset so
+/// the bootstrap starts the next boot in test mode (boot flag 0x40).
+pub const MAINTENANCE_MAGIC: u32 = 0xB0B0_DADA;
+
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub flash_reads: u64,
@@ -752,8 +756,14 @@ impl Machine {
     /// everything else starts cold, the tools' options included. The real
     /// bootstrap that would unpack the container is not run: the machine
     /// loads its MAIN OS as it does from a `.syx`, so the build must be one
-    /// `symbols.rs` knows. -> the new profile's name.
+    /// `symbols.rs` knows. One bootstrap rule is kept: a software reset with
+    /// `MAINTENANCE_MAGIC` at 0x48000000 (the factory console's #REBOOT and
+    /// #REBOOT_INTO_MAINTENANCE_MODE leave it, OS 1.74 `0x4013a234`) boots
+    /// with flag 0x40, the test mode (the 1.74 bootstrap's `0x80000ac4`
+    /// checks RSR's SOFT bit and that word) [read from the code]. -> the
+    /// new profile's name.
     pub fn reboot_from_flash(&mut self) -> Result<&'static str, String> {
+        let maintenance = self.cpu.bus.peek32(0x4800_0000) == MAINTENANCE_MAGIC;
         let mut flash = self.cpu.bus.spi.take().ok_or("no SPI flash")?;
         flash.settle(u64::MAX);
         let fw = match Firmware::from_container(&flash.mem[FLASH_SLOT..]) {
@@ -771,6 +781,11 @@ impl Machine {
             }
         };
         m.cpu.bus.spi = Some(flash);
+        if maintenance {
+            let f = m.cpu.bus.peek32(INITIAL_SP - 4);
+            m.cpu.bus.poke32(INITIAL_SP - 4, f | 0x40);
+            m.note("reboot into test mode (0xB0B0DADA at 0x48000000): boot flag 0x40".into());
+        }
         let card = &mut self.cpu.bus.io.esdhc.card;
         match card.path.clone() {
             Some(p) => {
