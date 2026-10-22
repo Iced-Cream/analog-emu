@@ -36,6 +36,7 @@
 //! answers 0xFF. Nothing here reaches real hardware: the image is a byte vector
 //! (written back to a file only by the tools' `--flash` option).
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
 pub const DSPI0_MCR: u32 = 0xFC05_C000;
@@ -134,6 +135,7 @@ impl CutMode {
 
 /// An operation under way: the bytes it leaves, at their addresses, in the
 /// order the part works through them, and its clock span.
+#[derive(Clone, Serialize, Deserialize)]
 struct Pending {
     op: Op,
     bytes: Vec<(usize, u8)>,
@@ -141,7 +143,19 @@ struct Pending {
     end: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a snapshot keeps of the flash: its contents (LZ4) and the state a
+/// running program can see (WEL, an operation under way and its clock span,
+/// the counters). The part and the host settings stay the running machine's.
+#[derive(Serialize, Deserialize)]
+pub struct FlashState {
+    mem_lz4: Vec<u8>,
+    wel: bool,
+    pending: Option<Pending>,
+    erased_bytes: u64,
+    programmed_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
     Erase { at: u32, len: u32 },
     Program { at: u32, len: u32 },
@@ -373,6 +387,36 @@ impl SpiFlash {
         }
     }
 
+    pub fn state(&self) -> FlashState {
+        FlashState {
+            mem_lz4: lz4_flex::compress_prepend_size(&self.mem),
+            wel: self.wel,
+            pending: self.pending.clone(),
+            erased_bytes: self.erased_bytes,
+            programmed_bytes: self.programmed_bytes,
+        }
+    }
+
+    /// Back to a snapshot's flash. A selection in progress is dropped (a
+    /// snapshot is taken between instructions; the OS deselects within its
+    /// own routine, so none is open in practice).
+    pub fn restore(&mut self, s: FlashState) -> Result<(), String> {
+        let mem = lz4_flex::decompress_size_prepended(&s.mem_lz4).map_err(|e| e.to_string())?;
+        if mem.len() != self.mem.len() {
+            return Err(format!("snapshot flash is {} bytes, this machine's {}", mem.len(), self.mem.len()));
+        }
+        self.mem = mem;
+        self.wel = s.wel;
+        self.pending = s.pending;
+        self.erased_bytes = s.erased_bytes;
+        self.programmed_bytes = s.programmed_bytes;
+        self.idx = 0;
+        self.prog.clear();
+        self.rx.clear();
+        self.dirty = true;
+        Ok(())
+    }
+
     /// One line for the end of a run.
     pub fn summary(&self) -> String {
         format!(
@@ -478,6 +522,22 @@ mod tests {
             assert!(f.cut(900_010).is_some());
             assert_eq!((f.mem[0x8_0000], f.mem[0xB_FFFF]), (want, want));
         }
+    }
+
+    #[test]
+    fn state_round_trip_keeps_an_operation_under_way() {
+        let mut f = SpiFlash::new(vec![0u8; 1 << 20]);
+        f.instant = false;
+        tx(&mut f, &[0x06]);
+        tx(&mut f, &[0xD8, 0x04, 0x00, 0x00]);
+        assert!(f.busy());
+        let s = f.state();
+        let mut g = SpiFlash::new(vec![0u8; 1 << 20]);
+        g.restore(s).unwrap();
+        assert!(g.busy());
+        g.settle(u64::MAX);
+        assert_eq!(g.mem[0x4_0000], 0xFF);
+        assert_eq!(g.erased_bytes, 0x4_0000);
     }
 
     #[test]

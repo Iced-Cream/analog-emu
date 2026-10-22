@@ -666,9 +666,9 @@ then the emulated run doing exactly this]:
 - **Before an OS upgrade** ("ERASING FLASH...", 0x4004db9c) the same write is
   made synchronously (0x4012285c): flashing an OS keeps the working state.
   So a Rytm flashed with a mod build boots the stock state, and going back to
-  stock boots the mod's state - the HIGH 2 case [inferred from the code; the
-  emulator runs the upgrade now ("OS upgrade over USB MIDI" below), but this
-  save has not been checked there].
+  stock boots the mod's state - the HIGH 2 case [measured in the emulator,
+  "OS upgrade over USB MIDI" below: the save lands before the first erase and
+  the new OS loads it].
 - Strings "MRAM STATE NOT WRITTEN", "MRAM WRITE IN PROGRESS" (0x41352d28,
   0x41352d24) belong to the factory test's status report; "SHUTDOWN" is a
   random-name word and "TURN POWER OFF" the end of the factory test - none
@@ -868,12 +868,30 @@ stops, saying so. A unit would go on into its bootstrap, whose check failing
 opens its STARTUP MENU with OS UPGRADE (0x8000356c; 0x8000214c inferred to be
 that check), the recovery path; the emulator does not run the bootstrap.
 
+**The state save before the erase** [measured, 2026-10-22, 1.73 receiving
+1.74 from a snapshot just before YES at 18G]: the project name in the working
+state changed in RAM (0x405c8e2c "Analog" -> "Znalog", header checksum at
+0x405c8e14 recomputed: the sum of word[i] ^ (i + 1) over (size + 8) / 4 words
+from +8) before YES. After YES the OS writes the 2 MB state to the other
+eMMC slot (0x7c000 here) and clears the first byte of the old one (0x7a000),
+as the power-off save does; the write is complete between 18.030G and
+18.035G, and the first erase starts between 18.035G and 18.040G, so the save
+comes first. After the reset, OS 1.74 boots with "Znalog Rytm" at the same
+address: the new OS loads the state the old one saved. With the checksum
+left stale, the slot is written but the new OS rejects it and starts from
+defaults (the old slot having been cleared).
+
+**Snapshots carry the flash** (a `FLSH` trailer after the main body and the
+Syntakt's DSP: the contents, LZ4, about 3 MB; WEL; an erase or program under
+way with its clock span; the counters). Older snapshots load as before and
+leave the flash alone. A snapshot taken mid-erase (18.402G) and resumed
+reaches the reset at the same clock as an uninterrupted run (19.6035G) and
+writes the same container. With `--flash FILE` the snapshot's flash runs and
+is written back to FILE; dtboot notes when the two differed.
+
 Not modelled: the bootstrap that a unit runs first (the emulator loads MAIN OS
 from the container as it does from a `.syx`, so only builds `symbols.rs` knows
-boot, and the recovery after an interrupted upgrade cannot be followed); the
-flash is not in snapshots (a snapshot resumed with `--flash` sees the file's
-flash, and an operation under way at a snapshot is lost). The upgrade's
-synchronous state save before the erase was not checked.
+boot, and the recovery after an interrupted upgrade cannot be followed).
 
 The memory note that open-loop feeds lost chunks around 17G could not be
 reproduced: the same 2 KiB and 32 KiB streams in one feed, and the earlier

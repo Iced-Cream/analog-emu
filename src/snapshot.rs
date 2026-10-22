@@ -16,6 +16,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"DTEMUSNP";
+/// The SPI flash's trailer: after the main body (and the DSP's, if any). A
+/// snapshot without it (older ones, MKI units) leaves the flash as it is.
+const FLASH_TAG: &[u8; 4] = b"FLSH";
 const VERSION: u32 = 2; // 2: panel held[16] + groups
 
 #[derive(Serialize, Deserialize)]
@@ -172,6 +175,10 @@ pub fn save(m: &Machine, path: &Path) -> std::io::Result<()> {
         };
         body.extend(bincode::serialize(&dsp).map_err(std::io::Error::other)?);
     }
+    if let Some(f) = c.bus.spi.as_ref() {
+        body.extend_from_slice(FLASH_TAG);
+        body.extend(bincode::serialize(&f.state()).map_err(std::io::Error::other)?);
+    }
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -197,7 +204,14 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     f.read_to_end(&mut body).map_err(|e| e.to_string())?;
     let mut cur = std::io::Cursor::new(&body[..]);
     let s: Snap = bincode::deserialize_from(&mut cur).map_err(|e| e.to_string())?;
-    let dsp: Option<DspSnap> = if (cur.position() as usize) < body.len() {
+    let at_flash = |cur: &std::io::Cursor<&[u8]>| body[cur.position() as usize..].starts_with(FLASH_TAG);
+    let dsp: Option<DspSnap> = if (cur.position() as usize) < body.len() && !at_flash(&cur) {
+        Some(bincode::deserialize_from(&mut cur).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let flash: Option<crate::spiflash::FlashState> = if at_flash(&cur) {
+        cur.set_position(cur.position() + FLASH_TAG.len() as u64);
         Some(bincode::deserialize_from(&mut cur).map_err(|e| e.to_string())?)
     } else {
         None
@@ -260,6 +274,9 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
         d.cpu.restore(&mut core);
         m.dsp = Some(Box::new(core));
         m.dsp_stats = d.stats;
+    }
+    if let (Some(state), Some(f)) = (flash, m.cpu.bus.spi.as_mut()) {
+        f.restore(state)?;
     }
     m.frame = s.frame;
     m.frame_seq = s.frame_seq;

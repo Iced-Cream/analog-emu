@@ -162,6 +162,7 @@ fn main() {
     let mut card: Option<String> = None;
     let mut card_save = false;
     let mut flash: Option<String> = None;
+    let mut flash_loaded: Option<Vec<u8>> = None;
     let mut serials: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut reboot = false;
     let mut power_off: Option<u64> = None;
@@ -388,7 +389,10 @@ fn main() {
     }
     if let Some(p) = &flash {
         match m.load_flash(std::path::Path::new(p)) {
-            Ok(true) => println!("flash {p}: loaded"),
+            Ok(true) => {
+                println!("flash {p}: loaded");
+                flash_loaded = m.cpu.bus.spi.as_ref().map(|f| f.mem.clone());
+            }
             Ok(false) => println!("flash {p}: new (built from the .syx)"),
             Err(e) => panic!("--flash {e}"),
         }
@@ -400,6 +404,13 @@ fn main() {
     if let Some(p) = &load {
         dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
         println!("restored {p} at clock {}", m.now());
+        // A snapshot carries its own flash (an older one does not, and leaves
+        // the file's): say so when it replaced a different --flash file.
+        if let (Some(before), Some(f)) = (&flash_loaded, m.cpu.bus.spi.as_ref()) {
+            if *before != f.mem {
+                println!("note: the snapshot's flash differs from --flash's file; running the snapshot's, which is written back to the file at the end");
+            }
+        }
         instr += m.now();
     }
     // --ob-in FILE.wav[:CH]: a 16-bit WAV's first channel as Overbridge input
