@@ -827,18 +827,34 @@ the prompt comes.
 - "Success! Rebooting": a wait (0x40098c84(3000000); 3 s if microseconds
   [inferred]), 0 to 0x48000000, then RCR (0xEC090000) = 0x80, a software reset
   (`move.b` at 0x4009f53a). `Io::reset_request` catches it and
-  `Machine::run_until` returns `Stop::Reset` (1.73: clock 18.68G with YES at
-  18G; erase and program are instant here, as WIP never sets).
+  `Machine::run_until` returns `Stop::Reset` (1.73, YES at 18G: the reset at
+  19.60G with the part's times, 18.68G with `DTEMU_SPI_INSTANT=1`; the
+  difference, 0.92G instructions, is 4.6 s at 200 MHz: six 520 ms erases,
+  2899 programs of 340 us and the OS's own polling waits).
 - `Machine::reboot_from_flash` builds a new machine from the container at
   0x80000, keeping the flash and the card: it boots OS 1.74 to the same screen
   as a cold boot of the 1.74 `.syx` on that card.
 
-Not modelled: erase and program times (WIP never reads busy); the bootstrap
-that a unit runs first (the emulator loads MAIN OS from the container as it
-does from a `.syx`, so only builds `symbols.rs` knows boot); the flash is not
-in snapshots (a snapshot resumed with `--flash` sees the file's flash);
-interrupting the upgrade (power off mid-write). The upgrade's synchronous state
-save before the erase was not checked.
+**Timing and power loss.** Erase and program take the part's datasheet
+typicals on the emulated clock (`spiflash::Part`, [inferred]): status reads
+busy meanwhile, other commands are ignored, and the change lands at the end.
+`dtboot --power-off AT` during an upgrade runs the OS's power-fail handler as
+before, then cuts a flash operation still under way, leaving the share of its
+bytes its elapsed time covers [inferred: neither the order a part works in nor
+how long the supercap keeps the flash up is known]. Measured: 1.73 receiving
+1.74 with YES at 18G and the power off at 18.85G leaves six sectors erased and
+828,416 of 1,484,288 bytes written; booting that flash (`dtboot --flash F`, no
+`.syx`) finds the container's header but a MAIN OS no profile knows, and
+stops, saying so. A unit would go on into its bootstrap, whose check failing
+opens its STARTUP MENU with OS UPGRADE (0x8000356c; 0x8000214c inferred to be
+that check), the recovery path; the emulator does not run the bootstrap.
+
+Not modelled: the bootstrap that a unit runs first (the emulator loads MAIN OS
+from the container as it does from a `.syx`, so only builds `symbols.rs` knows
+boot, and the recovery after an interrupted upgrade cannot be followed); the
+flash is not in snapshots (a snapshot resumed with `--flash` sees the file's
+flash, and an operation under way at a snapshot is lost). The upgrade's
+synchronous state save before the erase was not checked.
 
 The memory note that open-loop feeds lost chunks around 17G could not be
 reproduced: the same 2 KiB and 32 KiB streams in one feed, and the earlier
@@ -849,7 +865,8 @@ Tools: `dtboot --flash FILE` (load if present, write back at the end; with no
 `.syx`, boot the flash's OS), `dtboot --reboot` (continue across the reset;
 events not yet due run on the new boot's clock), `rytm --flash FILE` (the
 window reboots by itself and saves the flash with the card),
-`DTEMU_SPI_TRACE=1` (each erase and program; `=all` every command).
+`DTEMU_SPI_TRACE=1` (each erase and program; `=all` every command),
+`DTEMU_SPI_INSTANT=1` (no erase and program times).
 
 ## The factory-test console (2026-10-22)
 

@@ -116,6 +116,15 @@ Environment:
                        (DTEMU_STRICT=log: listed only, no fault)
 ";
 
+/// The flash holds no OS the emulator can boot: after an interrupted upgrade,
+/// a unit's bootstrap finds its check failing and offers its own OS upgrade
+/// (STARTUP MENU, `0x8000356c`); the emulator does not run the bootstrap.
+fn no_os_in_flash(e: &str) -> ! {
+    println!("the flash holds no bootable OS ({e}).");
+    println!("On a unit the bootstrap decides next: its check (0x8000214c, inferred to be the OS check) failing opens its STARTUP MENU with OS UPGRADE. The emulator does not run the bootstrap.");
+    std::process::exit(3);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut syx = None;
@@ -329,7 +338,7 @@ fn main() {
     let flash_image = flash.as_ref().and_then(|p| std::fs::read(p).ok());
     let fw = match (&syx, &flash_image) {
         (None, Some(img)) if img.len() > dtemu::machine::FLASH_SLOT => {
-            let fw = Firmware::from_container(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| panic!("--flash: no OS at 0x80000: {e}"));
+            let fw = Firmware::from_container(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| no_os_in_flash(&e.to_string()));
             println!("booting the OS in the flash: build {} version {}", fw.build, fw.version);
             fw
         }
@@ -345,7 +354,8 @@ fn main() {
             println!("note: the flash holds a different OS from the .syx; this run boots the .syx's (leave the .syx out to boot the flash's)");
         }
     }
-    let mut m = Machine::new(&fw, 128).unwrap();
+    let booting_flash = syx.is_none() && flash_image.is_some();
+    let mut m = Machine::new(&fw, 128).unwrap_or_else(|e| if booting_flash { no_os_in_flash(&e) } else { panic!("{e}") });
     if let Some(i) = ips {
         m.cpu.bus.io.ips = i as f64;
     }
@@ -499,6 +509,9 @@ fn main() {
                     if r.slots[1] { "valid" } else { "-" },
                     if matches!(r.stop, Stop::Fault(..)) { format!(" ({:?})", r.stop) } else { String::new() }
                 );
+                if let Some(c) = &r.flash_cut {
+                    println!("[{:>12}] power off: flash {c}", m.now());
+                }
                 if card.is_some() {
                     card_save = true;
                 }

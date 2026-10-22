@@ -66,6 +66,8 @@ pub struct PowerOff {
     /// A valid state header ('COKI') at sector 0x7a000, 0x7c000 afterwards.
     pub slots: [bool; 2],
     pub stop: Stop,
+    /// A flash erase or program the power cut short (spiflash.rs `cut`).
+    pub flash_cut: Option<String>,
 }
 
 pub struct Machine {
@@ -737,6 +739,8 @@ impl Machine {
     /// Write the SPI flash back to `path` (a host file, nothing else).
     pub fn save_flash(&mut self, path: &std::path::Path) -> Result<(), String> {
         let f = self.cpu.bus.spi.as_mut().ok_or("no SPI flash")?;
+        // An operation under way finishes: the power stays on.
+        f.settle(u64::MAX);
         std::fs::write(path, &f.mem).map_err(|e| format!("{}: {e}", path.display()))?;
         f.dirty = false;
         Ok(())
@@ -750,7 +754,8 @@ impl Machine {
     /// loads its MAIN OS as it does from a `.syx`, so the build must be one
     /// `symbols.rs` knows. -> the new profile's name.
     pub fn reboot_from_flash(&mut self) -> Result<&'static str, String> {
-        let flash = self.cpu.bus.spi.take().ok_or("no SPI flash")?;
+        let mut flash = self.cpu.bus.spi.take().ok_or("no SPI flash")?;
+        flash.settle(u64::MAX);
         let fw = match Firmware::from_container(&flash.mem[FLASH_SLOT..]) {
             Ok(fw) => fw,
             Err(e) => {
@@ -930,6 +935,10 @@ impl Machine {
             let off = bus.peek32(sp + 4) as usize;
             let len = bus.peek32(sp + 8) as usize;
             let dest = bus.peek32(sp + 12);
+            let now = bus.io.now;
+            if let Some(f) = bus.spi.as_mut() {
+                f.settle(now);
+            }
             let data = match bus.spi.as_ref() {
                 Some(f) if len != 0 && dest != 0 && off + len <= f.mem.len() => Some(f.mem[off..off + len].to_vec()),
                 _ => None,
@@ -1450,7 +1459,13 @@ impl Machine {
         }
         let card = &self.cpu.bus.io.esdhc.card;
         let slots = [0x7a000u32, 0x7c000].map(|s| card.sectors.get(&s).is_some_and(|d| &d[..4] == b"COKI"));
-        PowerOff { armed, done, instructions: self.now() - t0, sectors_written: card.writes - writes0, slots, stop }
+        let (writes, instructions) = (card.writes - writes0, self.now() - t0);
+        // The CPU has parked: an erase or program under way stops here
+        // [inferred: how long the supercap keeps the flash powered beyond the
+        // handler is not known].
+        let now = self.now();
+        let flash_cut = self.cpu.bus.spi.as_mut().and_then(|f| f.cut(now));
+        PowerOff { armed, done, instructions, sectors_written: writes, slots, stop, flash_cut }
     }
 
     /// The firmware's own "+Drive mounted" flag.

@@ -24,9 +24,12 @@
 //!                    an error bit, 0x60, which never sets here)
 //! ```
 //!
-//! Program and erase need WEL, act when the chip select goes high (a word
-//! without CONT), and clear WEL; they complete at once, so a status poll
-//! never sees WIP. The part is `Part`: by default the owner's Rytm MKII's,
+//! Program and erase need WEL and start when the chip select goes high (a
+//! word without CONT). They then take the part's time on the emulated clock
+//! (`Part::t_*`, datasheet typicals [inferred]): status reads WIP (and WEL)
+//! meanwhile, other commands are ignored, and the change lands in the image
+//! when the time is up (`settle`). A power cut (`cut`) leaves the share of
+//! the operation done by then. `DTEMU_SPI_INSTANT=1` completes them at once. The part is `Part`: by default the owner's Rytm MKII's,
 //! read with the factory-test console's #STATUS (FLASH `01 2018 00`,
 //! 2026-10-22) [measured]. Any other command is counted in `unknown` and
 //! answers 0xFF. Nothing here reaches real hardware: the image is a byte vector
@@ -54,15 +57,67 @@ pub struct Part {
     pub sector: usize,
     /// 20 (4 KB) and 52 (32 KB) erases exist.
     pub small_erases: bool,
+    /// Typical times in microseconds: a page program, a D8 sector erase, a
+    /// 4 KB and a 32 KB erase (when the part has them), the chip erase.
+    pub t_page: f64,
+    pub t_sector: f64,
+    pub t_4k: f64,
+    pub t_32k: f64,
+    pub t_chip: f64,
+}
+
+impl Part {
+    /// How long an operation takes, in microseconds.
+    fn time(&self, op: &Op) -> f64 {
+        match *op {
+            Op::Program { .. } => self.t_page,
+            Op::Erase { len: 0x1000, .. } if self.small_erases => self.t_4k,
+            Op::Erase { len: 0x8000, .. } if self.small_erases => self.t_32k,
+            Op::Erase { len, .. } if len as usize == self.sector => self.t_sector,
+            Op::Erase { .. } => self.t_chip,
+        }
+    }
 }
 
 /// Spansion S25FL128S with uniform 256 KB sectors: 01 2018, byte 4 = 00, as
 /// the owner's Rytm MKII reports [measured]; bytes 3 and 5 (4D, 80) are the
-/// datasheet's [inferred: the console prints neither].
-pub const S25FL128S_256K: Part = Part { id: [0x01, 0x20, 0x18, 0x4D, 0x00, 0x80], page: 512, sector: 0x4_0000, small_erases: false };
+/// datasheet's [inferred: the console prints neither]. Times: the datasheet's
+/// typicals, 340 us a 512-byte page, 520 ms a 256 KB sector, 33 s the chip
+/// [inferred].
+pub const S25FL128S_256K: Part = Part {
+    id: [0x01, 0x20, 0x18, 0x4D, 0x00, 0x80],
+    page: 512,
+    sector: 0x4_0000,
+    small_erases: false,
+    t_page: 340.0,
+    t_sector: 520_000.0,
+    t_4k: 0.0,
+    t_32k: 0.0,
+    t_chip: 33_000_000.0,
+};
 
-/// A Winbond W25Q128 (EF 4018), another part the OS accepts.
-pub const W25Q128: Part = Part { id: [0xEF, 0x40, 0x18, 0x00, 0x00, 0x00], page: 256, sector: 0x1_0000, small_erases: true };
+/// A Winbond W25Q128 (EF 4018), another part the OS accepts (typicals: 0.7
+/// ms a page; 45 / 120 / 150 ms a 4 / 32 / 64 KB erase; 40 s the chip).
+pub const W25Q128: Part = Part {
+    id: [0xEF, 0x40, 0x18, 0x00, 0x00, 0x00],
+    page: 256,
+    sector: 0x1_0000,
+    small_erases: true,
+    t_page: 700.0,
+    t_sector: 150_000.0,
+    t_4k: 45_000.0,
+    t_32k: 120_000.0,
+    t_chip: 40_000_000.0,
+};
+
+/// An operation under way: the bytes it leaves, at their addresses, in the
+/// order the part works through them, and its clock span.
+struct Pending {
+    op: Op,
+    bytes: Vec<(usize, u8)>,
+    start: u64,
+    end: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -91,6 +146,9 @@ pub struct SpiFlash {
     /// Program and erase operations, in order (`DTEMU_SPI_TRACE=1` prints them
     /// as they happen, `=all` every selection).
     pub ops: Vec<Op>,
+    pending: Option<Pending>,
+    /// `DTEMU_SPI_INSTANT=1`: operations complete at once.
+    pub instant: bool,
     trace: bool,
     trace_all: bool,
 }
@@ -111,6 +169,8 @@ impl SpiFlash {
             programmed_bytes: 0,
             unknown: BTreeMap::new(),
             ops: Vec::new(),
+            pending: None,
+            instant: std::env::var_os("DTEMU_SPI_INSTANT").is_some(),
             trace: std::env::var_os("DTEMU_SPI_TRACE").is_some(),
             trace_all: std::env::var("DTEMU_SPI_TRACE").is_ok_and(|v| v == "all"),
         }
@@ -127,14 +187,47 @@ impl SpiFlash {
         self.rx.pop_front().unwrap_or(0xFF)
     }
 
-    pub fn push(&mut self, v: u32) {
+    /// A PUSHR word at clock `now` (instructions; `ips` of them a second).
+    pub fn push(&mut self, v: u32, now: u64, ips: f64) {
+        self.settle(now);
         let out = if v & 0x00FF_0000 == PCS_FLASH { self.byte(v as u8) } else { 0xFF };
         if self.rx.len() < 64 {
             self.rx.push_back(out as u32);
         }
         if v & 0x8000_0000 == 0 {
-            self.deselect();
+            self.deselect(now, ips);
         }
+    }
+
+    /// An operation is under way.
+    pub fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Finish an operation whose time is up by clock `now` (u64::MAX: any).
+    pub fn settle(&mut self, now: u64) {
+        if self.pending.as_ref().is_some_and(|p| now >= p.end) {
+            let p = self.pending.take().unwrap();
+            for &(a, b) in &p.bytes {
+                self.mem[a] = b;
+            }
+            self.wel = false;
+        }
+    }
+
+    /// The power goes at clock `now`: an operation under way stops with the
+    /// share of its bytes its elapsed time covers [inferred: how far a part
+    /// gets, and in which order, is not specified]. -> what was cut, if any.
+    pub fn cut(&mut self, now: u64) -> Option<String> {
+        self.settle(now);
+        let p = self.pending.take()?;
+        let f = (now.saturating_sub(p.start) as f64 / (p.end - p.start).max(1) as f64).clamp(0.0, 1.0);
+        let n = (p.bytes.len() as f64 * f) as usize;
+        for &(a, b) in &p.bytes[..n] {
+            self.mem[a] = b;
+        }
+        self.wel = false;
+        Some(format!("{:x?} cut {:.0}% through ({n} of {} bytes changed)", p.op, f * 100.0, p.bytes.len()))
     }
 
     /// One byte clocked while selected -> the byte the flash drives back.
@@ -144,6 +237,12 @@ impl SpiFlash {
         if i == 0 {
             self.cmd = b;
             self.addr = 0;
+            if self.pending.is_some() {
+                if b != 0x05 {
+                    self.cmd = 0xFF; // ignored while busy
+                }
+                return 0xFF;
+            }
             match b {
                 0x06 => self.wel = true,
                 0x04 => self.wel = false,
@@ -158,7 +257,7 @@ impl SpiFlash {
             return 0xFF;
         }
         match self.cmd {
-            0x05 => (self.wel as u8) << 1,
+            0x05 => (self.wel as u8) << 1 | self.pending.is_some() as u8,
             0x9F => self.part.id.get(i as usize - 1).copied().unwrap_or(0xFF),
             0x03 => self.read_next(),
             0x0B if i == 4 => 0xFF,
@@ -179,7 +278,7 @@ impl SpiFlash {
         self.mem[a]
     }
 
-    fn deselect(&mut self) {
+    fn deselect(&mut self, now: u64, ips: f64) {
         let (cmd, addr, n) = (self.cmd, self.addr as usize, self.idx);
         self.idx = 0;
         let prog = std::mem::take(&mut self.prog);
@@ -201,26 +300,40 @@ impl SpiFlash {
         if let (Some(len), true) = (erase, complete) {
             if self.wel {
                 let at = if len == self.mem.len() { 0 } else { (addr % self.mem.len()) & !(len - 1) };
-                self.mem[at..at + len].fill(0xFF);
-                self.done(Op::Erase { at: at as u32, len: len as u32 });
+                let bytes = (at..at + len).map(|a| (a, 0xFF)).collect();
+                self.start(Op::Erase { at: at as u32, len: len as u32 }, bytes, now, ips);
                 self.erased_bytes += len as u64;
+            } else {
+                self.wel = false;
             }
-            self.wel = false;
         } else if cmd == 0x02 && n >= 4 {
             if self.wel && !prog.is_empty() {
                 let a = addr % self.mem.len();
                 let size = self.part.page;
                 let page = a & !(size - 1);
+                let mut bytes: Vec<(usize, u8)> = Vec::with_capacity(prog.len());
                 for (k, d) in prog.iter().enumerate() {
-                    self.mem[page + (a - page + k) % size] &= d;
+                    let at = page + (a - page + k) % size;
+                    let old = bytes.iter().rev().find(|x| x.0 == at).map_or(self.mem[at], |x| x.1);
+                    bytes.push((at, old & d));
                 }
-                self.done(Op::Program { at: a as u32, len: prog.len() as u32 });
+                self.start(Op::Program { at: a as u32, len: prog.len() as u32 }, bytes, now, ips);
                 self.programmed_bytes += prog.len() as u64;
+            } else {
+                self.wel = false;
             }
-            self.wel = false;
         } else if cmd == 0x01 {
             self.wel = false;
         }
+    }
+
+    /// Begin `op` at clock `now`: it lands when the part's time is up.
+    fn start(&mut self, op: Op, bytes: Vec<(usize, u8)>, now: u64, ips: f64) {
+        let t = if self.instant { 0.0 } else { self.part.time(&op) };
+        let end = now + (t * 1e-6 * ips).ceil() as u64;
+        self.pending = Some(Pending { op, bytes, start: now, end });
+        self.settle(now);
+        self.done(op);
     }
 
     fn done(&mut self, op: Op) {
@@ -252,7 +365,7 @@ mod tests {
     fn tx(f: &mut SpiFlash, bytes: &[u8]) -> Vec<u8> {
         for (k, &b) in bytes.iter().enumerate() {
             let cont = if k + 1 < bytes.len() { 0x8000_0000 } else { 0x0800_0000 };
-            f.push(cont | PCS_FLASH | b as u32);
+            f.push(cont | PCS_FLASH | b as u32, 0, 1.0);
         }
         (0..bytes.len()).map(|_| f.pop() as u8).collect()
     }
@@ -261,6 +374,7 @@ mod tests {
     fn erase_program_read() {
         let mut f = SpiFlash::new(vec![0u8; 1 << 20]);
         f.part = W25Q128;
+        f.instant = true;
         // Without WREN nothing changes.
         tx(&mut f, &[0x20, 0x00, 0x10, 0x00]);
         assert_eq!(f.mem[0x1000], 0);
@@ -283,6 +397,7 @@ mod tests {
     #[test]
     fn default_part_256k_sectors_512_byte_pages() {
         let mut f = SpiFlash::new(vec![0u8; 1 << 20]);
+        f.instant = true;
         assert_eq!(&tx(&mut f, &[0x9F, 0, 0, 0, 0, 0])[1..], &[0x01, 0x20, 0x18, 0x4D, 0x00]);
         tx(&mut f, &[0x06]);
         tx(&mut f, &[0x20, 0x04, 0x00, 0x00]); // no 4 KB erase on this part
@@ -301,8 +416,37 @@ mod tests {
     }
 
     #[test]
+    fn timed_erase_reads_busy_then_lands() {
+        let mut f = SpiFlash::new(vec![0u8; 1 << 20]);
+        f.instant = false;
+        let ips = 1e6; // one instruction a microsecond
+        let at = |f: &mut SpiFlash, t: u64, bytes: &[u8]| -> Vec<u8> {
+            for (k, &b) in bytes.iter().enumerate() {
+                let cont = if k + 1 < bytes.len() { 0x8000_0000 } else { 0x0800_0000 };
+                f.push(cont | PCS_FLASH | b as u32, t, ips);
+            }
+            (0..bytes.len()).map(|_| f.pop() as u8).collect()
+        };
+        at(&mut f, 0, &[0x06]);
+        at(&mut f, 0, &[0xD8, 0x04, 0x00, 0x00]);
+        assert_eq!(at(&mut f, 10, &[0x05, 0])[1] & 1, 1);
+        assert_eq!(f.mem[0x4_0000], 0, "lands at the end");
+        at(&mut f, 20, &[0x06]); // ignored while busy
+        assert_eq!(at(&mut f, 520_000, &[0x05, 0])[1], 0);
+        assert_eq!(f.mem[0x4_0000], 0xFF);
+        // A cut halfway leaves half the sector erased.
+        at(&mut f, 600_000, &[0x06]);
+        f.mem[0x8_0000..0xC_0000].fill(0);
+        at(&mut f, 600_000, &[0xD8, 0x08, 0x00, 0x00]);
+        assert!(f.cut(860_000).is_some());
+        assert_eq!(f.mem[0x8_0000], 0xFF);
+        assert_eq!(f.mem[0xB_FFFF], 0);
+    }
+
+    #[test]
     fn program_only_clears_bits() {
         let mut f = SpiFlash::new(vec![0xF0u8; 0x1000]);
+        f.instant = true;
         tx(&mut f, &[0x06]);
         tx(&mut f, &[0x02, 0, 0, 0, 0x3C]);
         assert_eq!(f.mem[0], 0x30);
@@ -311,7 +455,7 @@ mod tests {
     #[test]
     fn mcr_clears_receive_queue() {
         let mut f = SpiFlash::new(vec![0u8; 0x1000]);
-        f.push(0x8000_0000 | PCS_FLASH | 0x05);
+        f.push(0x8000_0000 | PCS_FLASH | 0x05, 0, 1.0);
         f.mcr(0xC00);
         assert_eq!(f.pop(), 0xFF);
     }

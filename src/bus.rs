@@ -787,7 +787,7 @@ impl Bus {
         }
         if let Some(f) = self.spi.as_mut() {
             if a == crate::spiflash::DSPI0_PUSHR && size == 4 {
-                return f.push(v);
+                return f.push(v, self.io.now, self.io.ips);
             }
             // MCR stays plain memory too.
             if a == crate::spiflash::DSPI0_MCR && size == 4 {
