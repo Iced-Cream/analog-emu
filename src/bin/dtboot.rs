@@ -79,8 +79,11 @@ counts (suffixes k, M, G).
                        (a sleeping laptop: no SOF, no transfers); no TO: to the end
   --usb-host-noread FROM[:TO]  the host keeps the bus running but stops reading
                        MIDI IN (an application with the port closed)
+  --usb-host-gone FROM:TO  the host browns out and restarts: VBUS off, no bus
+                       from FROM, then at TO a fresh host (bus reset, a new
+                       enumeration); repeatable
   --ob-link [ADDR]     serve the Overbridge input to a host over TCP (oblink.rs;
-                       default 127.0.0.1:7301)
+                       default 127.0.0.1:7301; 0.0.0.0:PORT serves the LAN)
   --ext-in FILE.wav    play a 16-bit WAV into EXT IN L/R from the start (Rytm)
   --watch-read ADDR LEN  log CPU reads and writes of LEN bytes at ADDR (hex)
   --count ADDR         count visits to a PC (hex)
@@ -116,6 +119,10 @@ Environment:
   DTEMU_STRICT=1       unmapped pages and the SRAM mirror beyond 64 KB raise an
                        access error (interpreter only); listed as `strict:` lines
                        (DTEMU_STRICT=log: listed only, no fault)
+  DTEMU_PROFILE_DUMP=FILE  with --profile-after: every sampled block start and its
+                       sample count (one sample per 64 instructions) to FILE
+  DTEMU_CACHE=1        model the I- and D-caches (interpreter only; docs/CACHE.md);
+                       =log also prints each stale instruction fetch
 ";
 
 /// The flash holds no OS the emulator can boot: after an interrupted upgrade,
@@ -147,6 +154,7 @@ fn main() {
     let mut usb_midi_real = false;
     let mut usb_sleep: Option<(u64, u64)> = None;
     let mut usb_noread: Option<(u64, u64)> = None;
+    let mut usb_gone: Vec<(u64, u64)> = Vec::new();
     let mut nudges: Vec<(u64, u8, i8, bool, bool)> = Vec::new();
     let mut usb_wav: Option<String> = None;
     let mut ext_in: Option<String> = None;
@@ -291,6 +299,11 @@ fn main() {
             "--test-mode" => test_mode = true,
             "--power-off" => power_off = Some(num(it.next().unwrap())),
             "--usb-midi-real" => usb_midi_real = true,
+            "--usb-host-gone" => {
+                let v = it.next().unwrap();
+                let (x, y) = v.split_once(':').expect("--usb-host-gone FROM:TO");
+                usb_gone.push((num(x), num(y)));
+            }
             "--usb-host-sleep" | "--usb-host-noread" => {
                 let v = it.next().unwrap();
                 let (x, y) = v.split_once(':').map_or((v.as_str(), None), |(x, y)| (x, Some(y)));
@@ -371,6 +384,12 @@ fn main() {
     for c in &counts {
         m.add_counter(*c);
     }
+    // DTEMU_HEAP=STATE:PC,PC..  the buddy allocator's low-water mark (Machine::add_heap_probe)
+    if let Ok(v) = std::env::var("DTEMU_HEAP") {
+        let (st, pcs) = v.split_once(':').expect("DTEMU_HEAP=STATE:PC,PC");
+        let hex = |x: &str| u32::from_str_radix(x.trim_start_matches("0x"), 16).unwrap();
+        m.add_heap_probe(hex(st), pcs.split(',').map(hex).collect());
+    }
     if break_after > 0 {
         m.run_until(break_after);
     }
@@ -441,6 +460,7 @@ fn main() {
         let mut h = dtemu::usbhost::UsbHost::new();
         h.suspend = usb_sleep;
         h.midi_sleep = usb_noread;
+        h.gone = usb_gone.clone();
         h.cdc = !serials.is_empty();
         m.usb_host = Some(h);
     }
@@ -470,9 +490,8 @@ fn main() {
     let mut logged = 0;
     let mut target = m.now();
     while target < instr {
-        // Events in [from, target): run_until can overshoot a chunk's end, so an
-        // event on the boundary would otherwise fall between two chunks.
-        let from = target;
+        // This chunk's events: [start, target) by their own clocks, whatever clock the CPU overshot to.
+        let start = target;
         target = (target + every).min(instr);
         if let Some(pa) = profile_after {
             if m.now() >= pa && m.cpu.profile.is_none() {
@@ -513,13 +532,17 @@ fn main() {
         let mut early: Option<Stop> = None;
         let mut powered_off = false;
         for (at, kind, code, d) in events {
-            if at < from || at >= target {
+            if at < start || at >= target {
                 continue;
             }
-            let s = m.run_until(at);
-            if matches!(s, Stop::Hook(_) | Stop::Fault(..) | Stop::Reset) {
-                early = Some(s);
-                break;
+            // An event the run already passed (the CPU stops at block boundaries, so the previous event may have
+            // overshot its clock by a few instructions) happens now, not never: two events at one clock both happen.
+            if at > m.now() {
+                let s = m.run_until(at);
+                if matches!(s, Stop::Hook(_) | Stop::Fault(..) | Stop::Reset) {
+                    early = Some(s);
+                    break;
+                }
             }
             if kind == 7 {
                 let r = m.power_off(2_000_000_000);
@@ -796,6 +819,13 @@ fn main() {
     );
     let exc: Vec<String> = m.cpu.exc_counts.iter().enumerate().filter(|x| *x.1 > 0 && x.0 < 64).map(|(v, n)| format!("{v}:{n}")).collect();
     println!("cpu exceptions: {}", exc.join(" "));
+    if let Some(h) = &m.heap_probe {
+        let end = m.heap_free(h.state);
+        println!(
+            "heap: lowest free {} B at clock {} ({} live allocations), most live {}, {} samples; at the end {:?} (free B, live)",
+            h.min_free, h.min_at, h.min_live, h.max_live, h.samples, end
+        );
+    }
     for (v, pc, op, t) in &m.cpu.fault_log {
         println!("  fault vector {v} at 0x{pc:08x} opcode {op:04x} (clock {t})");
     }
@@ -819,6 +849,9 @@ fn main() {
         println!("usb host: streaming={} {:?}", h.streaming(), h.stats);
         println!("usb host: device descriptor {:02x?}", h.device_desc);
         println!("usb host: configuration ({} bytes) {:02x?}", h.config_desc.len(), h.config_desc);
+    }
+    if let Some(s) = m.ob_link_report() {
+        println!("{s}");
     }
     let uo = &m.cpu.bus.io.usb_midi_out;
     if !uo.is_empty() {
@@ -856,11 +889,21 @@ fn main() {
     for ((pc, page, w), (a, n)) in &m.cpu.bus.strict_log {
         println!("strict: pc {pc:08x} {} page {page:08x} first {a:08x} x{n}", if *w { "write" } else { "read " });
     }
+    if let Some(c) = &m.cpu.bus.cache {
+        print!("{}", c.report());
+    }
     print!("{}", m.task_report());
     let vt: Vec<String> = [97u32, 99, 154, 155, 180, 191, 192, 205, 207, 208, 223].iter().map(|v| format!("v{v}={:08x}", m.cpu.bus.peek32(m.cpu.vbr + v * 4))).collect();
     println!("vectors: {}", vt.join(" "));
     if let Some(p) = &m.cpu.profile {
         let total: u64 = p.values().sum();
+        // DTEMU_PROFILE_DUMP=FILE: every sampled block start and its count (one sample per 64 instructions)
+        if let Some(f) = std::env::var_os("DTEMU_PROFILE_DUMP") {
+            let mut v: Vec<(u32, u64)> = p.iter().map(|(a, n)| (*a, *n)).collect();
+            v.sort();
+            let txt: String = v.iter().map(|(a, n)| format!("{a:08x} {n}\n")).collect();
+            std::fs::write(f, txt).expect("DTEMU_PROFILE_DUMP");
+        }
         let mut by_fn: std::collections::HashMap<u32, u64> = Default::default();
         for (pc, n) in p {
             *by_fn.entry(pc & !0xFF).or_insert(0) += n;

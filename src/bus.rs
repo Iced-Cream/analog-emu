@@ -42,6 +42,17 @@ const STRICT_ALLOWED: &[(u32, u32)] = &[
     (0xFC0C_8000, 0xFC0C_9000), // SSI1's page, 0x4000561c (setup)
 ];
 
+/// Strict mode: the stock instructions that read or write page 0 (address
+/// 0..0xFFF), allowed from these PCs only, so that a NULL access anywhere else
+/// still faults. Measured in stock runs: 0x4012119a (`clr.w (a0)`, a0 = 0,
+/// half a million times a run), 0x4012185c (`move.b 0x0,d1`), 0x400afe1e
+/// (`tst.b 0x8`). The others are the stock image's remaining absolute
+/// references below 0x1000 in code (objdump of stock 1.73, inferred).
+const STRICT_PAGE0_PCS: &[u32] = &[
+    0x4012_119A, 0x4012_185C, 0x400A_FE1E, 0x4009_8AD2, 0x4009_8AEE, 0x400A_FFD6, 0x4010_53F0, 0x4010_56F0,
+    0x4010_5D2E, 0x4010_B07A, 0x4010_CCBC, 0x4012_19D8, 0x4013_B882, 0x4015_4322, 0x4015_43A8,
+];
+
 pub struct Bus {
     pub ddr: Vec<u8>,
     ddr_mask: u32,
@@ -65,13 +76,13 @@ pub struct Bus {
     pub strict_pending: Option<(u32, u32)>,
     /// Every strict violation, (pc, page, write) -> (first address, count).
     pub strict_log: BTreeMap<(u32, u32, bool), (u32, u64)>,
-    /// Strict mode: the PCs allowed to touch page 0, per build (the profile's
-    /// `strict_page0_pcs`; stock 1.73's until `Machine::new` sets it).
-    pub strict_page0_pcs: &'static [u32],
     pub io: Io,
     /// The Rytm's analog voices, modelled from the control frame (`analog.rs`).
     /// None on the Digitakt. Not part of a snapshot: envelopes restart silent.
     pub analog: Option<crate::analog::Analog>,
+    /// The control frame as the voice boards got it last (machine.rs, the profile's `voice_frame_sent`): the analog
+    /// model reads it instead of the live frame when set.
+    pub analog_sent: Option<Vec<u8>>,
     /// The Analog Four MKII's voices, modelled from its voice frame (a4voice.rs).
     pub a4: Option<crate::a4voice::A4Voices>,
     /// The Syntakt's analog voices and analog FX block (stanalog.rs).
@@ -118,6 +129,8 @@ pub struct Bus {
     pub icache_on: bool,
     pub icache_decodes: u64,
     pub icache_invalidations: u64,
+    /// The cache model (`DTEMU_CACHE`, cache.rs): None normally.
+    pub cache: Option<Box<crate::cache::Caches>>,
 }
 
 /// A predecoded block, and its compiled code once it ran hot.
@@ -149,9 +162,9 @@ impl Bus {
             sram_span: 0x0C00_0000,
             strict_pending: None,
             strict_log: BTreeMap::new(),
-            strict_page0_pcs: crate::symbols::AR_173_PAGE0_PCS,
             io: Io::new(),
             analog: None,
+            analog_sent: None,
             a4: None,
             st: None,
             nor: None,
@@ -176,6 +189,7 @@ impl Bus {
             icache_on: false,
             icache_decodes: 0,
             icache_invalidations: 0,
+            cache: None,
         }
     }
 
@@ -254,7 +268,7 @@ impl Bus {
     pub fn ddr_plain(&self, a: u32, len: u32) -> Option<usize> {
         let o = self.ddr_off(a)?;
         let end = a.wrapping_add(len - 1);
-        if self.ddr_off(end)? != o + len as usize - 1 || self.watch.is_some() {
+        if self.ddr_off(end)? != o + len as usize - 1 || self.watch.is_some() || self.cache.is_some() {
             return None;
         }
         // Wholly below or above the cached code, or a store could hit it.
@@ -362,7 +376,7 @@ impl Bus {
         let base = addr & !(SPARSE_PAGE - 1);
         if self.strict
             && !STRICT_ALLOWED.iter().any(|&(lo, hi)| (lo..hi).contains(&base))
-            && !(base == 0 && self.strict_page0_pcs.contains(&self.pc))
+            && !(base == 0 && STRICT_PAGE0_PCS.contains(&self.pc))
             && !(self.nor.is_some() && base.wrapping_sub(crate::nor::PRAM_BASE) < crate::nor::PRAM_SIZE)
         {
             self.strict_hit(addr, write);
@@ -385,6 +399,9 @@ impl Bus {
     /// Plain-memory byte read, bypassing peripherals.
     pub fn peek8(&self, addr: u32) -> u8 {
         if let Some(o) = self.ddr_off(addr) {
+            if let Some(b) = self.cache.as_ref().and_then(|c| c.peek(addr)) {
+                return b;
+            }
             return self.ddr[o];
         }
         if let Some(d) = self.io.dsp.as_ref() {
@@ -413,6 +430,9 @@ impl Bus {
     /// Plain-memory byte write, bypassing peripherals.
     pub fn poke8(&mut self, addr: u32, v: u8) {
         if let Some(o) = self.ddr_off(addr) {
+            if let Some(c) = self.cache.as_mut() {
+                c.poke(addr, v);
+            }
             self.check_code(o as u32, 1);
             self.ddr[o] = v;
             return;
@@ -441,7 +461,7 @@ impl Bus {
     }
 
     pub fn peek32(&self, a: u32) -> u32 {
-        if let Some(o) = self.ddr_off(a) {
+        if let (Some(o), None) = (self.ddr_off(a), &self.cache) {
             if o + 4 <= self.ddr.len() {
                 return u32::from_be_bytes(self.ddr[o..o + 4].try_into().unwrap());
             }
@@ -464,6 +484,11 @@ impl Bus {
     }
 
     pub fn poke_bytes(&mut self, a: u32, data: &[u8]) {
+        if let Some(c) = self.cache.as_mut() {
+            for (i, b) in data.iter().enumerate() {
+                c.poke(a.wrapping_add(i as u32), *b);
+            }
+        }
         if let Some(o) = self.ddr_off(a) {
             if o + data.len() <= self.ddr.len() {
                 if self.icache_on {
@@ -480,10 +505,147 @@ impl Bus {
         }
     }
 
-    // -- CPU accesses --------------------------------------------------------
+    // -- CPU accesses, through the cache model when it is on ------------------
 
     #[inline(always)]
     pub fn read8(&mut self, a: u32) -> u8 {
+        if self.cache.is_some() {
+            return self.cached_read(a, 1) as u8;
+        }
+        self.read8_mem(a)
+    }
+
+    #[inline(always)]
+    pub fn read16(&mut self, a: u32) -> u16 {
+        if self.cache.is_some() {
+            return self.cached_read(a, 2) as u16;
+        }
+        self.read16_mem(a)
+    }
+
+    #[inline(always)]
+    pub fn read32(&mut self, a: u32) -> u32 {
+        if self.cache.is_some() {
+            return self.cached_read(a, 4);
+        }
+        self.read32_mem(a)
+    }
+
+    #[inline(always)]
+    pub fn write8(&mut self, a: u32, v: u8) {
+        if self.cache.is_some() {
+            return self.cached_write(a, 1, v as u32);
+        }
+        self.write8_mem(a, v)
+    }
+
+    #[inline(always)]
+    pub fn write16(&mut self, a: u32, v: u16) {
+        if self.cache.is_some() {
+            return self.cached_write(a, 2, v as u32);
+        }
+        self.write16_mem(a, v)
+    }
+
+    #[inline(always)]
+    pub fn write32(&mut self, a: u32, v: u32) {
+        if self.cache.is_some() {
+            return self.cached_write(a, 4, v);
+        }
+        self.write32_mem(a, v)
+    }
+
+    /// An instruction fetch: through the I-cache in cache mode (filled from
+    /// memory, never the D-cache), else a plain read.
+    #[inline(always)]
+    pub fn ifetch16(&mut self, a: u32) -> u16 {
+        if self.cache.is_some() {
+            return self.cached_ifetch(a, 2) as u16;
+        }
+        self.read16(a)
+    }
+
+    #[inline(always)]
+    pub fn ifetch32(&mut self, a: u32) -> u32 {
+        if self.cache.is_some() {
+            return self.cached_ifetch(a, 4);
+        }
+        self.read32(a)
+    }
+
+    fn mem_read(&mut self, a: u32, n: u32) -> u32 {
+        match n {
+            1 => self.read8_mem(a) as u32,
+            2 => self.read16_mem(a) as u32,
+            _ => self.read32_mem(a),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cached_read(&mut self, a: u32, n: u32) -> u32 {
+        // eDMA (in_dma) reads memory, past the caches.
+        if !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
+            let c = self.cache.as_mut().unwrap();
+            if let Some(v) = c.read(&mut self.ddr, self.ddr_mask, a, n) {
+                if self.watch_reads {
+                    self.check_watch(a, n, v);
+                }
+                return v;
+            }
+        }
+        self.mem_read(a, n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cached_write(&mut self, a: u32, n: u32, v: u32) {
+        if !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
+            let c = self.cache.as_mut().unwrap();
+            if c.write(&mut self.ddr, self.ddr_mask, a, n, v) {
+                self.check_watch(a, n, v);
+                return;
+            }
+        }
+        match n {
+            1 => self.write8_mem(a, v as u8),
+            2 => self.write16_mem(a, v as u16),
+            _ => self.write32_mem(a, v),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cached_ifetch(&mut self, a: u32, n: u32) -> u32 {
+        if self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
+            let pc = self.pc;
+            let c = self.cache.as_mut().unwrap();
+            if let Some(v) = c.ifetch(&self.ddr, self.ddr_mask, a, n, pc) {
+                return v;
+            }
+        }
+        // Not instruction-cacheable: memory itself, past the D-cache too.
+        self.mem_read(a, n)
+    }
+
+    /// CPUSHL (`which`: 1 dc, 2 ic, 3 bc) with An = `an`; INTOUCH is `which` 0.
+    pub fn cache_op(&mut self, which: u8, an: u32) {
+        let in_ddr = self.ddr_off(an).is_some();
+        if let Some(c) = self.cache.as_mut() {
+            if which == 0 {
+                if in_ddr {
+                    c.intouch(&self.ddr, self.ddr_mask, an);
+                }
+            } else {
+                c.cpushl(&mut self.ddr, self.ddr_mask, which, an);
+            }
+        }
+    }
+
+    // -- memory, past the caches ---------------------------------------------
+
+    #[inline(always)]
+    fn read8_mem(&mut self, a: u32) -> u8 {
         if let Some(o) = self.ddr_off(a) {
             if self.watch_reads {
                 self.check_watch(a, 1, self.ddr[o] as u32);
@@ -497,7 +659,7 @@ impl Bus {
     }
 
     #[inline(always)]
-    pub fn read16(&mut self, a: u32) -> u16 {
+    fn read16_mem(&mut self, a: u32) -> u16 {
         if let Some(o) = self.ddr_off(a) {
             if o + 2 <= self.ddr.len() {
                 let v = u16::from_be_bytes([self.ddr[o], self.ddr[o + 1]]);
@@ -516,7 +678,7 @@ impl Bus {
     }
 
     #[inline(always)]
-    pub fn read32(&mut self, a: u32) -> u32 {
+    fn read32_mem(&mut self, a: u32) -> u32 {
         if let Some(o) = self.ddr_off(a) {
             if o + 4 <= self.ddr.len() {
                 let v = u32::from_be_bytes(self.ddr[o..o + 4].try_into().unwrap());
@@ -535,7 +697,7 @@ impl Bus {
     }
 
     #[inline(always)]
-    pub fn write8(&mut self, a: u32, v: u8) {
+    fn write8_mem(&mut self, a: u32, v: u8) {
         if let Some(o) = self.ddr_off(a) {
             self.check_watch(a, 1, v as u32);
             self.check_code(o as u32, 1);
@@ -551,7 +713,7 @@ impl Bus {
     }
 
     #[inline(always)]
-    pub fn write16(&mut self, a: u32, v: u16) {
+    fn write16_mem(&mut self, a: u32, v: u16) {
         if let Some(o) = self.ddr_off(a) {
             if o + 2 <= self.ddr.len() {
                 self.check_watch(a, 2, v as u32);
@@ -571,7 +733,7 @@ impl Bus {
     }
 
     #[inline(always)]
-    pub fn write32(&mut self, a: u32, v: u32) {
+    fn write32_mem(&mut self, a: u32, v: u32) {
         if let Some(o) = self.ddr_off(a) {
             if o + 4 <= self.ddr.len() {
                 self.check_watch(a, 4, v);
@@ -693,7 +855,11 @@ impl Bus {
                     audio: self.io.ssi.audio_in.pop_front().unwrap_or((0.0, 0.0)),
                     ext: self.io.ssi.ext_in.pop_front().unwrap_or((0.0, 0.0)),
                 };
-                let out = an.frame(&self.sram[o..o + crate::analog::FRAME_LEN], &dac, &self.sram[fx..fx + 24], inputs);
+                let f = match &self.analog_sent {
+                    Some(v) => &v[..],
+                    None => &self.sram[o..o + crate::analog::FRAME_LEN],
+                };
+                let out = an.frame(f, &dac, &self.sram[fx..fx + 24], inputs);
                 if self.io.ssi0.on {
                     // The Rytm MKI's 10-word receive frame: words 0..5 on
                     // SSI0, 6..9 on SSI1 [inferred: the MKII's order].
@@ -849,14 +1015,6 @@ mod tests {
         b.write16(0, 0);
         assert_eq!(b.strict_pending, None);
         assert_eq!(b.strict_log.len(), 2);
-        // 1.74's list: the same store, moved; 1.73's PC is no longer allowed.
-        b.strict_page0_pcs = crate::symbols::AR_174_PAGE0_PCS;
-        b.pc = 0x4012_1206;
-        b.write16(0, 0);
-        assert_eq!(b.strict_pending, None);
-        b.pc = 0x4012_119A;
-        b.write16(0, 0);
-        assert_eq!(b.strict_pending, Some((0x4012_119A, 0)));
         // Off: the mirror and unmapped pages are plain memory again.
         let mut b = Bus::new(16);
         b.write32(0x8001_0000, 7);

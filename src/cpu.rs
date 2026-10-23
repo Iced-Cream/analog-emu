@@ -319,14 +319,14 @@ impl Cpu {
 
     #[inline(always)]
     pub(crate) fn fetch16(&mut self) -> u16 {
-        let v = self.bus.read16(self.pc);
+        let v = self.bus.ifetch16(self.pc);
         self.pc = self.pc.wrapping_add(2);
         v
     }
 
     #[inline(always)]
     pub(crate) fn fetch32(&mut self) -> u32 {
-        let v = self.bus.read32(self.pc);
+        let v = self.bus.ifetch32(self.pc);
         self.pc = self.pc.wrapping_add(4);
         v
     }
@@ -763,6 +763,10 @@ impl Cpu {
         self.op_pc = pc;
         self.bus.pc = pc;
         self.bus.io.now += 1;
+        if self.bus.cache.is_some() {
+            // The cache model fetches through the I-cache: no predecoding.
+            return self.execute();
+        }
         let op = crate::fast::decode(self, pc);
         self.pc = pc.wrapping_add(op.len as u32);
         (op.h)(self, &op);
@@ -1045,7 +1049,7 @@ impl Cpu {
             0x4AFC => return self.illegal(VEC_ILLEGAL),
             0x40E7 => {
                 // STRLDSR #imm: 0x40E7 0x46FC imm
-                if self.bus.read16(self.pc) == 0x46FC {
+                if self.bus.ifetch16(self.pc) == 0x46FC {
                     self.pc = self.pc.wrapping_add(2);
                     let imm = self.fetch16();
                     if !self.supervisor() {
@@ -1357,12 +1361,30 @@ impl Cpu {
                 let old_eusp = self.cacr & 0x20 != 0;
                 self.cacr = v;
                 let _ = old_eusp;
+                if let Some(c) = self.bus.cache.as_mut() {
+                    c.set_cacr(v);
+                }
+            }
+            0x004..=0x007 => {
+                self.ctl.insert(rc, v);
+                if let Some(c) = self.bus.cache.as_mut() {
+                    c.set_acr((rc - 4) as usize, v);
+                }
             }
             0x800 => self.other_sp = v,
             0x801 => self.vbr = v & 0xFFF0_0000,
             _ => {
                 self.ctl.insert(rc, v);
             }
+        }
+    }
+
+    /// Hand CACR and ACR0-3 to the cache model (after a snapshot load).
+    pub fn cache_sync(&mut self) {
+        let acr = [4u16, 5, 6, 7].map(|r| self.ctl.get(&r).copied().unwrap_or(0));
+        let cacr = self.cacr;
+        if let Some(c) = self.bus.cache.as_mut() {
+            c.configure(cacr, acr);
         }
     }
 
@@ -1701,9 +1723,14 @@ impl Cpu {
     pub(crate) fn linef(&mut self, op: u16) {
         match op & 0xFF00 {
             0xF400 => {
-                // CPUSHL / INTOUCH: no cache is modelled.
+                // CPUSHL dc/ic/bc (An) and INTOUCH (An): the cache model's
+                // (cache.rs), a no-op without it.
                 if !self.supervisor() {
-                    self.illegal(VEC_PRIV);
+                    return self.illegal(VEC_PRIV);
+                }
+                if self.bus.cache.is_some() && op & 0x38 == 0x28 {
+                    let an = self.a[(op & 7) as usize];
+                    self.bus.cache_op(((op >> 6) & 3) as u8, an);
                 }
             }
             0xFB00 => {

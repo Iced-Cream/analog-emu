@@ -124,6 +124,12 @@ pub struct UsbHost {
     /// USBSTS.SLI set on entry, a port change on resume.
     pub suspend: Option<(u64, u64)>,
     suspended: bool,
+    /// Clocks [from, to) during which the host is gone (a USB host that
+    /// browns out and restarts: VBUS off, no SOF, no transfers, whatever the
+    /// Rytm had queued left where it is); at `to` it comes back as a fresh
+    /// host: VBUS, bus reset and a new enumeration. Several windows allowed.
+    pub gone: Vec<(u64, u64)>,
+    is_gone: bool,
     /// MIDI bytes read from 0x81, for the caller to take.
     pub midi_out: Vec<u8>,
     /// The controller's general-purpose timers 0 and 1 (GPTIMERnLD at 0x80 /
@@ -159,6 +165,11 @@ pub struct UsbStats {
     /// MIDI IN (0x81) dTDs completed, and microframes the host did not read it.
     pub midi_dtds: u64,
     pub midi_asleep: u64,
+    /// OUT frames sent as silence because the Overbridge link had none queued (oblink.rs).
+    pub out_underruns: u64,
+    /// Host restarts (`gone` windows left) and enumerations completed.
+    pub restarts: u64,
+    pub enumerations: u64,
 }
 
 impl Default for UsbHost {
@@ -186,6 +197,8 @@ impl UsbHost {
             midi_sleep: None,
             suspend: None,
             suspended: false,
+            gone: Vec::new(),
+            is_gone: false,
             midi_out: Vec::new(),
             gpt: [None, None],
             cdc: false,
@@ -217,6 +230,34 @@ impl UsbHost {
             self.gptimers(bus);
         }
         let t = bus.io.now;
+        let gone = self.gone.iter().any(|&(a, b)| (a..b).contains(&t));
+        if gone != self.is_gone {
+            self.is_gone = gone;
+            if gone {
+                // VBUS off (B session ends) and the port detached: the device sees the session change.
+                let otg = (bus.peek32(OTGSC) & !(OTG_BSV | OTG_AVV | OTG_ASV)) | OTG_BSE | OTG_BSVIS;
+                bus.poke32(OTGSC, otg);
+                let p = bus.peek32(PORTSC1) & !(1 | (1 << 2) | (1 << 7));
+                bus.poke32(PORTSC1, p);
+                raise(bus, STS_PCI);
+                self.say("host gone (VBUS off)");
+            } else {
+                // A fresh host: the Idle phase raises VBUS, then the bus reset and a new enumeration.
+                self.phase = Phase::Idle;
+                self.queue.clear();
+                self.ctl = None;
+                self.credit = 0;
+                self.in_budget = 0;
+                self.device_desc.clear();
+                self.config_desc.clear();
+                self.stats.restarts += 1;
+                self.say("host back");
+            }
+        }
+        if gone {
+            self.stats.midi_asleep += 1;
+            return;
+        }
         let asleep = self.suspend.is_some_and(|(a, b)| (a..b).contains(&t));
         if asleep != self.suspended {
             self.suspended = asleep;
@@ -410,6 +451,7 @@ impl UsbHost {
             let Some(setup) = self.queue.pop_front() else {
                 if self.phase == Phase::Enumerate {
                     self.phase = Phase::Stream;
+                    self.stats.enumerations += 1;
                     self.say("configured: streaming");
                 }
                 return;
@@ -675,7 +717,13 @@ impl UsbHost {
             blk[2..4].copy_from_slice(&self.out_counter.to_be_bytes());
             self.out_counter = self.out_counter.wrapping_add(OB_FRAMES_PER_BLOCK as u16);
             for f in 0..OB_FRAMES_PER_BLOCK {
-                let fr = to_rytm.pop_front().unwrap_or([0; OB_CHANNELS]);
+                let fr = match to_rytm.pop_front() {
+                    Some(f) => f,
+                    None => {
+                        self.stats.out_underruns += 1;
+                        [0; OB_CHANNELS]
+                    }
+                };
                 for (c, x) in fr.iter().enumerate() {
                     let o = 32 + 4 * (f * OB_CHANNELS + c);
                     blk[o..o + 4].copy_from_slice(&x.to_be_bytes());

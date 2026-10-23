@@ -251,6 +251,11 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     c.bus.io.esdhc.card.path = card_path;
     c.bus.io.deadline = c.bus.io.now;
     s.cpu.restore(c);
+    // Snapshots carry memory only: the caches start empty (cache.rs).
+    if let Some(k) = c.bus.cache.as_mut() {
+        k.reset();
+    }
+    c.cache_sync();
     m.stats = s.stats;
     m.dsp = None;
     if let Some(d) = dsp {
