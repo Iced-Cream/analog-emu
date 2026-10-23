@@ -573,7 +573,7 @@ pub fn main() {
     let o = parse();
     let flash_image = o.flash.as_ref().filter(|_| !o.syx_given).and_then(|p| std::fs::read(p).ok());
     let fw = match flash_image.as_ref().filter(|img| img.len() > dtemu::machine::FLASH_SLOT) {
-        Some(img) => Firmware::from_container(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| {
+        Some(img) => Firmware::from_flash(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| {
             eprintln!("{}: no OS in the flash: {e}", o.flash.as_ref().unwrap().display());
             std::process::exit(1)
         }),

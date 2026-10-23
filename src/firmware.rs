@@ -246,6 +246,40 @@ impl Firmware {
         Self::from_syx_bytes(&d)
     }
 
+    /// The OS container in a flash image, at its slot: parsed and `verify`d.
+    pub fn from_flash(c: &[u8]) -> Result<Firmware> {
+        let fw = Self::from_container(c)?;
+        fw.verify()?;
+        Ok(fw)
+    }
+
+    /// Every section whose header carries a byte sum (packed sections) still
+    /// matches it: what booting from the flash requires, since a unit's
+    /// bootstrap checks the container before it starts the OS ("CRC CHECK",
+    /// [inferred]: the check itself is not modelled, only its outcome).
+    /// A half-written container fails here even when MAIN OS is whole.
+    pub fn verify(&self) -> Result<()> {
+        for s in &self.sections {
+            let (o, n) = (s.entry.offset as usize, s.entry.comp_len as usize);
+            let stream = &self.container[o..o + n];
+            if !stream.is_empty() && stream.iter().all(|&b| b == 0xFF) {
+                return Err(Error::Container(format!("section {} is erased", s.entry.id)));
+            }
+            // A packed section's header: its length fills the section, give or
+            // take the padding to a word (A4 1.56's panel section: 1 byte).
+            let fills = |ln: usize| ln + 8 <= stream.len() && stream.len() - (ln + 8) <= 3;
+            if stream.len() < 8 || !fills(be32(stream, 0) as usize) {
+                continue; // raw, nothing to check
+            }
+            let ln = be32(stream, 0) as usize;
+            let ok = stream[8..8 + ln].iter().fold(0u32, |a, &b| a.wrapping_add(b as u32)) == be32(stream, 4);
+            if !ok {
+                return Err(Error::Container(format!("section {} fails its byte sum", s.entry.id)));
+            }
+        }
+        Ok(())
+    }
+
     pub fn section(&self, id: u32) -> Option<&Section> {
         self.sections.iter().find(|s| s.entry.id == id)
     }

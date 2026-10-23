@@ -343,7 +343,7 @@ fn main() {
     let flash_image = flash.as_ref().and_then(|p| std::fs::read(p).ok());
     let fw = match (&syx, &flash_image) {
         (None, Some(img)) if img.len() > dtemu::machine::FLASH_SLOT => {
-            let fw = Firmware::from_container(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| no_os_in_flash(&e.to_string()));
+            let fw = Firmware::from_flash(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| no_os_in_flash(&e.to_string()));
             println!("booting the OS in the flash: build {} version {}", fw.build, fw.version);
             fw
         }

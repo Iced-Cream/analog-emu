@@ -908,6 +908,12 @@ reaches the reset at the same clock as an uninterrupted run (19.6035G) and
 writes the same container. With `--flash FILE` the snapshot's flash runs and
 is written back to FILE; dtboot notes when the two differed.
 
+Booting from the flash (`--reboot`, `--flash` with no `.syx`, the window)
+checks every packed section's byte sum first (`Firmware::from_flash`): a
+container cut short anywhere, not only in MAIN OS, does not boot, as a unit's
+bootstrap checks it before starting the OS ("CRC CHECK" among its strings)
+[inferred]. The A4 MKII has its own flash part (docs/A4-PORT.md section 14).
+
 Not modelled: the bootstrap that a unit runs first (the emulator loads MAIN OS
 from the container as it does from a `.syx`, so only builds `symbols.rs` knows
 boot, and the recovery after an interrupted upgrade cannot be followed).

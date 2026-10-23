@@ -30,9 +30,11 @@
 //! meanwhile, other commands are ignored, and the change lands in the image
 //! when the time is up (`settle`). A power cut (`cut`) leaves what `CutMode`
 //! says of an operation under way (`DTEMU_SPI_CUT`: share, none or done;
-//! how far a part gets is not specified anywhere, so this is a setting). `DTEMU_SPI_INSTANT=1` completes them at once. The part is `Part`: by default a contributor's Rytm MKII's,
-//! read with the factory-test console's #STATUS (FLASH `01 2018 00`,
-//! 2026-10-22) [measured]. Any other command is counted in `unknown` and
+//! how far a part gets is not specified anywhere, so this is a setting). `DTEMU_SPI_INSTANT=1` completes them at once.
+//! The part is `Part`, per unit (`machine::flash_part`): the ones a
+//! contributor's units report on the factory-test console's #STATUS, the
+//! Rytm MKII's S25FL128S (FLASH `01 2018 00`) and the A4 MKII's W25Q64
+//! (`EF 4017 00`) [measured]. Any other command is counted in `unknown` and
 //! answers 0xFF. Nothing here reaches real hardware: the image is a byte vector
 //! (written back to a file only by the tools' `--flash` option).
 
@@ -59,6 +61,8 @@ pub struct Part {
     pub sector: usize,
     /// 20 (4 KB) and 52 (32 KB) erases exist.
     pub small_erases: bool,
+    /// Bytes; addresses wrap at the end, as on the part.
+    pub size: usize,
     /// Typical times in microseconds: a page program, a D8 sector erase, a
     /// 4 KB and a 32 KB erase (when the part has them), the chip erase.
     pub t_page: f64,
@@ -91,6 +95,7 @@ pub const S25FL128S_256K: Part = Part {
     page: 512,
     sector: 0x4_0000,
     small_erases: false,
+    size: 16 << 20,
     t_page: 340.0,
     t_sector: 520_000.0,
     t_4k: 0.0,
@@ -105,11 +110,30 @@ pub const W25Q128: Part = Part {
     page: 256,
     sector: 0x1_0000,
     small_erases: true,
+    size: 16 << 20,
     t_page: 700.0,
     t_sector: 150_000.0,
     t_4k: 45_000.0,
     t_32k: 120_000.0,
     t_chip: 40_000_000.0,
+};
+
+/// Winbond W25Q64 (EF 4017, 8 MB): what a contributor's A4 MKII reports on
+/// the factory console's #STATUS (FLASH `EF 4017 00`, 2026-10-23)
+/// [measured]; the OS takes it with 256-byte pages and 64 KB sectors. Times:
+/// the datasheet's typicals (0.4 ms a page; 45 / 120 / 150 ms a 4 / 32 / 64
+/// KB erase; 20 s the chip) [inferred]; bytes 3 to 5 unprinted (0).
+pub const W25Q64: Part = Part {
+    id: [0xEF, 0x40, 0x17, 0x00, 0x00, 0x00],
+    page: 256,
+    sector: 0x1_0000,
+    small_erases: true,
+    size: 8 << 20,
+    t_page: 400.0,
+    t_sector: 150_000.0,
+    t_4k: 45_000.0,
+    t_32k: 120_000.0,
+    t_chip: 20_000_000.0,
 };
 
 /// What a power cut leaves of an operation under way (`DTEMU_SPI_CUT`).
@@ -191,10 +215,15 @@ pub struct SpiFlash {
 }
 
 impl SpiFlash {
+    /// A flash of `part`, holding `mem` (its size, `part.size`).
     pub fn new(mem: Vec<u8>) -> SpiFlash {
+        Self::with_part(mem, S25FL128S_256K)
+    }
+
+    pub fn with_part(mem: Vec<u8>, part: Part) -> SpiFlash {
         SpiFlash {
             mem,
-            part: S25FL128S_256K,
+            part,
             wel: false,
             idx: 0,
             cmd: 0,

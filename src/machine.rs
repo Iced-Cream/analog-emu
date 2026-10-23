@@ -10,7 +10,17 @@ use crate::symbols::{Device, Profile, MAIN_LOAD};
 /// it there and the OS's flash reads (section tables, the panel MCU image)
 /// look for it there.
 pub const FLASH_SLOT: usize = 0x8_0000;
+/// The Rytm MKII's flash (the A4 MKII's is 8 MB: `flash_part`).
 pub const FLASH_SIZE: usize = 16 << 20;
+
+/// The SPI flash part each unit is modelled with (spiflash.rs): the ones
+/// read on units, else the Rytm's.
+pub fn flash_part(d: Device) -> crate::spiflash::Part {
+    match d {
+        Device::A4Mk2 => crate::spiflash::W25Q64,
+        _ => crate::spiflash::S25FL128S_256K,
+    }
+}
 pub const INITIAL_SP: u32 = 0x4080_0000;
 /// The MKI units' LCD: 122x32, 1 bit (the OS clears 488 B = 122 x 4 pages and
 /// centres text on 0x7a) [measured, docs/MK1-PORT.md].
@@ -196,10 +206,11 @@ impl Machine {
         cpu.vbr = DEFAULT_VBR;
 
         if !prof.device.mk1() {
-            let mut flash = vec![0u8; FLASH_SIZE];
+            let part = flash_part(prof.device);
+            let mut flash = vec![0u8; part.size];
             let c = &fw.container;
             flash[FLASH_SLOT..FLASH_SLOT + c.len()].copy_from_slice(c);
-            cpu.bus.spi = Some(crate::spiflash::SpiFlash::new(flash));
+            cpu.bus.spi = Some(crate::spiflash::SpiFlash::with_part(flash, part));
         }
 
         let mut m = Machine {
@@ -766,7 +777,7 @@ impl Machine {
         let maintenance = self.cpu.bus.peek32(0x4800_0000) == MAINTENANCE_MAGIC;
         let mut flash = self.cpu.bus.spi.take().ok_or("no SPI flash")?;
         flash.settle(u64::MAX);
-        let fw = match Firmware::from_container(&flash.mem[FLASH_SLOT..]) {
+        let fw = match Firmware::from_flash(&flash.mem[FLASH_SLOT..]) {
             Ok(fw) => fw,
             Err(e) => {
                 self.cpu.bus.spi = Some(flash);
@@ -966,7 +977,11 @@ impl Machine {
                 f.settle(now);
             }
             let data = match bus.spi.as_ref() {
-                Some(f) if len != 0 && dest != 0 && off + len <= f.mem.len() => Some(f.mem[off..off + len].to_vec()),
+                // Addresses wrap at the part's end, as on the part.
+                Some(f) if len != 0 && dest != 0 && len <= f.mem.len() => {
+                    let n = f.mem.len();
+                    Some((0..len).map(|k| f.mem[(off + k) % n]).collect::<Vec<u8>>())
+                }
                 _ => None,
             };
             if let Some(data) = data {
