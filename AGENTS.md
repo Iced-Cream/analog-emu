@@ -33,6 +33,7 @@ Run `cargo test --release` before you finish a change.
 ./target/release/a4 [FW.syx] [--card a4.img]             # the window as an Analog Four (defaults: fw/Analog-Four_MKII_OS1.56.syx, a4.img)
 ./target/release/dtboot FW.syx --instr 4G --press YES@3000M   # headless: fixed budget, prints the screen, exits; keys by name
 ./target/release/dtboot FW.syx --load SNAP --card C.img --power-off 5G   # power off: the OS saves its state to the card
+./target/release/dtboot FW.syx --card C.img --flash F.img --reboot --instr 26G --usb-midi-file UP.syx@5G --press YES@18G   # an OS upgrade; F.img keeps the flash
 ./target/release/fwinfo FW.syx [-o DIR]                  # list/extract the firmware's sections (ELE3, and the MKI units' ELE2)
 ./target/release/rytm fw/Analog-Four_Analog-Keys_OS1.56.syx --card COPY.img   # the Analog Four MKI (docs/MK1-PORT.md); a blank card works
 ./target/release/rytm fw/Analog-Rytm_OS1.74.syx --card NEW.img               # the Analog Rytm MKI: a blank card (it lays out its own ekFS v1)
@@ -48,7 +49,7 @@ Environment switches:
 - `DTEMU_SYNTAKT_DSP=stub` runs the Syntakt with the scripted stand-in for its second CPU; `DTEMU_DSP_PROFILE=1` samples the second CPU's PCs (dtboot lists them).
 - Syntakt analog side: `DTEMU_NO_ANALOG=1` turns the model off; `DTEMU_ST_FRAME_TRACE=1` prints the voice frame's changed words, `DTEMU_ST_FRAME_DUMP=FILE` dumps it (500 u16 every 32 codec frames); `DTEMU_ST_RX_TONE=k[:AMP]` / `DTEMU_ST_RX_MASK=HEX` inject a test tone on / zero codec receive words.
 
-The window creates the virtual MIDI ports `rytm-emu in` and `rytm-emu out` (`a4-emu ...` on an A4). See `README.md` for MIDI, samples, keys and the USB/Overbridge options.
+The window creates the virtual MIDI ports `rytm-emu in` and `rytm-emu out` (`a4-emu ...` on an A4); on Windows, which has none, it opens existing ports of those names (a loopback driver such as loopMIDI makes them), so the window builds and `cargo test --release` runs there too. See `README.md` for MIDI, samples, keys and the USB/Overbridge options.
 Window mouse: click presses, shift-click latches; on a knob drag/wheel turns, a click pushes, ctrl-drag is push + turn (`gui::KnobDrag`).
 
 ## Architecture
@@ -62,6 +63,7 @@ Window mouse: click presses, shift-click latches; on a knob drag/wheel turns, a 
 - `src/symbols.rs`: the per-build guest-address profiles, and `Device` (Digitakt, Rytm/A4 MKII, Rytm/A4 MKI, Syntakt), which selects the board wiring.
 - `src/syntakt.rs`: the Syntakt's link to its second CPU (FPGA mailbox at 0x10000000, kick and IRQ lines, DSPI2 boot stream), the DSP's end of it (`DspSide`), its profile, and the scripted stand-in. The second CPU itself is `Machine::dsp`, a second `Cpu` + `Bus` run in lockstep slices with CPU1 (`Machine::run_until`); snapshots and `jitcheck` cover both.
 - `src/stanalog.rs`: the Syntakt's analog tracks 9-12 and analog FX block, modelled from the 500-word voice frame (map in docs/SYNTAKT-PORT.md section 12); receive words 0..3 / 4..5 back to CPU1, the analog side to `Ssi::voices` for the speakers. Reuses the Rytm's envelope `Record` (analog.rs).
+- `src/spiflash.rs`: the MKII units' and Syntakt's SPI flash on DSPI0 (ID, erase, page program, status), so an OS upgrade writes it; `Machine::reboot_from_flash` boots what it holds after the OS's reset (`Stop::Reset`).
 - `src/nor.rs`, `src/mk1.rs`: the MKI units' parallel NOR flash and CS1 memory, and the codec's SPI control port; `io::Ssi0`: the Rytm MKI's second codec port.
 - `src/ekfs.rs`: the +Drive filesystem.
 - `src/snapshot.rs`: snapshots.

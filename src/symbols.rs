@@ -60,6 +60,20 @@ impl Device {
     pub fn mk1(self) -> bool {
         matches!(self, Device::RytmMk1 | Device::A4Mk1)
     }
+
+    /// The boot flag that starts the factory-test console (a USB serial
+    /// device beside the normal UI), as the bootstrap sets it for a power-on
+    /// key combo or a maintenance reboot: 0x40 on the Rytm MKII (1.74 main
+    /// `0x401006ee`, bootstrap `0x80000ac4`), 0x20 on the A4 MKII (1.56 main
+    /// `0x40105fb6`, where 0x40 means no UI; bootstrap offset 0x832) [read
+    /// from the code]. None where it was not looked for.
+    pub fn test_mode_flag(self) -> Option<u32> {
+        match self {
+            Device::RytmMk2 => Some(0x40),
+            Device::A4Mk2 => Some(0x20),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

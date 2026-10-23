@@ -105,12 +105,28 @@ pad, clicking higher strikes harder. Every key is also reachable by name in
 
 **MIDI**: the window creates two virtual MIDI ports, `rytm-emu in` and `rytm-emu out`,
 wired to the emulated DIN MIDI port (`--no-midi` to skip). Connect a keyboard, a DAW
-or a SysEx tool to them as to a real Rytm's DIN MIDI. Headless tests can send MIDI
+or a SysEx tool to them as to a real Rytm's DIN MIDI. Windows has no virtual MIDI
+ports: there the window opens existing ports with those names, so create them first
+with a loopback driver such as loopMIDI (`rytm-emu in`, `rytm-emu out`, and for the
+USB MIDI port `rytm-emu usb in` / `rytm-emu usb out`; `a4-emu ...` for the A4); a missing one is reported
+and skipped. Headless tests can send MIDI
 with `dtboot --midi 9d0064@5G` or a SysEx file with `--midi-file dump.syx@5G`.
 `DTEMU_MIDI_LOG=FILE` logs every message through the ports. Elektron's own protocol
 (Transfer, elektroid), which the Rytm only serves over USB, is answered on these
 ports too: the emulator hands it to the OS as USB input and returns the replies
 (docs/RYTM-PORT.md, DIN MIDI). `tools/ekproto.py` encodes and decodes it for tests.
+
+**OS upgrades** (MKII units): the SPI flash is writable (`src/spiflash.rs`), so an OS
+upgrade sent by Transfer, elektroid or elkflash runs as on a unit: the transfer, the
+UPGRADE OS NOW? prompt, ERASING FLASH..., the write and the reset. With `--flash
+FILE` (window and dtboot) the flash lives in FILE and survives the run; the window
+then boots the new OS, and `dtboot --reboot` does the same. With no `.syx` named, the
+tools boot the OS the flash holds. A flash image holds the OS: name it `*.img` so git
+ignores it. Nothing in the emulator reaches a real unit.
+
+    ./target/release/dtboot fw/Analog-Rytm_MKII_OS1.73.syx --card rytm.img --flash rytm-flash.img \
+        --reboot --instr 26G --usb-midi-file upgrade.syx@5G --press YES@18G
+    ./target/release/dtboot --card rytm.img --flash rytm-flash.img --instr 4G   # boots the upgraded OS
 
 **Overbridge input** (Rytm): `--ob-link [ADDR]` (window and dtboot) serves the
 host->Rytm Overbridge stream over TCP (default 127.0.0.1:7301; `src/oblink.rs`):

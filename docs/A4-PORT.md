@@ -581,3 +581,62 @@ before 522 ms 2.5 s after the snapshot (growing to the 1 s cap), after 28 ms at
 70 ms. Headless (dtboot), the OS opens the VCA words within one 5 ms status step of
 the key, and the modelled audio starts about 1 ms after the press: the rest is the
 window's audio ring.
+
+## 14. OS upgrade, power cuts and the test-mode console (2026-10-23)
+
+The Rytm MKII work in docs/RYTM-PORT.md ("OS upgrade over USB MIDI", "The
+factory-test console") applies to the A4 MKII unchanged in the emulator's code:
+the same SPI flash model (spiflash.rs), reset, reboot from the flash,
+snapshots with the flash, power-cut settings and serial console. Measured on
+OS 1.56 (the only A4 MKII OS file to hand, so the upgrade reinstalls 1.56):
+
+- **The flash part**: a contributor's A4 MKII reports `EF 4017 00` on the
+  factory console's #STATUS (2026-10-23): a Winbond W25Q64, 8 MB, which the
+  OS's part check (0x40114f7c, the Rytm's list) takes with 256-byte pages and
+  64 KB sectors [measured]. The emulator gives the A4 MKII that part
+  (`machine::flash_part`, `spiflash::W25Q64`; addresses wrap at 8 MB as on the
+  part); the Rytm keeps its S25FL128S.
+- **Upgrade** (`dtboot ... --flash F --reboot`, the 1.56 `.syx` as Transfer
+  sends it in 32 KiB chunks from 5G, YES at 18G): UPGRADE OS NOW?, then 17
+  erases of 64 KB from 0x80000 and 4228 page programs of 256 bytes, 1,082,368
+  bytes, the file's ELE3 container byte for byte; RCR software reset at
+  19.724G (from 0x4007db72); the emulator boots 1.56 from the flash
+  [measured]. Through the window on Windows (loopMIDI `a4-emu usb in/out`,
+  elkflash): 42 chunks, 0 resends; after YES the window rebooted from its
+  flash [measured].
+- **State save before the erase**: as on the Rytm. The working state is the
+  'COKI' block at 0x4045c870 (version 0x0b, header size 0x78, project name
+  at +0x30, the Rytm's checksum rule). Renamed "Analog Keys" to "Znalog Keys"
+  with the checksum fixed before YES: after YES the state is written to the
+  eMMC slot at 0x7c000 and the slot at 0x7a000 is invalidated, and after the
+  reset 1.56 boots with "Znalog Keys" [measured].
+- **Power cuts** (with the W25Q64: 63 runs from a snapshot just before YES,
+  every 0.1G from 18.0G to 19.7G with the three `DTEMU_SPI_CUT` settings,
+  plus holds of 50, 520 and 5000 ms at 18.2, 18.6 and 19.0G): the settings
+  never changed an outcome and no flash operation was under way when the CPU
+  parked. During an erase the power-fail handler took 12M-32M instructions
+  (it waits for the erase; 64 KB erases are shorter), otherwise 3M. Before the
+  first erase the old OS boots; from the first erase to the last page (18.1G
+  to 19.1G, 1,045,504 of 1,082,368 bytes written at 19.1G) the flash has no
+  bootable OS; from 19.2G on the new OS boots. The A4's power-fail save has
+  the Rytm's RDSR wait (0x40106ba6) [measured; the poll located by its DSPI0
+  words]. At 19.1G MAIN OS was whole and only the panel firmware section was
+  short: booting from the flash now checks every section's byte sum
+  (`Firmware::from_flash`), as a unit's bootstrap checks the container before
+  it starts the OS [inferred], and refuses that image.
+- **Test-mode console**: boot flag **0x20** on the A4 (0x40 there skips the
+  UI: 1.56 main `0x40105fb6` tests 0x40 for the UI and 0x20 for the console
+  task `0x4011b116` and USB mode 5; the bootstrap ORs 0x20 for 0xB0B0DADA at
+  0x48000000 after a software reset, offset 0x832 of the bootstrap section)
+  [read from the code]. `dtboot --test-mode` uses it: the CDC device answers
+  #HELLO and #STATUS (VERSION 2, OS 0204 1.56, FLASH EF 4017 00, SUPERCAP
+  FAIL "NEVER AT DISCHARGED STATE": the emulator's supercap is always
+  charged), and #REBOOT comes back in test mode [measured]. The power-on key
+  combination (bootstrap `0x80000ac2`): PERF, TRK, PTN, SONG and [TRIG 4] held,
+  with FUNC, KIT, SND, MIX, [TRIG 3] and [TRIG 5] up (codes 0x30, 0x92, 0x93,
+  0x94, 0x03 held; 0x80, 0x90, 0x91, 0xB3, 0x02, 0x04 up; named by
+  `panel::A4_KEYS`, which the bootstrap shares with the OS - inferred, as on
+  the Rytm, where the same reading proved right on a unit) [read from the
+  code; not tried on an A4].
+- **The window**: `a4` opens `a4-emu in` / `a4-emu out` / `a4-emu usb in` /
+  `a4-emu usb out`; on Windows create those in loopMIDI.

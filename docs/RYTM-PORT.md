@@ -666,8 +666,9 @@ then the emulated run doing exactly this]:
 - **Before an OS upgrade** ("ERASING FLASH...", 0x4004db9c) the same write is
   made synchronously (0x4012285c): flashing an OS keeps the working state.
   So a Rytm flashed with a mod build boots the stock state, and going back to
-  stock boots the mod's state - the HIGH 2 case [inferred from the code; the
-  emulator does not run an OS upgrade].
+  stock boots the mod's state - the HIGH 2 case [measured in the emulator,
+  "OS upgrade over USB MIDI" below: the save lands before the first erase and
+  the new OS loads it].
 - Strings "MRAM STATE NOT WRITTEN", "MRAM WRITE IN PROGRESS" (0x41352d28,
   0x41352d24) belong to the factory test's status report; "SHUTDOWN" is a
   random-name word and "TURN POWER OFF" the end of the factory test - none
@@ -784,3 +785,205 @@ depth's envelope.
   peak -10.2 dBFS (the old model: -21.1, oscillator 1 at 0 Hz stayed silent);
 - the default kit: BD PLASTIC peaks -8.9 dBFS (was -13.5), RS -14.1 (was -12.1);
 - the end screens of all seven devices unchanged; the Rytm window holds SPEED 100 %.
+
+## OS upgrade over USB MIDI (2026-10-22)
+
+The OS upgrade runs end to end on the emulated Rytm MKII: the SPI flash takes
+erase and program commands (`src/spiflash.rs`), and the reset at the end boots
+the new OS from it. Measured with stock OS 1.73 receiving stock OS 1.74, the
+requests as Transfer sends them (Knowledge Base, overbridge-transfer-protocols
+section 3.6, encoded by elkflash), on a scratch card. Addresses are OS 1.74's
+unless marked.
+
+**The flash driver** [measured, Ghidra read-only and the emulator's trace]:
+DSPI0 at 0xFC05C000, chip select PCS1, polled. Every routine clears the FIFOs
+(MCR |= 0xC00), pushes words with CONT until the last byte and pops one POPR
+word per push. Commands in the image: 06 WREN, 05 RDSR (bit 0 busy; 0x60 = an
+erase/program error, then 30 CLSR), 03 READ (`flash_read` 0x40136482, which
+the emulator still serves itself, from the same image), 02 page program
+(0x401365aa, from 0x4013717a in page-sized pieces), D8 sector erase (0x401368a2),
+9F ID, plus OTP/SFDP/protection reads (4B, 5A, 48, 42, 44, 2B, E0-E4) that the
+upgrade path does not use.
+
+**The part check** (0x40136b50, on the first five 9F bytes) sets the page and
+sector size or fails every program and erase: Spansion 01 2018 (byte 4 = 0:
+512-byte pages, 256 KB sectors; 1: 256 B, 64 KB), ISSI 9D 6017/6018, Macronix C2
+2017/2018, Winbond EF 4014/7015/4017/4018, EON 1C 7015 (all 256 B, 64 KB). The
+contributor's Rytm MKII reports Spansion 01 2018 with byte 4 = 00 (the factory-test
+console's #STATUS, below) [measured]: an S25FL128S with uniform 256 KB sectors
+and 512-byte pages, which the emulator now answers as (`spiflash::Part`;
+`W25Q128` stays as a 64 KB-sector alternative). Before this model the 9F read returned junk, and that is why the
+earlier test stopped on OS UPGRADE RECEIVING with no prompt: with a known ID
+the prompt comes.
+
+**The sequence** in the emulator (1.73 receiving 1.74, 1.88 MB `.syx`):
+- start (0x50) -> status 0, OS UPGRADE RECEIVING. Writes in 32 KiB (58) or
+  2 KiB (919) pieces, open loop or at fixed clocks, all answered in order; the
+  last with status 1. Then UPGRADE OS NOW? CONFIRM YES/NO.
+- YES -> ERASING FLASH...: 6 sectors of 256 KB from 0x80000 (0x4009f404:
+  `(size + sector - 1) / sector` erases), then "Writing Flash": 2899 page
+  programs of 512 bytes from 0x80000 (with the W25Q128: 23 x 64 KB, 5798 x 256), 1,484,288 bytes, which is the new `.syx`'s ELE3
+  container byte for byte (`dtboot` compares them: no "different OS" note).
+- "Success! Rebooting": a wait (0x40098c84(3000000): DTIM1 counts to its
+  argument with DTMR 0x841b, a /133 prescaler on the internal bus clock, so
+  about 1 us a count and 3 s here; 3.0 s in the emulator, 0.6G instructions
+  between the last page and the reset [read from the code; measured]), 0 to
+  0x48000000, then RCR (0xEC090000) = 0x80, a software reset
+  (`move.b` at 0x4009f53a). `Io::reset_request` catches it and
+  `Machine::run_until` returns `Stop::Reset` (1.73, YES at 18G: the reset at
+  19.60G with the part's times, 18.68G with `DTEMU_SPI_INSTANT=1`; the
+  difference, 0.92G instructions, is 4.6 s at 200 MHz: six 520 ms erases,
+  2899 programs of 340 us and the OS's own polling waits).
+- `Machine::reboot_from_flash` builds a new machine from the container at
+  0x80000, keeping the flash and the card: it boots OS 1.74 to the same screen
+  as a cold boot of the 1.74 `.syx` on that card.
+
+**Timing and power loss.** Erase and program take the part's datasheet
+typicals on the emulated clock (`spiflash::Part`, [inferred]): status reads
+busy meanwhile, other commands are ignored, and the change lands at the end.
+`dtboot --power-off AT` during an upgrade runs the OS's power-fail handler as
+before, then cuts a flash operation still under way. Neither how far a part
+gets with an interrupted operation nor how long the supercap keeps the flash
+powered after the CPU parks is known, so both are settings:
+`DTEMU_SPI_CUT=share|none|done` (the share of its bytes its elapsed time
+covers, the default; nothing; all of it) and `DTEMU_SPI_HOLD_MS=N` (the flash
+keeps power N ms after the handler; default 0).
+
+**Sweep** (2026-10-22, from a snapshot just before YES; 1.73 receiving 1.74,
+YES at 18G): the power off at 35 points from 18.00G to 19.70G (every 0.05G)
+with each of the three cut settings, and at 18 points with holds of 50, 520
+and 5000 ms; then a boot from the flash left. Result: the settings never
+changed an outcome, and no flash operation was ever under way when the CPU
+parked. Page programs (340 us) finish inside the handler's 3M instructions
+(15 ms); during an erase the handler does not finish until the erase has
+(44M-94M instructions) [measured]. Why: the power-fail save (1.73
+`0x40122266`, called at level 5 from `0x40000486` after the level-7 handler
+`0x400004b0` forces INTC2 source 30) first asks whether the flash driver's
+lock is held (`0x40137124`: `*0x419f00d0 != 0`; every flash routine takes
+it). If it is, a flash routine was interrupted: the save finishes the SPI
+transfer under way (zeros, then an end-of-queue word, so the chip select
+goes high and a started command executes), then polls RDSR (`0x80020005`,
+`0x08020000`) until WIP clears (`0x401224a0`..`0x4012252c`), and only then
+goes on to its card work and the CMD0 that parks the card [read from the
+code, 1.73; 1.74's save `0x401222d2` has the same structure: the lock test
+`0x401372f0`, the RDSR poll at `0x4012256a`]. The interrupted
+code ran at SR 0x2000 (the erase routine's delay loop at 1.73 `0x40136730`),
+so the interrupt itself is taken at once [measured]. So the OS completes any
+erase or program it started before the board loses power, as long as the
+supercap lasts the rest of it (at most one 256 KB erase: 520 ms typical, 2.6
+s maximum on the S25FL128S); `DTEMU_SPI_HOLD_MS` and `DTEMU_SPI_CUT` matter
+only if it does not. So the
+outcome depends only on when the power goes:
+- before the first erase (18.00G): the old OS is untouched and boots (1.73);
+- from the first erase to the last page (18.05G to 18.95G: 256 KB to 1.5 MB
+  erased, then 0 to 1.27 MB written): no bootable OS (the container's header
+  without its MAIN OS, or nothing at all);
+- after the last page (19.00G on, including the 3 s before the reset): the
+  new OS boots (1.74). For example, 1.73 receiving
+1.74 with YES at 18G and the power off at 18.85G leaves six sectors erased and
+828,416 of 1,484,288 bytes written; booting that flash (`dtboot --flash F`, no
+`.syx`) finds the container's header but a MAIN OS no profile knows, and
+stops, saying so. A unit would go on into its bootstrap, whose check failing
+opens its STARTUP MENU with OS UPGRADE (0x8000356c; 0x8000214c inferred to be
+that check), the recovery path; the emulator does not run the bootstrap.
+
+**The state save before the erase** [measured, 2026-10-22, 1.73 receiving
+1.74 from a snapshot just before YES at 18G]: the project name in the working
+state changed in RAM (0x405c8e2c "Analog" -> "Znalog", header checksum at
+0x405c8e14 recomputed: the sum of word[i] ^ (i + 1) over (size + 8) / 4 words
+from +8) before YES. After YES the OS writes the 2 MB state to the other
+eMMC slot (0x7c000 here) and clears the first byte of the old one (0x7a000),
+as the power-off save does; the write is complete between 18.030G and
+18.035G, and the first erase starts between 18.035G and 18.040G, so the save
+comes first. After the reset, OS 1.74 boots with "Znalog Rytm" at the same
+address: the new OS loads the state the old one saved. With the checksum
+left stale, the slot is written but the new OS rejects it and starts from
+defaults (the old slot having been cleared).
+
+**Snapshots carry the flash** (a `FLSH` trailer after the main body and the
+Syntakt's DSP: the contents, LZ4, about 3 MB; WEL; an erase or program under
+way with its clock span; the counters). Older snapshots load as before and
+leave the flash alone. A snapshot taken mid-erase (18.402G) and resumed
+reaches the reset at the same clock as an uninterrupted run (19.6035G) and
+writes the same container. With `--flash FILE` the snapshot's flash runs and
+is written back to FILE; dtboot notes when the two differed.
+
+Booting from the flash (`--reboot`, `--flash` with no `.syx`, the window)
+checks every packed section's byte sum first (`Firmware::from_flash`): a
+container cut short anywhere, not only in MAIN OS, does not boot, as a unit's
+bootstrap checks it before starting the OS ("CRC CHECK" among its strings)
+[inferred]. The A4 MKII has its own flash part (docs/A4-PORT.md section 14).
+
+Not modelled: the bootstrap that a unit runs first (the emulator loads MAIN OS
+from the container as it does from a `.syx`, so only builds `symbols.rs` knows
+boot, and the recovery after an interrupted upgrade cannot be followed).
+
+The memory note that open-loop feeds lost chunks around 17G could not be
+reproduced: the same 2 KiB and 32 KiB streams in one feed, and the earlier
+per-file schedule (one file of ten writes a second of emulated time), arrived
+in full on this build and on main (c5732f0) alike [measured, 2026-10-22].
+
+Tools: `dtboot --flash FILE` (load if present, write back at the end; with no
+`.syx`, boot the flash's OS), `dtboot --reboot` (continue across the reset;
+events not yet due run on the new boot's clock), `rytm --flash FILE` (the
+window reboots by itself and saves the flash with the card),
+`DTEMU_SPI_TRACE=1` (each erase and program; `=all` every command),
+`DTEMU_SPI_INSTANT=1` (no erase and program times).
+
+## The factory-test console (2026-10-22)
+
+Boot flag 0x40 (bit 6 of the entry's argument, kept at 0x40272874 on OS 1.74)
+starts a text console beside the normal UI: 0x401006ee registers its input
+parser (0x400816c4) and task (0x4013c164 -> 0x4013a234) and sets USB up in
+mode 4, a CDC ACM serial device (1935:ffff; data interface 1, bulk 0x02 OUT
+and 0x82 IN) [measured, OS 1.74]. Lines start with `#` and end with a newline
+(`!` and `$$$$` start binary blocks).
+
+Where the flag comes from: the bootstrap (OS 1.74's, 0x80000ac4, Ghidra
+read-only; the emulator does not run it) sets 0x40 in three cases: FUNC,
+GLOBAL, SAMPLER and CHRO held at power-on with PLAYMODE, MUTE, SCNE, PERF and
+QPER up (and the OS check 0x8000214c passing); a software reset with
+0xB0B0DADA at 0x48000000 (the console's #REBOOT and
+#REBOOT_INTO_MAINTENANCE_MODE both write it, then RCR = 0x80, 1.74
+`0x4013a234` [read from the code]; the OS upgrade writes 0 there before its
+reset); or no panel answer
+(0xC0, which also parks the UI). FUNC alone opens the STARTUP MENU (0x8000356c),
+whose 1 ... TEST MODE is the bootstrap's own key/encoder/pad test, not this
+console [read from the code; key codes named by panel::RYTM_KEYS, which the
+bootstrap shares with the OS - inferred; not tried on a unit].
+
+Commands (strings in 0x4013a234): #HELLO, #STATUS, #READ_SERIAL, #READ_TEMP,
+#DUMP_CALIBRATION and other reads; also #UPGRADE (writes the bootstrap),
+#FULL_UPGRADE, #FORMAT_FS, #WRITE_SERIAL and more that write the flash or the
+card. #STATUS prints a block per part; its FLASH line is the first bytes of
+the 9F ID (`01 2018 00 ...` on a contributor's unit and the emulator alike; the
+words after it differ per unit and are not recorded here).
+
+In the emulator: `dtboot FW --test-mode --usb-serial "#STATUS@3.5G"`
+(`--test-mode` ORs the device's flag into the boot flags, here 0x00140040,
+`Device::test_mode_flag`; `--usb-serial` turns on the USB host as a serial
+driver, `UsbHost::cdc`, and prints what comes back). The A4 MKII has the same
+console with flag 0x20 (docs/A4-PORT.md section 14). Measured on 1.74:
+#HELLO -> HOW DO YOU DO?; #STATUS -> START, VERSION 1, OS 0176 1.74, PLATFORM,
+FLASH 01 2018 (EF 4018 before the part was changed), DRAM, FPGA, SUPERCAP, UI (WRONG UI CARD), MMC, CODEC (FAIL).
+
+`usbdev.rs` now keeps OTGSC's line-state bits (8..14) read-only: the
+firmware's USB setup write (0x08000000) cleared the host's VBUS before, and a
+cold boot with `--usb-host` stayed at "VBUS on" in every USB mode; it now
+enumerates (USB MIDI as 1935:0011 on 1.73, the serial device in test mode).
+
+**Checked later (2026-10-23):**
+- *Downgrade.* OS 1.74 receiving 1.73 (32 KiB chunks, YES at 18G) accepts it,
+  erases six sectors, writes 1,483,776 bytes and resets (19.603G); the
+  emulator reboots into 1.73. The OS does not refuse an older image; the
+  bootstrap's "DOWNGRADE NOT POSSIBLE" belongs to its own SysEx upgrade
+  [measured; the bootstrap path not run].
+- *Maintenance reboot.* `Machine::reboot_from_flash` keeps the bootstrap's
+  rule for 0xB0B0DADA at 0x48000000 and boots with flag 0x40. In dtboot, test
+  mode, #HELLO, #REBOOT (a reset 3.5k instructions later), then #HELLO on the
+  new boot: HOW DO YOU DO? [measured]. dtboot re-attaches its USB host after
+  a `--reboot`.
+- *Transfer.* Not run against the window. It pairs MIDI ports by product name
+  and otherwise asks the user to pick them ("Select MIDI ports for your
+  device", overbridge-transfer-protocols 3.5): choose input `rytm-emu usb out`
+  and output `rytm-emu usb in` [inferred].

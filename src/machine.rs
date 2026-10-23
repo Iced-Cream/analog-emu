@@ -10,7 +10,17 @@ use crate::symbols::{Device, Profile, MAIN_LOAD};
 /// it there and the OS's flash reads (section tables, the panel MCU image)
 /// look for it there.
 pub const FLASH_SLOT: usize = 0x8_0000;
+/// The Rytm MKII's flash (the A4 MKII's is 8 MB: `flash_part`).
 pub const FLASH_SIZE: usize = 16 << 20;
+
+/// The SPI flash part each unit is modelled with (spiflash.rs): the ones
+/// read on units, else the Rytm's.
+pub fn flash_part(d: Device) -> crate::spiflash::Part {
+    match d {
+        Device::A4Mk2 => crate::spiflash::W25Q64,
+        _ => crate::spiflash::S25FL128S_256K,
+    }
+}
 pub const INITIAL_SP: u32 = 0x4080_0000;
 /// The MKI units' LCD: 122x32, 1 bit (the OS clears 488 B = 122 x 4 pages and
 /// centres text on 0x7a) [measured, docs/MK1-PORT.md].
@@ -22,6 +32,10 @@ pub const DEFAULT_VBR: u32 = 0x4000_0000;
 /// boot flags"). The OS stores it at 0x401F55C0 and tests it in more than
 /// twenty places; 0x40|0x20 would mean "no panel" and park the OS.
 pub const BOOT_FLAGS: u32 = 0x0014_0000;
+
+/// What the factory console leaves at 0x48000000 before a software reset so
+/// the bootstrap starts the next boot in test mode (boot flag 0x40).
+pub const MAINTENANCE_MAGIC: u32 = 0xB0B0_DADA;
 
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
@@ -66,12 +80,13 @@ pub struct PowerOff {
     /// A valid state header ('COKI') at sector 0x7a000, 0x7c000 afterwards.
     pub slots: [bool; 2],
     pub stop: Stop,
+    /// A flash erase or program the power cut short (spiflash.rs `cut`).
+    pub flash_cut: Option<String>,
 }
 
 pub struct Machine {
     pub cpu: Cpu,
     pub prof: Profile,
-    pub flash: Vec<u8>,
     pub stats: Stats,
     pub opts: Options,
     /// The last complete frame the firmware handed to the panel.
@@ -190,14 +205,17 @@ impl Machine {
         cpu.bus.poke32(INITIAL_SP - 4, BOOT_FLAGS);
         cpu.vbr = DEFAULT_VBR;
 
-        let mut flash = vec![0u8; FLASH_SIZE];
-        let c = &fw.container;
-        flash[FLASH_SLOT..FLASH_SLOT + c.len()].copy_from_slice(c);
+        if !prof.device.mk1() {
+            let part = flash_part(prof.device);
+            let mut flash = vec![0u8; part.size];
+            let c = &fw.container;
+            flash[FLASH_SLOT..FLASH_SLOT + c.len()].copy_from_slice(c);
+            cpu.bus.spi = Some(crate::spiflash::SpiFlash::with_part(flash, part));
+        }
 
         let mut m = Machine {
             cpu,
             prof,
-            flash,
             stats: Stats::default(),
             opts: Options::default(),
             frame: None,
@@ -355,7 +373,7 @@ impl Machine {
         if std::env::var_os("DTEMU_NO_CAL").is_none() {
             let cal = Self::rytm_calibration(false);
             for at in [0x30_0000usize, 0x34_0000] {
-                self.flash[at..at + cal.len()].copy_from_slice(&cal);
+                self.flash_mut()[at..at + cal.len()].copy_from_slice(&cal);
             }
         }
         self.cpu.bus.io.dtin_hz = 12_288_000.0;
@@ -480,7 +498,7 @@ impl Machine {
     fn a4_bootstrap_state(&mut self) {
         if std::env::var_os("DTEMU_NO_CAL").is_none() {
             let cal = self.a4_calibration(0);
-            self.flash[0x30_0000..0x30_0000 + cal.len()].copy_from_slice(&cal);
+            self.flash_mut()[0x30_0000..0x30_0000 + cal.len()].copy_from_slice(&cal);
         }
         self.cpu.bus.io.dtin_hz = 12_288_000.0;
         self.cpu.bus.io.panel.card = crate::panel::CARD_A4;
@@ -617,7 +635,7 @@ impl Machine {
         if std::env::var_os("DTEMU_NO_CAL").is_none() {
             let cal = Self::syntakt_calibration();
             for at in [0x30_0000usize, 0x34_0000] {
-                self.flash[at..at + cal.len()].copy_from_slice(&cal);
+                self.flash_mut()[at..at + cal.len()].copy_from_slice(&cal);
             }
         }
         // The board revision register, a byte on FlexBus CS1 at 0 (CS1 64 KB
@@ -702,6 +720,104 @@ impl Machine {
     pub fn add_counter(&mut self, pc: u32) {
         self.counters.push((pc, 0));
         self.cpu.set_hook(pc, true);
+    }
+
+    /// The SPI flash image (spiflash.rs). Panics on an MKI unit, whose flash
+    /// is the parallel NOR in the bus's sparse pages.
+    pub fn flash(&self) -> &[u8] {
+        &self.cpu.bus.spi.as_ref().expect("no SPI flash on this unit").mem
+    }
+
+    pub fn flash_mut(&mut self) -> &mut [u8] {
+        &mut self.cpu.bus.spi.as_mut().expect("no SPI flash on this unit").mem
+    }
+
+    /// `--flash FILE`: the SPI flash from a file a previous run saved (the OS's
+    /// writes, an upgraded OS included), replacing the one built from the
+    /// `.syx`. A missing file leaves the built one, to be saved there.
+    pub fn load_flash(&mut self, path: &std::path::Path) -> Result<bool, String> {
+        let Some(f) = self.cpu.bus.spi.as_mut() else {
+            return Err("this unit has no SPI flash (an MKI keeps its OS in NOR)".into());
+        };
+        match std::fs::read(path) {
+            Ok(d) if d.len() == f.mem.len() => {
+                f.mem = d;
+                f.dirty = false;
+                Ok(true)
+            }
+            Ok(d) => Err(format!("{}: {} bytes, a flash image is {}", path.display(), d.len(), f.mem.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Write the SPI flash back to `path` (a host file, nothing else).
+    pub fn save_flash(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let f = self.cpu.bus.spi.as_mut().ok_or("no SPI flash")?;
+        // An operation under way finishes: the power stays on.
+        f.settle(u64::MAX);
+        std::fs::write(path, &f.mem).map_err(|e| format!("{}: {e}", path.display()))?;
+        f.dirty = false;
+        Ok(())
+    }
+
+    /// After `Stop::Reset`: boot again from the OS container now in the SPI
+    /// flash at `FLASH_SLOT` (the new OS after an upgrade), keeping the flash
+    /// and the +Drive card (written back to its file, then attached again);
+    /// everything else starts cold, the tools' options included. The real
+    /// bootstrap that would unpack the container is not run: the machine
+    /// loads its MAIN OS as it does from a `.syx`, so the build must be one
+    /// `symbols.rs` knows. One bootstrap rule is kept: a software reset with
+    /// `MAINTENANCE_MAGIC` at 0x48000000 (the factory console's #REBOOT and
+    /// #REBOOT_INTO_MAINTENANCE_MODE leave it, OS 1.74 `0x4013a234`) boots
+    /// with flag 0x40, the test mode (the 1.74 bootstrap's `0x80000ac4`
+    /// checks RSR's SOFT bit and that word) [read from the code]. -> the
+    /// new profile's name.
+    pub fn reboot_from_flash(&mut self) -> Result<&'static str, String> {
+        let maintenance = self.cpu.bus.peek32(0x4800_0000) == MAINTENANCE_MAGIC;
+        let mut flash = self.cpu.bus.spi.take().ok_or("no SPI flash")?;
+        flash.settle(u64::MAX);
+        let fw = match Firmware::from_flash(&flash.mem[FLASH_SLOT..]) {
+            Ok(fw) => fw,
+            Err(e) => {
+                self.cpu.bus.spi = Some(flash);
+                return Err(format!("no bootable OS in the flash at 0x{FLASH_SLOT:x}: {e}"));
+            }
+        };
+        let mut m = match Machine::new(&fw, self.cpu.bus.ddr.len() >> 20) {
+            Ok(m) => m,
+            Err(e) => {
+                self.cpu.bus.spi = Some(flash);
+                return Err(e);
+            }
+        };
+        m.cpu.bus.spi = Some(flash);
+        if maintenance {
+            if let Some(flag) = m.set_test_mode() {
+                m.note(format!("reboot into test mode (0xB0B0DADA at 0x48000000): boot flag 0x{flag:x}"));
+            }
+        }
+        let card = &mut self.cpu.bus.io.esdhc.card;
+        match card.path.clone() {
+            Some(p) => {
+                card.flush().map_err(|e| format!("{}: {e}", p.display()))?;
+                m.attach_card(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            }
+            None => std::mem::swap(&mut m.cpu.bus.io.esdhc.card.sectors, &mut card.sectors),
+        }
+        *self = m;
+        Ok(self.prof.name)
+    }
+
+    /// Boot into the factory-test console, as the bootstrap does for its key
+    /// combo or a maintenance reboot: OR the device's flag into the boot
+    /// flags (call before the first instruction). -> the flag, or None on a
+    /// device without one here.
+    pub fn set_test_mode(&mut self) -> Option<u32> {
+        let flag = self.prof.device.test_mode_flag()?;
+        let f = self.cpu.bus.peek32(INITIAL_SP - 4);
+        self.cpu.bus.poke32(INITIAL_SP - 4, f | flag);
+        Some(flag)
     }
 
     pub fn add_breakpoint(&mut self, pc: u32) {
@@ -856,8 +972,19 @@ impl Machine {
             let off = bus.peek32(sp + 4) as usize;
             let len = bus.peek32(sp + 8) as usize;
             let dest = bus.peek32(sp + 12);
-            if len != 0 && dest != 0 && off + len <= self.flash.len() {
-                let data = self.flash[off..off + len].to_vec();
+            let now = bus.io.now;
+            if let Some(f) = bus.spi.as_mut() {
+                f.settle(now);
+            }
+            let data = match bus.spi.as_ref() {
+                // Addresses wrap at the part's end, as on the part.
+                Some(f) if len != 0 && dest != 0 && len <= f.mem.len() => {
+                    let n = f.mem.len();
+                    Some((0..len).map(|k| f.mem[(off + k) % n]).collect::<Vec<u8>>())
+                }
+                _ => None,
+            };
+            if let Some(data) = data {
                 self.cpu.bus.poke_bytes(dest, &data);
             }
             self.stats.flash_reads += 1;
@@ -1194,6 +1321,8 @@ impl Machine {
                     }
                     core.skip_hook = Some(pc);
                 }
+                // The DSP's RCR is not its board's reset.
+                Stop::Reset => break,
                 Stop::Fault(v, p) => {
                     self.dsp_stats.fault = Some((v, p));
                     break;
@@ -1220,7 +1349,11 @@ impl Machine {
         self.run_nudges();
         self.cpu.bus.io.service();
         loop {
-            match self.cpu.run(until) {
+            let s = self.cpu.run(until);
+            if self.cpu.bus.io.reset_request {
+                return Stop::Reset;
+            }
+            match s {
                 Stop::Budget => return Stop::Budget,
                 Stop::Event => {
                     self.cpu.bus.io.service();
@@ -1264,7 +1397,7 @@ impl Machine {
                         self.cpu.skip_hook = Some(pc);
                     }
                 }
-                f @ Stop::Fault(..) => return f,
+                f @ (Stop::Fault(..) | Stop::Reset) => return f,
             }
         }
     }
@@ -1367,7 +1500,15 @@ impl Machine {
         }
         let card = &self.cpu.bus.io.esdhc.card;
         let slots = [0x7a000u32, 0x7c000].map(|s| card.sectors.get(&s).is_some_and(|d| &d[..4] == b"COKI"));
-        PowerOff { armed, done, instructions: self.now() - t0, sectors_written: card.writes - writes0, slots, stop }
+        let (writes, instructions) = (card.writes - writes0, self.now() - t0);
+        // The CPU has parked; the flash keeps power for DTEMU_SPI_HOLD_MS more
+        // (default 0), then an erase or program still under way stops. How
+        // long the supercap holds the flash's rail is a board property the
+        // firmware does not show, so this is a setting.
+        let hold_ms: f64 = std::env::var("DTEMU_SPI_HOLD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let now = self.now() + (hold_ms * 1e-3 * self.cpu.bus.io.ips) as u64;
+        let flash_cut = self.cpu.bus.spi.as_mut().and_then(|f| f.cut(now));
+        PowerOff { armed, done, instructions, sectors_written: writes, slots, stop, flash_cut }
     }
 
     /// The firmware's own "+Drive mounted" flag.

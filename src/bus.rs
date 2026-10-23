@@ -83,6 +83,8 @@ pub struct Bus {
     /// The MKI codec's control port on DSPI1 (mk1.rs); None elsewhere (the
     /// MKII units drive their voices on DSPI1).
     pub codec: Option<crate::mk1::CodecSpi>,
+    /// The serial flash on DSPI0 (spiflash.rs); None on the MKI units.
+    pub spi: Option<crate::spiflash::SpiFlash>,
     /// The PC of the instruction being executed, for diagnostics.
     pub pc: u32,
     /// A DDR write watchpoint: [lo, hi) as physical offsets. Hits are logged
@@ -154,6 +156,7 @@ impl Bus {
             st: None,
             nor: None,
             codec: None,
+            spi: None,
             pc: 0,
             watch: None,
             watch_hits: 0,
@@ -674,6 +677,11 @@ impl Bus {
                 return c.pop();
             }
         }
+        if let Some(f) = self.spi.as_mut() {
+            if a == crate::spiflash::DSPI0_POPR && size == 4 {
+                return f.pop();
+            }
+        }
         // SSI1 receive data: with the analog model on, each frame's words come
         // from it, rendered from the current control frame.
         if (a == 0xFC0C_8008 || a == 0xFC0C_800C) && self.io.ssi.input.is_empty() {
@@ -775,6 +783,15 @@ impl Bus {
         if let Some(c) = self.codec.as_mut() {
             if a == crate::mk1::DSPI1_PUSHR && size == 4 {
                 return c.push(v);
+            }
+        }
+        if let Some(f) = self.spi.as_mut() {
+            if a == crate::spiflash::DSPI0_PUSHR && size == 4 {
+                return f.push(v, self.io.now, self.io.ips);
+            }
+            // MCR stays plain memory too.
+            if a == crate::spiflash::DSPI0_MCR && size == 4 {
+                f.mcr(v);
             }
         }
         if crate::usbdev::is_usb(a) {

@@ -68,6 +68,12 @@ struct Audio {
 
 struct Opts {
     syx: PathBuf,
+    /// A FIRMWARE.syx was named (otherwise --flash's OS boots, if it has one).
+    syx_given: bool,
+    /// --flash FILE: the SPI flash, loaded if the file exists and written back
+    /// on save and exit, so an OS upgrade run in the window persists. When the
+    /// firmware resets (the end of an upgrade) the window boots the flash's OS.
+    flash: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     ips: f64,
     audio: bool,
@@ -105,6 +111,8 @@ struct Opts {
 fn parse() -> Opts {
     let mut o = Opts {
         syx: PathBuf::from(default_fw()),
+        syx_given: false,
+        flash: None,
         snapshot: None,
         ips: 200e6,
         audio: true,
@@ -155,6 +163,7 @@ fn parse() -> Opts {
             "--midi" => o.midi_headless = true,
             "--audio-null" => o.audio_null = true,
             "--card" => o.card = it.next().map(PathBuf::from),
+            "--flash" => o.flash = it.next().map(PathBuf::from),
             "--wav" => o.wav = it.next().map(PathBuf::from),
             "--latency" => o.latency = it.next().unwrap().parse().expect("--latency MS"),
             "--turn" => {
@@ -183,7 +192,9 @@ fn parse() -> Opts {
                      \x20       {pad}[--audio-in audio|ext|both]  (the Mac's default input into AUDIO IN / EXT IN)\n\
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
                      \x20       {pad}[--usb-wav FILE]  (record the USB audio stream: MAIN, 8 voices, AUDIO IN; 12 ch)\n\
-                     \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301)\n\n\
+                     \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301)\n\
+                     \x20       {pad}[--flash FILE]  (the SPI flash, kept in FILE: an OS upgrade over USB MIDI persists;\n\
+                     \x20       {pad}                 with no FIRMWARE named, the OS in it boots)\n\n\
                      Defaults: FIRMWARE {fw}, --card {card}.\n\
                      MIDI: virtual ports \"{port} in\" and \"{port} out\" carry the DIN MIDI port,\n\
                      \"{port} usb in\" and \"{port} usb out\" the USB MIDI port\n\
@@ -193,7 +204,10 @@ fn parse() -> Opts {
                 );
                 std::process::exit(0);
             }
-            _ => o.syx = PathBuf::from(a),
+            _ => {
+                o.syx = PathBuf::from(a);
+                o.syx_given = true;
+            }
         }
     }
     o
@@ -230,11 +244,11 @@ fn emulate(
     // so a second emulator can run beside a window without their ports colliding.
     let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let mut midi_out = if ports { midi::Out::start(&format!("{pname} out"), "out") } else { None };
-    let mut usb_out = if ports && m.is_rytm() { midi::Out::start(&format!("{pname} usb out"), "uout") } else { None };
+    let mut usb_out = if ports && (m.is_rytm() || m.is_a4()) { midi::Out::start(&format!("{pname} usb out"), "uout") } else { None };
     let slice = (ips / 500.0) as u64; // 2 ms of emulated time
     let target_ms = o.latency;
-    let t0 = Instant::now();
-    let emu0 = m.now();
+    let mut t0 = Instant::now();
+    let mut emu0 = m.now();
     let mut last_pub = Instant::now();
     let mut last_speed = (Instant::now(), m.now());
     let mut speed = 0.0;
@@ -311,7 +325,22 @@ fn emulate(
                 continue;
             }
         }
-        m.run_until(m.now() + slice);
+        if let dtemu::cpu::Stop::Reset = m.run_until(m.now() + slice) {
+            // The end of an OS upgrade: boot what is in the flash now.
+            save_flash(&mut m, o);
+            match m.reboot_from_flash() {
+                Ok(name) => eprintln!("reset: booting {name} from the flash"),
+                Err(e) => {
+                    eprintln!("reset: {e}");
+                    m.cpu.bus.io.reset_request = false;
+                }
+            }
+            m.cpu.bus.io.ips = ips;
+            m.cpu.bus.io.usb_audio_capture = o.usb_wav.is_some();
+            t0 = Instant::now();
+            emu0 = m.now();
+            last_speed = (Instant::now(), m.now());
+        }
         if let Some(uo) = usb_out.as_mut() {
             let bytes: Vec<u8> = m.cpu.bus.io.usb_midi_out.drain(..).collect();
             uo.send(&bytes);
@@ -542,14 +571,31 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
 
 pub fn main() {
     let o = parse();
-    let fw = Firmware::from_file(&o.syx).unwrap_or_else(|e| {
-        eprintln!("{}: {e}", o.syx.display());
-        std::process::exit(1)
-    });
+    let flash_image = o.flash.as_ref().filter(|_| !o.syx_given).and_then(|p| std::fs::read(p).ok());
+    let fw = match flash_image.as_ref().filter(|img| img.len() > dtemu::machine::FLASH_SLOT) {
+        Some(img) => Firmware::from_flash(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| {
+            eprintln!("{}: no OS in the flash: {e}", o.flash.as_ref().unwrap().display());
+            std::process::exit(1)
+        }),
+        None => Firmware::from_file(&o.syx).unwrap_or_else(|e| {
+            eprintln!("{}: {e}", o.syx.display());
+            std::process::exit(1)
+        }),
+    };
     let mut m = Machine::new(&fw, 128).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1)
     });
+    if let Some(p) = &o.flash {
+        match m.load_flash(p) {
+            Ok(true) => eprintln!("flash {}", p.display()),
+            Ok(false) => eprintln!("flash {}: new", p.display()),
+            Err(e) => {
+                eprintln!("--flash {e}");
+                std::process::exit(1)
+            }
+        }
+    }
     // The card first: a snapshot then brings its own sectors (the firmware's
     // cached view of the drive matches those) and keeps the image path.
     let mut image = None;
@@ -640,7 +686,7 @@ pub fn main() {
     // The same names as the output ports.
     let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let _midi_in = if ports { midi::start_in(tx.clone(), &format!("{pname} in"), false) } else { None };
-    let _usb_in = if ports && view.lock().unwrap().rytm { midi::start_in(tx.clone(), &format!("{pname} usb in"), true) } else { None };
+    let _usb_in = if ports && { let v = view.lock().unwrap(); v.rytm || v.a4 } { midi::start_in(tx.clone(), &format!("{pname} usb in"), true) } else { None };
     // --midi-from NAME: an existing MIDI source (a real Rytm, a keyboard) into
     // the DIN MIDI input, without a routing app.
     let _from = o.midi_from.as_deref().and_then(|n| midi::connect_from(tx.clone(), n));
@@ -923,7 +969,16 @@ fn run_window(o: &Opts, tx: mpsc::Sender<Ev>, view: Arc<Mutex<View>>, _quit: Arc
 /// Set when the image on disk is not the card the snapshot resumed with.
 static BACKUP_CARD: AtomicBool = AtomicBool::new(false);
 
+fn save_flash(m: &mut Machine, o: &Opts) {
+    if let Some(p) = &o.flash {
+        if let Err(e) = m.save_flash(p) {
+            eprintln!("--flash {e}");
+        }
+    }
+}
+
 fn save_card(m: &mut Machine, o: &Opts) {
+    save_flash(m, o);
     if let Some(c) = &o.card {
         let dirty = m.cpu.bus.io.esdhc.card.dirty;
         if dirty && BACKUP_CARD.swap(false, Ordering::Relaxed) && c.exists() {
@@ -971,8 +1026,29 @@ fn write_wav(path: &std::path::Path, s: &[f32]) {
 /// what the firmware sends comes out of "rytm-emu out".
 mod midi {
     use super::Ev;
+    #[cfg(unix)]
     use midir::os::unix::{VirtualInput, VirtualOutput};
     use std::sync::mpsc;
+
+    /// Windows has no virtual MIDI ports: the window opens existing ports by
+    /// name instead, which a loopback driver (loopMIDI, for one) provides.
+    /// The best match for `name`: the exact name, else the first port whose
+    /// name starts with it (Windows may number duplicates, "NAME 1").
+    #[cfg(not(unix))]
+    fn find_port<T: midir::MidiIO>(io: &T, name: &str) -> Option<T::Port> {
+        let ports = io.ports();
+        let names: Vec<String> = ports.iter().map(|p| io.port_name(p).unwrap_or_default()).collect();
+        let at = names.iter().position(|n| n.eq_ignore_ascii_case(name)).or_else(|| {
+            names.iter().position(|n| n.to_lowercase().starts_with(&name.to_lowercase()))
+        });
+        if at.is_none() {
+            eprintln!(
+                "midi: no port named \"{name}\" (have: {}); on Windows create it with a loopback driver such as loopMIDI",
+                if names.is_empty() { "none".to_string() } else { names.join(", ") }
+            );
+        }
+        at.map(|i| ports[i].clone())
+    }
 
     /// DTEMU_MIDI_LOG=FILE: every message through the virtual ports, both ways,
     /// with the time since the first one, appended to FILE.
@@ -988,15 +1064,37 @@ mod midi {
         }
     }
 
-    /// A virtual input port `name`; `usb`: its messages go to the USB MIDI port.
+    /// A virtual input port `name` (on Windows, the existing port `name`);
+    /// `usb`: its messages go to the USB MIDI port.
     pub fn start_in(tx: mpsc::Sender<Ev>, name: &str, usb: bool) -> Option<midir::MidiInputConnection<()>> {
         let mut input = midir::MidiInput::new("rytm-emu").map_err(|e| eprintln!("midi in: {e}")).ok()?;
         input.ignore(midir::Ignore::None); // SysEx, clock and active sensing too
-        match input.create_virtual(name, move |_, msg, _| {
-            let _ = tx.send(if usb { Ev::UsbMidi(msg.to_vec()) } else { Ev::Midi(msg.to_vec()) });
-        }, ()) {
+        // midir on Windows hands a long SysEx over in 1024-byte pieces (its
+        // WinMM buffers; elsewhere it arrives whole): put them back together
+        // so a piece without its F0 is not taken for stray data bytes.
+        let mut sysex: Vec<u8> = Vec::new();
+        let on_msg = move |_: u64, msg: &[u8], _: &mut ()| {
+            let whole = if msg.first() == Some(&0xF0) || !sysex.is_empty() && msg.first().is_some_and(|&b| b < 0x80) {
+                sysex.extend_from_slice(msg);
+                if sysex.last() != Some(&0xF7) {
+                    return;
+                }
+                std::mem::take(&mut sysex)
+            } else {
+                msg.to_vec()
+            };
+            let _ = tx.send(if usb { Ev::UsbMidi(whole) } else { Ev::Midi(whole) });
+        };
+        #[cfg(unix)]
+        let (conn, kind) = (input.create_virtual(name, on_msg, ()), "virtual input");
+        #[cfg(not(unix))]
+        let (conn, kind) = {
+            let port = find_port(&input, name)?;
+            (input.connect(&port, name, on_msg, ()), "input")
+        };
+        match conn {
             Ok(c) => {
-                eprintln!("midi: virtual input \"{name}\"");
+                eprintln!("midi: {kind} \"{name}\"");
                 Some(c)
             }
             Err(e) => {
@@ -1043,12 +1141,20 @@ mod midi {
     }
 
     impl Out {
-        /// A virtual output port `name`; `tag` labels it in DTEMU_MIDI_LOG.
+        /// A virtual output port `name` (on Windows, the existing port `name`);
+        /// `tag` labels it in DTEMU_MIDI_LOG.
         pub fn start(name: &str, tag: &'static str) -> Option<Out> {
             let out = midir::MidiOutput::new("rytm-emu").map_err(|e| eprintln!("midi out: {e}")).ok()?;
-            match out.create_virtual(name) {
+            #[cfg(unix)]
+            let (conn, kind) = (out.create_virtual(name), "virtual output");
+            #[cfg(not(unix))]
+            let (conn, kind) = {
+                let port = find_port(&out, name)?;
+                (out.connect(&port, name), "output")
+            };
+            match conn {
                 Ok(conn) => {
-                    eprintln!("midi: virtual output \"{name}\"");
+                    eprintln!("midi: {kind} \"{name}\"");
                     Some(Out { conn, tag, msg: Vec::new(), running: 0, sysex: false })
                 }
                 Err(e) => {

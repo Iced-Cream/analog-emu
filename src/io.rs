@@ -283,6 +283,12 @@ pub struct Io {
     /// plain memory.
     #[serde(skip)]
     pub epfr: u8,
+    /// The firmware wrote RCR's SOFTRST (0x80 to the byte at 0xEC090000), as
+    /// the OS upgrade does once the flash is written (Rytm MKII OS 1.74
+    /// `0x4009f53a`). `Machine::run_until` stops with `Stop::Reset`; what
+    /// happens next (a boot from the flash) is the tools' business.
+    #[serde(skip)]
+    pub reset_request: bool,
     /// Registers that read as a fixed value (status bits nothing else sets).
     pub forced: HashMap<u32, u32>,
     /// Ignore IMR masking, as the reference emulator effectively did.
@@ -379,6 +385,7 @@ impl Io {
             power_lost: false,
             supercap_flat: false,
             epfr: 0,
+            reset_request: false,
             forced,
             ignore_masks: false,
             trace_intc: std::env::var_os("DTEMU_TRACE_INTC").is_some(),
@@ -1320,6 +1327,12 @@ impl Io {
                 if let Some(t) = d.irq_at {
                     self.lower_deadline(t as f64);
                 }
+                false
+            }
+            0xEC09_0000 if a == 0xEC09_0000 && size == 1 && v & 0x80 != 0 => {
+                self.reset_request = true;
+                let now = self.now;
+                self.lower_deadline(now as f64);
                 false
             }
             0xEC09_4000 => {

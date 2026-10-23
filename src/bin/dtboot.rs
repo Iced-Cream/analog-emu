@@ -86,6 +86,20 @@ counts (suffixes k, M, G).
   --count ADDR         count visits to a PC (hex)
   --trace N            keep the last N PCs for fault reports
   --profile-after N    sample guest PCs from clock N on
+  --flash FILE         the SPI flash (MKII units, Syntakt) from FILE if it exists,
+                       written back at the end: what the OS wrote (an OS upgrade)
+                       persists. With no .syx given, boots the OS the flash holds.
+                       A host file only; nothing here reaches a unit
+  --usb-serial TEXT@AT  (implies --usb-host) the host as a serial (CDC ACM) device's
+                       driver, as the factory-test mode enumerates (--test-mode):
+                       TEXT and a newline on its data
+                       port at clock AT; what comes back is printed at the end
+  --test-mode          boot into the factory-test console (Rytm MKII, A4 MKII): the
+                       boot flag the bootstrap sets for its power-on key combo
+  --reboot             when the firmware resets (RCR SOFTRST, as at the end of an
+                       OS upgrade), boot again from the OS in the flash, keeping
+                       the flash and the card; events not yet due run on the new
+                       boot's clock. Without it the run ends at the reset
   --no-masks           ignore interrupt masks
 
 Environment:
@@ -103,6 +117,15 @@ Environment:
                        access error (interpreter only); listed as `strict:` lines
                        (DTEMU_STRICT=log: listed only, no fault)
 ";
+
+/// The flash holds no OS the emulator can boot: after an interrupted upgrade,
+/// a unit's bootstrap finds its check failing and offers its own OS upgrade
+/// (STARTUP MENU, `0x8000356c`); the emulator does not run the bootstrap.
+fn no_os_in_flash(e: &str) -> ! {
+    println!("the flash holds no bootable OS ({e}).");
+    println!("On a unit the bootstrap decides next: its check (0x8000214c, inferred to be the OS check) failing opens its STARTUP MENU with OS UPGRADE. The emulator does not run the bootstrap.");
+    std::process::exit(3);
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -140,6 +163,11 @@ fn main() {
     let mut dsp_wav: Option<String> = None;
     let mut card: Option<String> = None;
     let mut card_save = false;
+    let mut flash: Option<String> = None;
+    let mut flash_loaded: Option<Vec<u8>> = None;
+    let mut test_mode = false;
+    let mut serials: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut reboot = false;
     let mut power_off: Option<u64> = None;
     let mut pcm: Vec<i32> = Vec::new();
     let mut presses: Vec<(String, u64, u64)> = Vec::new();
@@ -247,6 +275,20 @@ fn main() {
             "--dsp-wav" => dsp_wav = it.next().cloned(),
             "--card" => card = it.next().cloned(),
             "--card-save" => card_save = true,
+            "--flash" => flash = it.next().cloned(),
+            "--usb-serial" => {
+                // TEXT@CLOCK: a line to the serial device; a newline ends it.
+                let v = it.next().unwrap();
+                let (what, at) = v.rsplit_once('@').unwrap();
+                let mut b = what.as_bytes().to_vec();
+                if !b.ends_with(b"\n") {
+                    b.push(b'\n');
+                }
+                serials.push((b, num(at)));
+                usb_host = true;
+            }
+            "--reboot" => reboot = true,
+            "--test-mode" => test_mode = true,
             "--power-off" => power_off = Some(num(it.next().unwrap())),
             "--usb-midi-real" => usb_midi_real = true,
             "--usb-host-sleep" | "--usb-host-noread" => {
@@ -297,9 +339,28 @@ fn main() {
             _ => syx = Some(a.clone()),
         }
     }
-    let syx = syx.unwrap_or_else(|| "fw/Digitakt_OS1.53.syx".into());
-    let fw = Firmware::from_file(std::path::Path::new(&syx)).unwrap();
-    let mut m = Machine::new(&fw, 128).unwrap();
+    // --flash FILE without a .syx: boot the OS the flash holds, as a unit does.
+    let flash_image = flash.as_ref().and_then(|p| std::fs::read(p).ok());
+    let fw = match (&syx, &flash_image) {
+        (None, Some(img)) if img.len() > dtemu::machine::FLASH_SLOT => {
+            let fw = Firmware::from_flash(&img[dtemu::machine::FLASH_SLOT..]).unwrap_or_else(|e| no_os_in_flash(&e.to_string()));
+            println!("booting the OS in the flash: build {} version {}", fw.build, fw.version);
+            fw
+        }
+        _ => {
+            let syx = syx.clone().unwrap_or_else(|| "fw/Digitakt_OS1.53.syx".into());
+            Firmware::from_file(std::path::Path::new(&syx)).unwrap()
+        }
+    };
+    if let (Some(_), Some(img)) = (&syx, &flash_image) {
+        let c = &fw.container;
+        let at = dtemu::machine::FLASH_SLOT;
+        if img.len() >= at + c.len() && img[at..at + c.len()] != c[..] {
+            println!("note: the flash holds a different OS from the .syx; this run boots the .syx's (leave the .syx out to boot the flash's)");
+        }
+    }
+    let booting_flash = syx.is_none() && flash_image.is_some();
+    let mut m = Machine::new(&fw, 128).unwrap_or_else(|e| if booting_flash { no_os_in_flash(&e) } else { panic!("{e}") });
     if let Some(i) = ips {
         m.cpu.bus.io.ips = i as f64;
     }
@@ -330,6 +391,22 @@ fn main() {
         m.cpu.bus.watch = Some((o, o + n));
         m.cpu.bus.watch_reads = true;
     }
+    if test_mode {
+        match m.set_test_mode() {
+            Some(f) => println!("test mode: boot flag 0x{f:x}"),
+            None => println!("test mode: not known for {}", m.prof.name),
+        }
+    }
+    if let Some(p) = &flash {
+        match m.load_flash(std::path::Path::new(p)) {
+            Ok(true) => {
+                println!("flash {p}: loaded");
+                flash_loaded = m.cpu.bus.spi.as_ref().map(|f| f.mem.clone());
+            }
+            Ok(false) => println!("flash {p}: new (built from the .syx)"),
+            Err(e) => panic!("--flash {e}"),
+        }
+    }
     if let Some(p) = &card {
         let fresh = m.attach_card(std::path::Path::new(p)).unwrap();
         println!("card {p}: {} sectors in use{}", m.cpu.bus.io.esdhc.card.sectors.len(), if fresh { " (new, sample area formatted)" } else { "" });
@@ -337,6 +414,13 @@ fn main() {
     if let Some(p) = &load {
         dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
         println!("restored {p} at clock {}", m.now());
+        // A snapshot carries its own flash (an older one does not, and leaves
+        // the file's): say so when it replaced a different --flash file.
+        if let (Some(before), Some(f)) = (&flash_loaded, m.cpu.bus.spi.as_ref()) {
+            if *before != f.mem {
+                println!("note: the snapshot's flash differs from --flash's file; running the snapshot's, which is written back to the file at the end");
+            }
+        }
         instr += m.now();
     }
     // --ob-in FILE.wav[:CH]: a 16-bit WAV's first channel as Overbridge input
@@ -357,6 +441,7 @@ fn main() {
         let mut h = dtemu::usbhost::UsbHost::new();
         h.suspend = usb_sleep;
         h.midi_sleep = usb_noread;
+        h.cdc = !serials.is_empty();
         m.usb_host = Some(h);
     }
     if usb_midi_real {
@@ -381,10 +466,13 @@ fn main() {
         m.cpu.bus.poke32(a, x);
     }
     let t0 = Instant::now();
-    let (clock0, idle0) = (m.now(), m.stats.idle_skipped);
+    let (mut clock0, mut idle0) = (m.now(), m.stats.idle_skipped);
     let mut logged = 0;
     let mut target = m.now();
     while target < instr {
+        // Events in [from, target): run_until can overshoot a chunk's end, so an
+        // event on the boundary would otherwise fall between two chunks.
+        let from = target;
         target = (target + every).min(instr);
         if let Some(pa) = profile_after {
             if m.now() >= pa && m.cpu.profile.is_none() {
@@ -414,6 +502,9 @@ fn main() {
         for (i, n) in nudges.iter().enumerate() {
             events.push((n.0, 6, i, 0));
         }
+        for (i, (_, at)) in serials.iter().enumerate() {
+            events.push((*at, 8, i, 0));
+        }
         if let Some(at) = power_off {
             events.push((at, 7, 0, 0));
         }
@@ -422,11 +513,11 @@ fn main() {
         let mut early: Option<Stop> = None;
         let mut powered_off = false;
         for (at, kind, code, d) in events {
-            if at < m.now() || at >= target {
+            if at < from || at >= target {
                 continue;
             }
             let s = m.run_until(at);
-            if matches!(s, Stop::Hook(_) | Stop::Fault(..)) {
+            if matches!(s, Stop::Hook(_) | Stop::Fault(..) | Stop::Reset) {
                 early = Some(s);
                 break;
             }
@@ -442,12 +533,22 @@ fn main() {
                     if r.slots[1] { "valid" } else { "-" },
                     if matches!(r.stop, Stop::Fault(..)) { format!(" ({:?})", r.stop) } else { String::new() }
                 );
+                if let Some(c) = &r.flash_cut {
+                    println!("[{:>12}] power off: flash {c}", m.now());
+                }
                 if card.is_some() {
                     card_save = true;
                 }
                 early = Some(r.stop);
                 powered_off = true;
                 break;
+            }
+            if kind == 8 {
+                if let Some(h) = m.usb_host.as_mut() {
+                    h.cdc_to_device.extend(serials[code].0.iter().copied());
+                }
+                println!("[{:>12}] usb serial out: {:?}", m.now(), String::from_utf8_lossy(&serials[code].0));
+                continue;
             }
             if kind == 6 {
                 let (_, e, d, func, big) = nudges[code];
@@ -597,6 +698,47 @@ fn main() {
             println!("STOPPED with nothing to wake it at pc=0x{:08x}", m.cpu.pc);
             break;
         }
+        if let Stop::Reset = stop {
+            let at = m.now();
+            println!("[{at:>12}] reset (RCR SOFTRST) at pc=0x{:08x}", m.cpu.pc);
+            if let Some(f) = m.cpu.bus.spi.as_ref() {
+                println!("{}", f.summary());
+            }
+            if !reboot {
+                break;
+            }
+            match m.reboot_from_flash() {
+                Ok(name) => {
+                    println!("[{at:>12}] rebooting from the flash: {name}");
+                    // The new machine starts without the tools' attachments.
+                    if usb_host {
+                        let mut h = dtemu::usbhost::UsbHost::new();
+                        h.suspend = usb_sleep;
+                        h.midi_sleep = usb_noread;
+                        h.cdc = !serials.is_empty();
+                        m.usb_host = Some(h);
+                    }
+                }
+                Err(e) => {
+                    println!("cannot reboot: {e}");
+                    break;
+                }
+            }
+            // The new boot's clock starts at 0: what was due is done.
+            presses.retain(|p| p.1 > at);
+            turns.retain(|t| t.0 > at);
+            raws.retain(|r| r.1 > at);
+            midis.retain(|x| x.1 > at);
+            usb_midis.retain(|x| x.1 > at);
+            nudges.retain(|n| n.0 > at);
+            serials.retain(|x| x.1 > at);
+            power_off = power_off.filter(|&t| t > at);
+            instr -= at.min(instr);
+            target = 0;
+            (clock0, idle0) = (0, 0);
+            logged = 0;
+            continue;
+        }
         if powered_off {
             break;
         }
@@ -624,6 +766,13 @@ fn main() {
         let peak = pcm.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
         let nz = pcm.iter().filter(|&&x| x != 0).count();
         println!("wrote {p}: {} frames, peak {peak} (of 8388607), {nz} nonzero samples", pcm.len() / 2);
+    }
+    if let Some(p) = &flash {
+        if let Some(f) = m.cpu.bus.spi.as_ref() {
+            println!("{}", f.summary());
+        }
+        m.save_flash(std::path::Path::new(p)).expect("--flash");
+        println!("flash written back to {p}");
     }
     if card_save {
         m.cpu.bus.io.esdhc.card.dirty = true;
@@ -664,6 +813,9 @@ fn main() {
         }
     }
     if let Some(h) = &m.usb_host {
+        if h.cdc {
+            println!("usb serial in ({} bytes):\n{}", h.cdc_from_device.len(), String::from_utf8_lossy(&h.cdc_from_device));
+        }
         println!("usb host: streaming={} {:?}", h.streaming(), h.stats);
         println!("usb host: device descriptor {:02x?}", h.device_desc);
         println!("usb host: configuration ({} bytes) {:02x?}", h.config_desc.len(), h.config_desc);
