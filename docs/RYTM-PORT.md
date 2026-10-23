@@ -550,6 +550,40 @@ as `R` messages (oblink.rs). Open: the MAIN return's level in the analog model
 (a loop of MAIN came back about 18 dB down); the USB MIDI interface in
 Overbridge mode is still the high-level hook.
 
+## Overbridge link: hello, MIDI pair, voice frames (2026-10-14)
+
+The TCP link (`--ob-link [ADDR]`, oblink.rs; the header has the full message list) gets an opt-in hello, for the
+rytm-teensy Pi engine as host:
+
+| message | direction | meaning |
+|---|---|---|
+| `H` + version 1 + flags | host -> emulator | bit 0 the MIDI pair, bit 1 no `R` frames, bit 2 `a` frames |
+| `H` + 1 + granted | emulator -> host | the answer (unknown bits are not granted) |
+| `M` + u16 LE len + bytes | both, after bit 0 | to the host: the Rytm's USB MIDI output as it comes (the same bytes as the window's "usb out" port); from the host: MIDI into the Rytm's USB MIDI input, a byte stream (a SysEx up to 64 KB, or a running status, may span `M` messages; a longer SysEx is dropped and counted) |
+| `a` + u32 LE n + n x 8 x i16 LE | host -> emulator, after bit 2 | the 8 voices in physical order, voice v on channel `VOICE_CH[v]` = {4,7,5,8,10,9,11,6} as v << 16, the rest 0 |
+
+- Old hosts never send `H` and get exactly the earlier stream (first `N` 512, `N`/`T`/`P`/`R`, `A`): obhost.py,
+  teensy_bridge.py, the Teensy. An `M` or `a` without its grant, or an `A`/`a` of more than 65536 frames, drops the
+  connection. Each connection has its own writer, so a new host gets every message and nothing queued for an
+  earlier host (messages while no host is connected are dropped).
+- `--ob-link 0.0.0.0:7301` serves a host on the LAN (e.g. the Pi on a direct cable).
+- The newest host wins: a new connection closes the one before, so a stalled or dead host (a pulled cable, no FIN)
+  never holds the link; the Pi engine reconnects every 2 s. A host that stops reading is dropped after 5 s of a
+  blocked write (its writer closes the socket, so its reader ends too). No read timeout: a paused emulator asks for
+  nothing, and a live host may then send nothing. The `H` answer is queued before the grant takes effect, so no `M`
+  comes ahead of it; an `R` queued before a no-`R` hello may still arrive just after the answer.
+- The host's MIDI in flight is bounded by bytes too (256 KB, besides 4096 batches), and machine.rs gives it to the
+  Rytm only while the USB MIDI input (`io.usb_in`) holds less than 64 KB; past that it waits in the link, and what
+  does not fit there is dropped and counted (`dropped: ... N midi msgs (B B)` in the link report).
+- The link report: the window prints it every 10 s on stderr, dtboot at exit:
+  `overbridge link: host connected, flags 0x7, frames short N, usb OUT frames short M, midi to host X B, from host Y B`.
+- The underrun counters: `frames short` (`ObLink::underruns`) counts the frames a mix block needed from a
+  connected host and did not have (the stand-in path, without a streaming USB host); `usb OUT frames short`
+  (`UsbStats::out_underruns`, with `--usb-host`) the OUT frames sent as silence because the link had none.
+Checked (2026-10-15, the mod build AR173_us_us1 cold-booted headless, rytm-teensy sim/emu_link.py): hello answered
+0x7, the mods' 0x19 reports arrive as `M`, 919328 frames served in 20 s, frames short 0 while the host was
+connected, `from host 7 B` for one message sent in; obhost.py (no hello) unchanged, flags 0x0.
+
 ## Strict memory and the real USB MIDI sender (2026-10-09)
 
 For the rytm-mods pre-hardware review (rytm-mods docs/REVIEW-2026-10-09.md,
@@ -571,10 +605,7 @@ other absolute references below 0x1000 in code [inferred from objdump]. So
 stock reads and writes address 0 legitimately - whatever answers there on
 hardware (FlexBus?) is not known. Stock 1.73 and rytm-mods lp3n both cold-boot
 and run every scenario clean under `DTEMU_STRICT=1`; under `=log` the two
-builds' sets of (pc, page, read/write) are identical (rytm-mods review, item 4). The page-0
-list is per build (`Profile::strict_page0_pcs`): OS 1.74's is the same fifteen
-instructions, found in that image at +0x6c (the first twelve) and +0x1cc (the
-last three) [measured]; stock 1.74 cold-boots clean under `DTEMU_STRICT=1`.
+builds' sets of (pc, page, read/write) are identical (rytm-mods review, item 4).
 
 **The real USB MIDI sender** (`dtboot --usb-midi-real`, `DTEMU_USB_MIDI_REAL=1`;
 needs `--usb-host`): the sender (0x400029e0), short sender (0x40002934) and
@@ -616,6 +647,15 @@ whole unit frozen. The fixed build (5e8f37a, lp3n) ran the same 4 minutes
 (reading 20 s, not reading 80 s, suspended 60 s, reading 80 s) with no blocking
 wait; the pool drained to empty while the host did not read and came back to
 its 27 free when it read again (5 stay out: the receive requests 0x4000246e keeps queued [inferred]).
+
+## Cache model (2026-10-16)
+
+`DTEMU_CACHE=1` (`=log` prints stale fetches) models the V4 I- and D-caches on
+the interpreter: copyback DDR per ACR0, I-cache filled from memory, `cpushl` by
+set/way, CACR invalidates. A mod that writes code and runs it without push and
+invalidate runs the old code there, as on the device. Stock 1.73 cold boot and
+play are byte-identical to the interpreter with 0 stale fetches; about 55-62
+MIPS. Details and the loader's flush loop: docs/CACHE.md.
 
 ## Power-off and the working state (2026-10-09)
 

@@ -192,7 +192,7 @@ fn parse() -> Opts {
                      \x20       {pad}[--audio-in audio|ext|both]  (the Mac's default input into AUDIO IN / EXT IN)\n\
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
                      \x20       {pad}[--usb-wav FILE]  (record the USB audio stream: MAIN, 8 voices, AUDIO IN; 12 ch)\n\
-                     \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301)\n\
+                     \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301; 0.0.0.0:7301 for a host on the LAN)\n\
                      \x20       {pad}[--flash FILE]  (the SPI flash, kept in FILE: an OS upgrade over USB MIDI persists;\n\
                      \x20       {pad}                 with no FIRMWARE named, the OS in it boots)\n\n\
                      Defaults: FIRMWARE {fw}, --card {card}.\n\
@@ -251,6 +251,7 @@ fn emulate(
     let mut emu0 = m.now();
     let mut last_pub = Instant::now();
     let mut last_speed = (Instant::now(), m.now());
+    let mut link_report = Instant::now();
     let mut speed = 0.0;
     let mut phase = 0.0f64;
     while !quit.load(Ordering::Relaxed) {
@@ -340,6 +341,12 @@ fn emulate(
             t0 = Instant::now();
             emu0 = m.now();
             last_speed = (Instant::now(), m.now());
+        }
+        if link_report.elapsed() >= Duration::from_secs(10) {
+            link_report = Instant::now();
+            if let Some(s) = m.ob_link_report() {
+                eprintln!("{s}");
+            }
         }
         if let Some(uo) = usb_out.as_mut() {
             let bytes: Vec<u8> = m.cpu.bus.io.usb_midi_out.drain(..).collect();

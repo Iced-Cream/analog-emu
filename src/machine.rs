@@ -97,6 +97,8 @@ pub struct Machine {
     pub breakpoints: Vec<u32>,
     /// Hit counters: address -> count.
     pub counters: Vec<(u32, u64)>,
+    /// A buddy-allocator low-water probe (`add_heap_probe`).
+    pub heap_probe: Option<HeapProbe>,
     /// The force a pad press reports (0..255; the OS ignores 10 and below).
     pub pad_force: u8,
     /// While the idle task is posting a USB MIDI message (`feed_usb_midi`): its
@@ -178,7 +180,11 @@ impl Machine {
             bus.codec = Some(Default::default());
         }
         bus.poke_bytes(MAIN_LOAD, &os.data);
-        if std::env::var_os("DTEMU_NO_ICACHE").is_none() {
+        // DTEMU_CACHE=1 (or =log): the I- and D-cache model (cache.rs). It
+        // runs on the interpreter alone, without predecoded blocks.
+        bus.cache = crate::cache::Caches::from_env().map(Box::new);
+        let cached = bus.cache.is_some();
+        if std::env::var_os("DTEMU_NO_ICACHE").is_none() && !cached {
             bus.icache_enable(os.data.len() as u32);
         }
         // DTEMU_STRICT=1: unmapped pages and the SRAM mirror fault (bus.rs). It
@@ -187,11 +193,10 @@ impl Machine {
         let strict = !strict_env.is_empty() && strict_env != "0";
         bus.set_strict(strict);
         bus.strict_raise = strict_env != "log";
-        bus.strict_page0_pcs = prof.strict_page0_pcs;
         let mut cpu = Cpu::new(bus);
         // The block compiler, on its own thread (DTEMU_JIT_SYNC=1: in line;
         // DTEMU_NO_JIT=1: the interpreter alone).
-        if std::env::var_os("DTEMU_NO_JIT").is_none() && !strict {
+        if std::env::var_os("DTEMU_NO_JIT").is_none() && !strict && !cached {
             if std::env::var_os("DTEMU_JIT_SYNC").is_some() {
                 cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
             } else {
@@ -223,6 +228,7 @@ impl Machine {
             log: Vec::new(),
             breakpoints: Vec::new(),
             counters: Vec::new(),
+            heap_probe: None,
             pad_force: 100,
             usb_call: None,
             usb_audio_last: None,
@@ -665,7 +671,7 @@ impl Machine {
 
     fn install_hooks(&mut self) {
         let p = self.prof.clone();
-        for a in [p.flash_read, p.task_create, p.intro_done, p.panel_diff, p.abort_loop, p.mainloop, p.sysex_send, p.usb_midi_send, p.usb_midi_send_short, p.usb_audio_copy, p.voice_output_mix] {
+        for a in [p.flash_read, p.task_create, p.intro_done, p.panel_diff, p.abort_loop, p.mainloop, p.sysex_send, p.usb_midi_send, p.usb_midi_send_short, p.usb_audio_copy, p.voice_output_mix, p.voice_frame_sent] {
             if a == 0 {
                 continue; // not found in this image
             }
@@ -720,6 +726,55 @@ impl Machine {
     pub fn add_counter(&mut self, pc: u32) {
         self.counters.push((pc, 0));
         self.cpu.set_hook(pc, true);
+    }
+
+    /// Watch a binary buddy allocator's free bytes: at each PC in `pcs`
+    /// (points where the caller holds the allocator's lock), walk its free
+    /// lists and keep the lowest total. `state`: +4 the arena base, +12 the
+    /// free-list heads by order (unit indices, -1 none), +16 the top order,
+    /// +24 the live allocations; a free block's next index is at +8; units
+    /// are 16 bytes. Addresses come from the caller (per build).
+    pub fn add_heap_probe(&mut self, state: u32, pcs: Vec<u32>) {
+        for &pc in &pcs {
+            self.cpu.set_hook(pc, true);
+        }
+        self.heap_probe = Some(HeapProbe { state, pcs, min_free: u64::MAX, min_at: 0, min_live: 0, max_live: 0, samples: 0 });
+    }
+
+    /// The allocator's free bytes and live allocations now (None before it is set up).
+    pub fn heap_free(&self, state: u32) -> Option<(u64, u32)> {
+        let b = &self.cpu.bus;
+        if b.peek32(state) == 0 {
+            return None;
+        }
+        let base = b.peek32(state + 4);
+        let heads = b.peek32(state + 12);
+        let top = b.peek32(state + 16).min(31);
+        let mut free = 0u64;
+        for k in 0..=top {
+            let mut u = b.peek32(heads + 4 * k);
+            let mut n = 0;
+            while u != u32::MAX && n < 1_000_000 {
+                free += 16u64 << k;
+                u = b.peek32(base.wrapping_add(u << 4) + 8);
+                n += 1;
+            }
+        }
+        Some((free, b.peek32(state + 24)))
+    }
+
+    fn heap_sample(&mut self) {
+        let state = self.heap_probe.as_ref().unwrap().state;
+        let Some((free, live)) = self.heap_free(state) else { return };
+        let now = self.now();
+        let h = self.heap_probe.as_mut().unwrap();
+        h.samples += 1;
+        h.max_live = h.max_live.max(live);
+        if free < h.min_free {
+            h.min_free = free;
+            h.min_at = now;
+            h.min_live = live;
+        }
     }
 
     /// The SPI flash image (spiflash.rs). Panics on an MKI unit, whose flash
@@ -1048,14 +1103,54 @@ impl Machine {
             self.stats.mainloop += 1;
             return true;
         }
+        if pc == p.voice_frame_sent {
+            // The sender's frame argument (sp + 24 past its lea and moveml) is the voices' frame: latch what went out.
+            let arg = self.cpu.bus.peek32(self.cpu.a[7].wrapping_add(24));
+            if let Some(an) = self.cpu.bus.analog.as_ref() {
+                if arg == an.frame_addr {
+                    let v = self.cpu.bus.peek_bytes(arg, crate::analog::FRAME_LEN);
+                    self.cpu.bus.analog_sent = Some(v);
+                }
+            }
+            return true;
+        }
         if pc == p.voice_output_mix {
             // The Overbridge input: this block's 32 frames into the half of the
             // double buffer the mix reads now (the firmware prepared it, with
             // zeros when no host sends).
             if let Some(l) = self.ob_link.as_mut() {
                 l.poll(&mut self.ob_in);
+                // Only while the USB MIDI input is short of USB_IN_HELD bytes (a Rytm not taking it leaves the
+                // rest in the link's bounded queue); without a queue all of it, dropped below.
+                let room = if p.usb_midi_queue != 0 {
+                    let held: usize = self.cpu.bus.io.usb_in.iter().map(Vec::len).sum();
+                    crate::oblink::USB_IN_HELD.saturating_sub(held)
+                } else {
+                    usize::MAX
+                };
+                let m = l.take_midi(room);
+                // The host's MIDI into the Rytm's USB MIDI input, as `Machine::usb_midi_send` (the window's "usb
+                // in" port) does, with or without a simulated USB host: usbhost.rs reads the MIDI streaming
+                // interface's bulk IN (0x81) only and models no MIDI OUT endpoint, so the OS's USB MIDI queue is
+                // the one way in either way.
+                if !m.is_empty() {
+                    if p.usb_midi_queue != 0 {
+                        self.cpu.bus.io.usb_midi_send(&m);
+                    } else if !l.midi_unrouted_logged {
+                        l.midi_unrouted_logged = true;
+                        eprintln!("overbridge link: host MIDI dropped: this build's profile has no USB MIDI queue (logged once)");
+                    }
+                }
             }
             let usb_streaming = self.usb_host.as_ref().is_some_and(|h| h.streaming());
+            // Frames this block needs that the link's host has not sent (a whole block when none came).
+            if !usb_streaming && self.ob_in.len() < 32 {
+                if let Some(l) = self.ob_link.as_mut() {
+                    if l.connected {
+                        l.underruns += 32 - self.ob_in.len() as u64;
+                    }
+                }
+            }
             // Without a USB host streaming, the stand-in writes the link's frames
             // straight into the firmware's input ring.
             if !usb_streaming && !self.ob_in.is_empty() {
@@ -1090,7 +1185,7 @@ impl Machine {
             let bus = &self.cpu.bus;
             let (len, ptr) = (bus.peek32(sp + 4), bus.peek32(sp + 8));
             let bytes = bus.peek_bytes(ptr, len.min(4096) as usize);
-            self.cpu.bus.io.usb_midi_out.extend(bytes);
+            self.usb_out(&bytes);
             self.cpu.pc = self.cpu.bus.peek32(sp);
             self.cpu.a[7] = sp + 4;
             return false;
@@ -1105,7 +1200,7 @@ impl Machine {
                 let (buf, len) = (bus.peek32(sp + 4), bus.peek32(sp + 8));
                 let bytes = bus.peek_bytes(buf, len.min(1 << 20) as usize);
                 self.cpu.bus.io.midi_out.extend(bytes.iter().copied());
-                self.cpu.bus.io.usb_midi_out.extend(bytes);
+                self.usb_out(&bytes);
                 self.cpu.d[0] = 1;
                 self.cpu.pc = self.cpu.bus.peek32(sp);
                 self.cpu.a[7] = sp + 4;
@@ -1130,9 +1225,7 @@ impl Machine {
         for _ in 0..n {
             h.microframe(&mut self.cpu.bus, &mut self.ob_in);
         }
-        if !h.midi_out.is_empty() {
-            self.cpu.bus.io.usb_midi_out.extend(h.midi_out.drain(..));
-        }
+        let midi: Vec<u8> = h.midi_out.drain(..).collect();
         // The Rytm's outputs go to the link's host; without one they are dropped.
         if let Some(l) = self.ob_link.as_ref() {
             if h.from_rytm.len() >= 32 {
@@ -1140,6 +1233,40 @@ impl Machine {
                 l.send_rytm(&v);
             }
         }
+        if !midi.is_empty() {
+            self.usb_out(&midi);
+        }
+    }
+
+    /// The Rytm's USB MIDI output: to `io.usb_midi_out` (the window's "usb out" port, dtboot's dump) and, when the
+    /// Overbridge link's host asked for it (oblink.rs HELLO_MIDI), to that host as well.
+    fn usb_out(&mut self, bytes: &[u8]) {
+        self.cpu.bus.io.usb_midi_out.extend(bytes.iter().copied());
+        if let Some(l) = self.ob_link.as_ref() {
+            l.send_midi(bytes);
+        }
+    }
+
+    /// The Overbridge link's state for a log line (None without a link).
+    pub fn ob_link_report(&self) -> Option<String> {
+        let l = self.ob_link.as_ref()?;
+        let (to, from) = l.midi_counts();
+        let usb = self.usb_host.as_ref().map(|h| format!(", usb OUT frames short {}", h.stats.out_underruns)).unwrap_or_default();
+        let d = l.dropped();
+        let dropped = if d == crate::oblink::Dropped::default() {
+            String::new()
+        } else {
+            format!(
+                ", dropped: to host {} msgs, from host {} frames, {} midi msgs ({} B)",
+                d.to_host, d.frames, d.midi, d.midi_bytes
+            )
+        };
+        Some(format!(
+            "overbridge link: host {}, flags {:#x}, frames short {}{usb}, midi to host {to} B, from host {from} B{dropped}",
+            if l.connected { "connected" } else { "none" },
+            l.granted(),
+            l.underruns
+        ))
     }
 
     pub fn run_until(&mut self, until: u64) -> Stop {
@@ -1392,6 +1519,9 @@ impl Machine {
                         if c.0 == pc {
                             c.1 += 1;
                         }
+                    }
+                    if self.heap_probe.as_ref().is_some_and(|h| h.pcs.contains(&pc)) {
+                        self.heap_sample();
                     }
                     if self.on_hook(pc, until) {
                         self.cpu.skip_hook = Some(pc);
@@ -1864,4 +1994,15 @@ impl Machine {
     pub fn lit(buf: &[u8]) -> usize {
         buf.iter().map(|b| b.count_ones() as usize).sum()
     }
+}
+
+/// State of `Machine::add_heap_probe`.
+pub struct HeapProbe {
+    pub state: u32,
+    pub pcs: Vec<u32>,
+    pub min_free: u64,
+    pub min_at: u64,
+    pub min_live: u32,
+    pub max_live: u32,
+    pub samples: u64,
 }
