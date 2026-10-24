@@ -46,6 +46,20 @@ impl Device {
     /// `0x401006ee`, bootstrap `0x80000ac4`), 0x20 on the A4 MKII (1.56 main
     /// `0x40105fb6`, where 0x40 means no UI; bootstrap offset 0x832) [read
     /// from the code]. None where it was not looked for.
+    /// The boot flags MAIN OS gets from the bootstrap on a normal power-on
+    /// (`DTEMU_BOOT_FLAGS=HEX` overrides). The A4 MKII's bootstrap (1.56,
+    /// `0x80000be8..0x80000c4c`) builds them from a PLL timeout (bit 17), the
+    /// FPGA load's status (bits 12-14) and a board pin (bit 21) and never sets
+    /// bit 20, which its OS reads as an Analog Keys (31 tests; the unit's
+    /// name, `0x400f6d80`, and the KBD calibration): 0, as a unit that names
+    /// itself "Analog Four" [read from the code]. The others keep BOOT_FLAGS.
+    pub fn boot_flags(self) -> u32 {
+        match self {
+            Device::A4Mk2 => 0,
+            _ => crate::machine::BOOT_FLAGS,
+        }
+    }
+
     pub fn test_mode_flag(self) -> Option<u32> {
         match self {
             Device::RytmMk2 => Some(0x40),
