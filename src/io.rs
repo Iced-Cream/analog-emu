@@ -3,7 +3,9 @@
 //! Time is the CPU's instruction count (`now`). Peripheral clocks convert
 //! through `ips`, emulated instructions per emulated second, against the
 //! 132 MHz bus clock the reference established from three independent PIT
-//! rates landing on round numbers (50 Hz, 59.998 Hz, 14.9996 Hz).
+//! rates landing on round numbers (100 Hz, 119.996 Hz, 29.999 Hz). The PIT
+//! counts the bus clock divided by 2^PRE: on a Rytm MKII running OS 1.74 the
+//! UI tick driven by PIT2 was measured at 119.99 Hz over 416 s.
 //!
 //! Interrupt lines are level-sensitive, as on the silicon: a source stays
 //! asserted until the firmware's handler clears the flag that raised it.
@@ -571,7 +573,7 @@ impl Io {
     // -- PIT ---------------------------------------------------------------
 
     fn pit_tick(&self, ch: usize) -> f64 {
-        let pre = 1u32 << (((self.pit[ch].pcsr >> 8) & 0xF) + 1);
+        let pre = 1u32 << ((self.pit[ch].pcsr >> 8) & 0xF);
         self.cyc(pre as f64)
     }
 
