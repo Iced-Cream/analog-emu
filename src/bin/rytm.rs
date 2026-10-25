@@ -105,6 +105,8 @@ struct Opts {
     /// --usb-midi-tcp ADDR: the USB MIDI port as a raw MIDI byte stream over TCP (usbtcp), for
     /// tools on a host without virtual MIDI ports (Windows), and one address per emulator.
     usb_midi_tcp: Option<String>,
+    /// --din-midi-tcp ADDR: the DIN MIDI port the same way (miditcp), in at the line's rate.
+    din_midi_tcp: Option<String>,
     /// --power-off: closing the window switches the Rytm off (Machine::power_off):
     /// the firmware saves its working state to the card, which is written
     /// back; no snapshot is saved, so the next start is a cold boot from it.
@@ -136,6 +138,7 @@ fn parse() -> Opts {
         ob_link: None,
         usb_host: false,
         usb_midi_tcp: None,
+        din_midi_tcp: None,
         power_off: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -150,6 +153,7 @@ fn parse() -> Opts {
             "--usb-wav" => o.usb_wav = it.next().map(PathBuf::from),
             "--usb-host" => o.usb_host = true,
             "--usb-midi-tcp" => o.usb_midi_tcp = it.next().cloned(),
+            "--din-midi-tcp" => o.din_midi_tcp = it.next().cloned(),
             "--ob-link" => {
                 let next = it.clone().next().filter(|a| !a.starts_with("--")).cloned();
                 if next.is_some() {
@@ -200,6 +204,7 @@ fn parse() -> Opts {
                      \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301; 0.0.0.0:7301 for a host on the LAN)\n\
                      \x20       {pad}[--usb-midi-tcp ADDR]  (the USB MIDI port as a raw MIDI byte stream over TCP, e.g. 127.0.0.1:7321;\n\
                      \x20       {pad}                        headless too; one client at a time, the newest)\n\
+                     \x20       {pad}[--din-midi-tcp ADDR]  (the DIN MIDI port the same way, e.g. 127.0.0.1:7322)\n\
                      \x20       {pad}[--flash FILE]  (the SPI flash, kept in FILE: an OS upgrade over USB MIDI persists;\n\
                      \x20       {pad}                 with no FIRMWARE named, the OS in it boots)\n\n\
                      Defaults: FIRMWARE {fw}, --card {card}.\n\
@@ -359,13 +364,12 @@ fn emulate(
         if let Some(uo) = usb_out.as_mut() {
             uo.send(&bytes);
         }
-        usbtcp::send(&bytes);
+        miditcp::USB.send(&bytes);
+        let bytes: Vec<u8> = m.cpu.bus.io.midi_out.drain(..).collect();
         if let Some(mo) = midi_out.as_mut() {
-            let bytes: Vec<u8> = m.cpu.bus.io.midi_out.drain(..).collect();
             mo.send(&bytes);
-        } else {
-            m.cpu.bus.io.midi_out.clear();
         }
+        miditcp::DIN.send(&bytes);
         let frame_words = m.ssi_frame_words();
         // Audio out: 24-bit samples, stereo, at the SSI's 48 kHz.
         let out = &mut m.cpu.bus.io.ssi.out;
@@ -706,10 +710,13 @@ pub fn main() {
     if let Some(addr) = &o.usb_midi_tcp {
         let usb = { let v = view.lock().unwrap(); v.rytm || v.a4 };
         if usb {
-            usbtcp::start(addr, tx.clone());
+            miditcp::USB.start(addr, tx.clone());
         } else {
             eprintln!("usb midi tcp: this device has no USB MIDI port here");
         }
+    }
+    if let Some(addr) = &o.din_midi_tcp {
+        miditcp::DIN.start(addr, tx.clone());
     }
     let opts = Arc::new(o);
     let th = {
@@ -1042,42 +1049,62 @@ fn write_wav(path: &std::path::Path, s: &[f32]) {
     let _ = std::fs::write(path, f);
 }
 
-/// The virtual MIDI ports: the DIN MIDI port of the emulated machine, as seen
-/// from the host. Messages from "rytm-emu in" go to the firmware's MIDI input;
-/// what the firmware sends comes out of "rytm-emu out".
-/// The USB MIDI port over TCP (--usb-midi-tcp): a raw MIDI byte stream both ways, no framing.
-/// One client at a time: a new connection replaces the one before (a dead client never holds
-/// the port). What arrives goes to the USB MIDI input as whole messages, as the "usb in" port
-/// delivers them; the USB MIDI output goes to the client as it comes, or nowhere without one.
-mod usbtcp {
+/// The MIDI ports over TCP (--usb-midi-tcp, --din-midi-tcp): a raw MIDI byte stream both ways,
+/// no framing. One client at a time: a new connection replaces the one before (a dead client
+/// never holds the port). What arrives goes to the port's input as whole messages, as the "usb
+/// in" / "in" ports deliver them (DIN at the line's rate, Io::midi_send); the port's output goes
+/// to the client as it comes, or nowhere without one.
+mod miditcp {
     use super::Ev;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{mpsc, Mutex, OnceLock};
 
-    static CLIENT: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
+    pub struct Port {
+        name: &'static str,
+        /// Ev::UsbMidi or Ev::Midi.
+        event: fn(Vec<u8>) -> Ev,
+        client: OnceLock<Mutex<Option<TcpStream>>>,
+    }
 
-    pub fn start(addr: &str, tx: mpsc::Sender<Ev>) {
-        let listener = match TcpListener::bind(addr) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("usb midi tcp {addr}: {e}");
+    pub static USB: Port = Port { name: "usb midi tcp", event: Ev::UsbMidi, client: OnceLock::new() };
+    pub static DIN: Port = Port { name: "din midi tcp", event: Ev::Midi, client: OnceLock::new() };
+
+    impl Port {
+        pub fn start(&'static self, addr: &str, tx: mpsc::Sender<Ev>) {
+            let name = self.name;
+            let listener = match TcpListener::bind(addr) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("{name} {addr}: {e}");
+                    return;
+                }
+            };
+            eprintln!("{name}: listening on {addr}");
+            self.client.get_or_init(|| Mutex::new(None));
+            std::thread::spawn(move || {
+                for s in listener.incoming().flatten() {
+                    let _ = s.set_nodelay(true);
+                    let Ok(w) = s.try_clone() else { continue };
+                    if let Some(old) = self.client.get().unwrap().lock().unwrap().replace(w) {
+                        let _ = old.shutdown(std::net::Shutdown::Both);
+                    }
+                    let tx = tx.clone();
+                    std::thread::spawn(move || reader(s, tx, self.event));
+                }
+            });
+        }
+
+        pub fn send(&self, bytes: &[u8]) {
+            if bytes.is_empty() {
                 return;
             }
-        };
-        eprintln!("usb midi tcp: listening on {addr}");
-        CLIENT.get_or_init(|| Mutex::new(None));
-        std::thread::spawn(move || {
-            for s in listener.incoming().flatten() {
-                let _ = s.set_nodelay(true);
-                let Ok(w) = s.try_clone() else { continue };
-                if let Some(old) = CLIENT.get().unwrap().lock().unwrap().replace(w) {
-                    let _ = old.shutdown(std::net::Shutdown::Both);
-                }
-                let tx = tx.clone();
-                std::thread::spawn(move || reader(s, tx));
+            let Some(c) = self.client.get() else { return };
+            let mut c = c.lock().unwrap();
+            if c.as_mut().is_some_and(|s| s.write_all(bytes).is_err()) {
+                *c = None;
             }
-        });
+        }
     }
 
     /// Data bytes after a status byte (0 for SysEx, which runs to F7).
@@ -1093,7 +1120,7 @@ mod usbtcp {
         }
     }
 
-    fn reader(mut s: TcpStream, tx: mpsc::Sender<Ev>) {
+    fn reader(mut s: TcpStream, tx: mpsc::Sender<Ev>, event: fn(Vec<u8>) -> Ev) {
         let mut buf = [0u8; 4096];
         let (mut msg, mut sysex, mut running) = (Vec::new(), false, 0u8);
         loop {
@@ -1103,20 +1130,20 @@ mod usbtcp {
             };
             for &b in &buf[..n] {
                 if b >= 0xF8 {
-                    let _ = tx.send(Ev::UsbMidi(vec![b])); // real time, even inside a SysEx
+                    let _ = tx.send(event(vec![b])); // real time, even inside a SysEx
                 } else if b == 0xF0 {
                     (msg, sysex) = (vec![b], true);
                 } else if sysex {
                     msg.push(b);
                     if b == 0xF7 {
-                        let _ = tx.send(Ev::UsbMidi(std::mem::take(&mut msg)));
+                        let _ = tx.send(event(std::mem::take(&mut msg)));
                         sysex = false;
                     }
                 } else if b & 0x80 != 0 {
                     running = if b < 0xF0 { b } else { 0 };
                     msg = vec![b];
                     if data_len(b) == 0 {
-                        let _ = tx.send(Ev::UsbMidi(std::mem::take(&mut msg)));
+                        let _ = tx.send(event(std::mem::take(&mut msg)));
                     }
                 } else {
                     if msg.is_empty() && running != 0 {
@@ -1127,25 +1154,17 @@ mod usbtcp {
                     }
                     msg.push(b);
                     if msg.len() == 1 + data_len(msg[0]) {
-                        let _ = tx.send(Ev::UsbMidi(std::mem::take(&mut msg)));
+                        let _ = tx.send(event(std::mem::take(&mut msg)));
                     }
                 }
             }
         }
     }
-
-    pub fn send(bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Some(c) = CLIENT.get() else { return };
-        let mut c = c.lock().unwrap();
-        if c.as_mut().is_some_and(|s| s.write_all(bytes).is_err()) {
-            *c = None;
-        }
-    }
 }
 
+/// The virtual MIDI ports: the DIN MIDI port of the emulated machine, as seen
+/// from the host. Messages from "rytm-emu in" go to the firmware's MIDI input;
+/// what the firmware sends comes out of "rytm-emu out".
 mod midi {
     use super::Ev;
     #[cfg(unix)]
