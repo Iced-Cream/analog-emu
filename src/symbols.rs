@@ -40,6 +40,20 @@ impl Device {
         matches!(self, Device::RytmMk1 | Device::A4Mk1)
     }
 
+    /// The boot flags MAIN OS gets from the bootstrap on a normal power-on
+    /// (`DTEMU_BOOT_FLAGS=HEX` overrides). The A4 MKII's bootstrap (1.56,
+    /// `0x80000be8..0x80000c4c`) builds them from a PLL timeout (bit 17), the
+    /// FPGA load's status (bits 12-14) and a board pin (bit 21) and never sets
+    /// bit 20, which its OS reads as an Analog Keys (31 tests; the unit's
+    /// name, `0x400f6d80`, and the KBD calibration): 0, as a unit that names
+    /// itself "Analog Four" [read from the code]. The others keep BOOT_FLAGS.
+    pub fn boot_flags(self) -> u32 {
+        match self {
+            Device::A4Mk2 => 0,
+            _ => crate::machine::BOOT_FLAGS,
+        }
+    }
+
     /// The boot flag that starts the factory-test console (a USB serial
     /// device beside the normal UI), as the bootstrap sets it for a power-on
     /// key combo or a maintenance reboot: 0x40 on the Rytm MKII (1.74 main
