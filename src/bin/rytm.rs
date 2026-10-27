@@ -106,6 +106,8 @@ struct Opts {
     /// the firmware saves its working state to the card, which is written
     /// back; no snapshot is saved, so the next start is a cold boot from it.
     power_off: bool,
+    /// --stdin-commands: a --headless run reads `save` / `quit` lines on stdin (see the loop).
+    stdin_commands: bool,
 }
 
 fn parse() -> Opts {
@@ -133,6 +135,7 @@ fn parse() -> Opts {
         ob_link: None,
         usb_host: false,
         power_off: false,
+        stdin_commands: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
@@ -174,6 +177,7 @@ fn parse() -> Opts {
             }
             "--headless" => o.headless = true,
             "--power-off" => o.power_off = true,
+            "--stdin-commands" => o.stdin_commands = true,
             "--after" => o.after = it.next().unwrap().parse().expect("--after"),
             "--screenshot" => o.screenshot = it.next().map(PathBuf::from),
             "--press" => {
@@ -188,6 +192,7 @@ fn parse() -> Opts {
                 println!(
                     "usage: {bin} [FIRMWARE.syx] [--snapshot FILE] [--card IMAGE] [--ips N] [--no-audio]\n\
                      \x20       {pad}[--headless --after SECS --screenshot OUT.png] [--press CODE@SECS[:HOLD]] [--turn ENC:DELTA@SECS]\n\
+                     \x20       {pad}[--stdin-commands]  (headless: stdin lines `save` (card, and --snapshot) and `quit`)\n\
                      \x20       {pad}[--latency MS] [--audio-null] [--wav OUT.wav] [--no-midi]\n\
                      \x20       {pad}[--audio-in audio|ext|both]  (the Mac's default input into AUDIO IN / EXT IN)\n\
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
@@ -713,7 +718,26 @@ pub fn main() {
         let mut pending: Vec<(u8, f64)> = Vec::new();
         let mut turns = opts.turns.clone();
         let mut last_report = 0.0;
-        while t0.elapsed().as_secs_f64() < opts.after {
+        // Commands on stdin, one a line: `save` writes the card and, with --snapshot, the
+        // snapshot (as F5 does in the window); `quit` ends the run now. A test harness takes
+        // a snapshot after its setup steps this way and later resumes from it.
+        let stop = Arc::new(AtomicBool::new(false));
+        if opts.stdin_commands {
+            let (tx, stop) = (tx.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for line in std::io::stdin().lines() {
+                    match line.as_deref().map(str::trim) {
+                        Ok("save") => {
+                            let _ = tx.send(Ev::Save);
+                        }
+                        Ok("quit") | Err(_) => break,
+                        Ok(other) => eprintln!("stdin: unknown command {other:?} (save, quit)"),
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        }
+        while t0.elapsed().as_secs_f64() < opts.after && !stop.load(Ordering::Relaxed) {
             let t = t0.elapsed().as_secs_f64();
             turns.retain(|&(e, d, at)| {
                 if at <= t {
