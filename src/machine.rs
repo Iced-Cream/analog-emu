@@ -30,7 +30,8 @@ pub const DEFAULT_VBR: u32 = 0x4000_0000;
 /// The argument the bootstrap passes MAIN OS when a panel answered: bit 20
 /// always, bit 18 from the bootstrap's own check (reference FINDINGS, "The
 /// boot flags"). The OS stores it at 0x401F55C0 and tests it in more than
-/// twenty places; 0x40|0x20 would mean "no panel" and park the OS.
+/// twenty places; 0x40|0x20 would mean "no panel" and park the OS. Per device:
+/// `Device::boot_flags` (the A4 MKII's differ).
 pub const BOOT_FLAGS: u32 = 0x0014_0000;
 
 /// What the factory console leaves at 0x48000000 before a software reset so
@@ -207,7 +208,10 @@ impl Machine {
         cpu.sr = 0x2700;
         // The OS entry reads its argument at 4(a7).
         cpu.a[7] = INITIAL_SP - 8;
-        cpu.bus.poke32(INITIAL_SP - 4, BOOT_FLAGS);
+        let flags = std::env::var("DTEMU_BOOT_FLAGS").ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or_else(|| prof.device.boot_flags());
+        cpu.bus.poke32(INITIAL_SP - 4, flags);
         cpu.vbr = DEFAULT_VBR;
 
         if !prof.device.mk1() {

@@ -102,7 +102,7 @@ struct Opts {
     /// Teensy) over TCP (dtemu::oblink).
     ob_link: Option<String>,
     usb_host: bool,
-    /// --usb-midi-tcp ADDR: the USB MIDI port as a raw MIDI byte stream over TCP (usbtcp), for
+    /// --usb-midi-tcp ADDR: the USB MIDI port as a raw MIDI byte stream over TCP (miditcp), for
     /// tools on a host without virtual MIDI ports (Windows), and one address per emulator.
     usb_midi_tcp: Option<String>,
     /// --din-midi-tcp ADDR: the DIN MIDI port the same way (miditcp), in at the line's rate.
@@ -111,6 +111,8 @@ struct Opts {
     /// the firmware saves its working state to the card, which is written
     /// back; no snapshot is saved, so the next start is a cold boot from it.
     power_off: bool,
+    /// --stdin-commands: a --headless run reads `save` / `quit` lines on stdin (see the loop).
+    stdin_commands: bool,
 }
 
 fn parse() -> Opts {
@@ -140,6 +142,7 @@ fn parse() -> Opts {
         usb_midi_tcp: None,
         din_midi_tcp: None,
         power_off: false,
+        stdin_commands: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
@@ -183,6 +186,7 @@ fn parse() -> Opts {
             }
             "--headless" => o.headless = true,
             "--power-off" => o.power_off = true,
+            "--stdin-commands" => o.stdin_commands = true,
             "--after" => o.after = it.next().unwrap().parse().expect("--after"),
             "--screenshot" => o.screenshot = it.next().map(PathBuf::from),
             "--press" => {
@@ -197,14 +201,15 @@ fn parse() -> Opts {
                 println!(
                     "usage: {bin} [FIRMWARE.syx] [--snapshot FILE] [--card IMAGE] [--ips N] [--no-audio]\n\
                      \x20       {pad}[--headless --after SECS --screenshot OUT.png] [--press CODE@SECS[:HOLD]] [--turn ENC:DELTA@SECS]\n\
+                     \x20       {pad}[--stdin-commands]  (headless: stdin lines `save` (card, and --snapshot) and `quit`)\n\
                      \x20       {pad}[--latency MS] [--audio-null] [--wav OUT.wav] [--no-midi]\n\
                      \x20       {pad}[--audio-in audio|ext|both]  (the Mac's default input into AUDIO IN / EXT IN)\n\
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
                      \x20       {pad}[--usb-wav FILE]  (record the USB audio stream: MAIN, 8 voices, AUDIO IN; 12 ch)\n\
                      \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301; 0.0.0.0:7301 for a host on the LAN)\n\
-                     \x20       {pad}[--usb-midi-tcp ADDR]  (the USB MIDI port as a raw MIDI byte stream over TCP, e.g. 127.0.0.1:7321;\n\
-                     \x20       {pad}                        headless too; one client at a time, the newest)\n\
-                     \x20       {pad}[--din-midi-tcp ADDR]  (the DIN MIDI port the same way, e.g. 127.0.0.1:7322)\n\
+                     \x20       {pad}[--usb-midi-tcp ADDR]  (the USB MIDI port as a raw MIDI byte stream over TCP, e.g. 7321 = 127.0.0.1:7321;\n\
+                     \x20       {pad}                        headless too; one client at a time, the newest; a LAN address warns)\n\
+                     \x20       {pad}[--din-midi-tcp ADDR]  (the DIN MIDI port the same way, e.g. 7322 = 127.0.0.1:7322)\n\
                      \x20       {pad}[--flash FILE]  (the SPI flash, kept in FILE: an OS upgrade over USB MIDI persists;\n\
                      \x20       {pad}                 with no FIRMWARE named, the OS in it boots)\n\n\
                      Defaults: FIRMWARE {fw}, --card {card}.\n\
@@ -734,7 +739,26 @@ pub fn main() {
         let mut pending: Vec<(u8, f64)> = Vec::new();
         let mut turns = opts.turns.clone();
         let mut last_report = 0.0;
-        while t0.elapsed().as_secs_f64() < opts.after {
+        // Commands on stdin, one a line: `save` writes the card and, with --snapshot, the
+        // snapshot (as F5 does in the window); `quit` ends the run now. A test harness takes
+        // a snapshot after its setup steps this way and later resumes from it.
+        let stop = Arc::new(AtomicBool::new(false));
+        if opts.stdin_commands {
+            let (tx, stop) = (tx.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for line in std::io::stdin().lines() {
+                    match line.as_deref().map(str::trim) {
+                        Ok("save") => {
+                            let _ = tx.send(Ev::Save);
+                        }
+                        Ok("quit") | Err(_) => break,
+                        Ok(other) => eprintln!("stdin: unknown command {other:?} (save, quit)"),
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        }
+        while t0.elapsed().as_secs_f64() < opts.after && !stop.load(Ordering::Relaxed) {
             let t = t0.elapsed().as_secs_f64();
             turns.retain(|&(e, d, at)| {
                 if at <= t {
@@ -1054,55 +1078,108 @@ fn write_wav(path: &std::path::Path, s: &[f32]) {
 /// never holds the port). What arrives goes to the port's input as whole messages, as the "usb
 /// in" / "in" ports deliver them (DIN at the line's rate, Io::midi_send); the port's output goes
 /// to the client as it comes, or nowhere without one.
+/// The emulation thread never blocks on a socket: each client has its own writer thread fed by
+/// a bounded queue; when a client stops reading, the queue fills and further output is dropped
+/// (counted, reported once) instead of stalling the emulator or the next client.
 mod miditcp {
     use super::Ev;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc, Mutex, OnceLock};
+
+    /// Output chunks queued per client (one chunk per emulation slice; a few seconds of MIDI).
+    const QUEUE: usize = 1024;
+
+    struct Client {
+        out: mpsc::SyncSender<Vec<u8>>,
+        sock: TcpStream,
+    }
 
     pub struct Port {
         name: &'static str,
         /// Ev::UsbMidi or Ev::Midi.
         event: fn(Vec<u8>) -> Ev,
-        client: OnceLock<Mutex<Option<TcpStream>>>,
+        client: OnceLock<Mutex<Option<Client>>>,
+        dropped: AtomicU64,
     }
 
-    pub static USB: Port = Port { name: "usb midi tcp", event: Ev::UsbMidi, client: OnceLock::new() };
-    pub static DIN: Port = Port { name: "din midi tcp", event: Ev::Midi, client: OnceLock::new() };
+    pub static USB: Port =
+        Port { name: "usb midi tcp", event: Ev::UsbMidi, client: OnceLock::new(), dropped: AtomicU64::new(0) };
+    pub static DIN: Port =
+        Port { name: "din midi tcp", event: Ev::Midi, client: OnceLock::new(), dropped: AtomicU64::new(0) };
+
+    /// "7321" or ":7321" means 127.0.0.1:7321; anything else as given.
+    fn resolve(addr: &str) -> Option<SocketAddr> {
+        let a = addr.trim_start_matches(':');
+        let full = if a.parse::<u16>().is_ok() { format!("127.0.0.1:{a}") } else { a.to_string() };
+        full.to_socket_addrs().ok()?.next()
+    }
 
     impl Port {
         pub fn start(&'static self, addr: &str, tx: mpsc::Sender<Ev>) {
             let name = self.name;
-            let listener = match TcpListener::bind(addr) {
+            let Some(sa) = resolve(addr) else {
+                eprintln!("{name} {addr}: not an address");
+                return;
+            };
+            if !sa.ip().is_loopback() {
+                eprintln!(
+                    "{name}: WARNING {sa} is reachable from other machines; anyone there can send MIDI and \
+                     SysEx (including OS upgrades) to the emulator"
+                );
+            }
+            let listener = match TcpListener::bind(sa) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("{name} {addr}: {e}");
+                    eprintln!("{name} {sa}: {e}");
                     return;
                 }
             };
-            eprintln!("{name}: listening on {addr}");
+            eprintln!("{name}: listening on {sa}");
             self.client.get_or_init(|| Mutex::new(None));
             std::thread::spawn(move || {
                 for s in listener.incoming().flatten() {
                     let _ = s.set_nodelay(true);
-                    let Ok(w) = s.try_clone() else { continue };
-                    if let Some(old) = self.client.get().unwrap().lock().unwrap().replace(w) {
-                        let _ = old.shutdown(std::net::Shutdown::Both);
+                    let (Ok(w), Ok(k)) = (s.try_clone(), s.try_clone()) else { continue };
+                    let (out, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
+                    std::thread::spawn(move || writer(w, rx));
+                    // the old client's writer ends when its sender is dropped; its reader when shut down
+                    if let Some(old) = self.client.get().unwrap().lock().unwrap().replace(Client { out, sock: k }) {
+                        let _ = old.sock.shutdown(std::net::Shutdown::Both);
                     }
+                    self.dropped.store(0, Ordering::Relaxed);
                     let tx = tx.clone();
                     std::thread::spawn(move || reader(s, tx, self.event));
                 }
             });
         }
 
+        /// Called from the emulation thread: never blocks on the network.
         pub fn send(&self, bytes: &[u8]) {
             if bytes.is_empty() {
                 return;
             }
             let Some(c) = self.client.get() else { return };
             let mut c = c.lock().unwrap();
-            if c.as_mut().is_some_and(|s| s.write_all(bytes).is_err()) {
-                *c = None;
+            let Some(cl) = c.as_ref() else { return };
+            match cl.out.try_send(bytes.to_vec()) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+                        eprintln!("{}: the client is not reading; dropping MIDI output", self.name);
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => *c = None, // its writer ended
+            }
+        }
+    }
+
+    fn writer(mut s: TcpStream, rx: mpsc::Receiver<Vec<u8>>) {
+        for chunk in rx {
+            if s.write_all(&chunk).is_err() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                return;
             }
         }
     }
@@ -1157,6 +1234,35 @@ mod miditcp {
                         let _ = tx.send(event(std::mem::take(&mut msg)));
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// A client that connects and never reads must not stall the emulation thread's send,
+        /// on either port.
+        #[test]
+        fn send_never_blocks_on_a_client_that_stops_reading() {
+            for (port, addr) in [(&USB, "127.0.0.1:47321"), (&DIN, "127.0.0.1:47323")] {
+                let (tx, _rx) = mpsc::channel();
+                port.start(addr, tx);
+                let _idle = TcpStream::connect(addr).unwrap(); // connected, never reads
+                let t = Instant::now();
+                while port.client.get().unwrap().lock().unwrap().is_none() {
+                    assert!(t.elapsed() < Duration::from_secs(5), "the client was not accepted");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let chunk = vec![0xF8u8; 64 * 1024];
+                let t = Instant::now();
+                for _ in 0..2048 {
+                    port.send(&chunk); // 128 MB, far past any socket buffer
+                }
+                assert!(t.elapsed() < Duration::from_secs(2), "send blocked: {:?}", t.elapsed());
+                assert!(port.dropped.load(Ordering::Relaxed) > 0, "the full queue was not counted");
             }
         }
     }

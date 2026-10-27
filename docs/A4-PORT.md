@@ -489,7 +489,8 @@ Code reading in OS 1.56 [measured unless tagged]:
 - The popup (`0x40099880..0x40099916`, "MISSING CAL: %s%s%s") names the parts
   whose flags are zero: **AUD** = u32 +0x44 (`0x400f1ad4`), **CV** = u32 +0x10
   (`0x400f1ab6`), **KBD** = u16 +0x24c with format > 1 (`0x400f1af2`), KBD only
-  when `*0x401ff54c & 0x100000` (a keyboard model; the A4 MKII sets it).
+  when `*0x401ff54c & 0x100000` (the boot flags' Analog Keys bit; the A4 MKII's
+  bootstrap never sets it, `Device::boot_flags`).
 - Boot (`0x40106206`): a valid record -> `0x40104148` (AUD) and, on a keyboard
   model, `0x400649d2` (KBD). CV is applied by `0x400fc9a2`.
 - **AUD** (`0x40104148`, when +0x44 != 0): for voice v and oscillator k = 2v + o,
@@ -624,6 +625,16 @@ OS 1.56 (the only A4 MKII OS file to hand, so the upgrade reinstalls 1.56):
   short: booting from the flash now checks every section's byte sum
   (`Firmware::from_flash`), as a unit's bootstrap checks the container before
   it starts the OS [inferred], and refuses that image.
+- **Boot flags** (`Device::boot_flags`, 0 here; the Rytm MKII's 0x140000 was used
+  before): the A4 MKII bootstrap (`0x80000be8..0x80000c4c`) starts them as
+  PLL timeout << 17 | FPGA load status (0-5) << 12 and ORs 0x200000 when pin
+  bit 5 of `0xec094018` reads low, then the test-mode and no-UI bits. It never
+  sets bit 20, which 1.56 reads as an Analog Keys in 31 places: with it the
+  default unit name (`0x400f6d80`, kept in the global settings and reported
+  by RPC Ping) is "Analog Keys" and MISSING CAL checks KBD. A unit names
+  itself "Analog Four" [read from the code; the name measured on a unit and
+  in the emulator]. The name lives in the saved settings, so a card made
+  before this change keeps "Analog Keys" until its settings are reset.
 - **Test-mode console**: boot flag **0x20** on the A4 (0x40 there skips the
   UI: 1.56 main `0x40105fb6` tests 0x40 for the UI and 0x20 for the console
   task `0x4011b116` and USB mode 5; the bootstrap ORs 0x20 for 0xB0B0DADA at

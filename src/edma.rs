@@ -12,7 +12,8 @@
 //! major channel links. A hardware request runs one minor loop per request,
 //! except UART transmit, whose request line never drops, so it too runs to
 //! major completion; the channel is then busy for as long as the bytes take
-//! on the wire, which is when the firmware's completion handler would run.
+//! on the wire (at the baud rate the firmware set), which is when the
+//! firmware's completion handler would run.
 
 use crate::bus::Bus;
 
@@ -114,6 +115,25 @@ impl Tcd {
 impl Bus {
     pub fn tcd(&self, ch: usize) -> Tcd {
         Tcd::from_bytes(&self.io.edma.tcd[ch * 32..ch * 32 + 32])
+    }
+
+    /// One character's time on UART8 (the Rytm's link to its panel MCU), in
+    /// instructions: from the baud divider the firmware set (UBG1:UBG2, baud =
+    /// bus clock / (32 x divider); 1.74 sets 26, about 158.7 kbaud) and the
+    /// frame in UMR1/UMR2. Before the firmware sets a divider, the fixed
+    /// `uart_byte_instr`.
+    fn uart8_byte_instr(&self) -> u64 {
+        let base = crate::io::UART8_BASE;
+        let div = (self.peek8(base + 0x18) as u32) << 8 | self.peek8(base + 0x1C) as u32;
+        if div == 0 {
+            return self.io.uart_byte_instr;
+        }
+        let umr = self.io.uart8.umr;
+        let parity = u32::from((umr[0] >> 3) & 3 != 2); // 10: no parity
+        let stop = if umr[1] & 0xF < 8 { 1 } else { 2 };
+        let bits = 1 + 5 + u32::from(umr[0] & 3) + parity + stop;
+        let secs = bits as f64 * 32.0 * div as f64 / crate::io::F_BUS;
+        ((secs * self.io.ips).round() as u64).max(1)
     }
 
     fn set_tcd(&mut self, ch: usize, t: &Tcd) {
@@ -377,7 +397,7 @@ impl Bus {
                         break;
                     }
                 }
-                self.io.edma.busy_until[ch] = self.io.now + bytes * self.io.uart_byte_instr;
+                self.io.edma.busy_until[ch] = self.io.now + bytes * self.uart8_byte_instr();
                 if self.io.edma.busy_until[ch] < self.io.deadline {
                     self.io.deadline = self.io.edma.busy_until[ch];
                 }
