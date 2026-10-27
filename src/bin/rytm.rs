@@ -102,6 +102,9 @@ struct Opts {
     /// Teensy) over TCP (dtemu::oblink).
     ob_link: Option<String>,
     usb_host: bool,
+    /// --usb-midi-tcp ADDR: the USB MIDI port as a raw MIDI byte stream over TCP (usbtcp), for
+    /// tools on a host without virtual MIDI ports (Windows), and one address per emulator.
+    usb_midi_tcp: Option<String>,
     /// --power-off: closing the window switches the Rytm off (Machine::power_off):
     /// the firmware saves its working state to the card, which is written
     /// back; no snapshot is saved, so the next start is a cold boot from it.
@@ -134,6 +137,7 @@ fn parse() -> Opts {
         usb_wav: None,
         ob_link: None,
         usb_host: false,
+        usb_midi_tcp: None,
         power_off: false,
         stdin_commands: false,
     };
@@ -148,6 +152,7 @@ fn parse() -> Opts {
             "--midi-from" => o.midi_from = it.next().cloned(),
             "--usb-wav" => o.usb_wav = it.next().map(PathBuf::from),
             "--usb-host" => o.usb_host = true,
+            "--usb-midi-tcp" => o.usb_midi_tcp = it.next().cloned(),
             "--ob-link" => {
                 let next = it.clone().next().filter(|a| !a.starts_with("--")).cloned();
                 if next.is_some() {
@@ -198,6 +203,8 @@ fn parse() -> Opts {
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
                      \x20       {pad}[--usb-wav FILE]  (record the USB audio stream: MAIN, 8 voices, AUDIO IN; 12 ch)\n\
                      \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301; 0.0.0.0:7301 for a host on the LAN)\n\
+                     \x20       {pad}[--usb-midi-tcp ADDR]  (the USB MIDI port as a raw MIDI byte stream over TCP, e.g. 7321 = 127.0.0.1:7321;\n\
+                     \x20       {pad}                        headless too; one client at a time, the newest; a LAN address warns)\n\
                      \x20       {pad}[--flash FILE]  (the SPI flash, kept in FILE: an OS upgrade over USB MIDI persists;\n\
                      \x20       {pad}                 with no FIRMWARE named, the OS in it boots)\n\n\
                      Defaults: FIRMWARE {fw}, --card {card}.\n\
@@ -353,12 +360,11 @@ fn emulate(
                 eprintln!("{s}");
             }
         }
+        let bytes: Vec<u8> = m.cpu.bus.io.usb_midi_out.drain(..).collect();
         if let Some(uo) = usb_out.as_mut() {
-            let bytes: Vec<u8> = m.cpu.bus.io.usb_midi_out.drain(..).collect();
             uo.send(&bytes);
-        } else {
-            m.cpu.bus.io.usb_midi_out.clear();
         }
+        usbtcp::send(&bytes);
         if let Some(mo) = midi_out.as_mut() {
             let bytes: Vec<u8> = m.cpu.bus.io.midi_out.drain(..).collect();
             mo.send(&bytes);
@@ -702,6 +708,14 @@ pub fn main() {
     // --midi-from NAME: an existing MIDI source (a real Rytm, a keyboard) into
     // the DIN MIDI input, without a routing app.
     let _from = o.midi_from.as_deref().and_then(|n| midi::connect_from(tx.clone(), n));
+    if let Some(addr) = &o.usb_midi_tcp {
+        let usb = { let v = view.lock().unwrap(); v.rytm || v.a4 };
+        if usb {
+            usbtcp::start(addr, tx.clone());
+        } else {
+            eprintln!("usb midi tcp: this device has no USB MIDI port here");
+        }
+    }
     let opts = Arc::new(o);
     let th = {
         let (view, audio, quit, opts) = (view.clone(), audio.clone(), quit.clone(), opts.clone());
@@ -1055,6 +1069,183 @@ fn write_wav(path: &std::path::Path, s: &[f32]) {
 /// The virtual MIDI ports: the DIN MIDI port of the emulated machine, as seen
 /// from the host. Messages from "rytm-emu in" go to the firmware's MIDI input;
 /// what the firmware sends comes out of "rytm-emu out".
+/// The USB MIDI port over TCP (--usb-midi-tcp): a raw MIDI byte stream both ways, no framing.
+/// One client at a time: a new connection replaces the one before (a dead client never holds
+/// the port). What arrives goes to the USB MIDI input as whole messages, as the "usb in" port
+/// delivers them; the USB MIDI output goes to the client as it comes, or nowhere without one.
+/// The emulation thread never blocks on the socket: each client has its own writer thread fed
+/// by a bounded queue; when a client stops reading, the queue fills and further output is
+/// dropped (counted, reported once) instead of stalling the emulator or the next client.
+mod usbtcp {
+    use super::Ev;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Mutex, OnceLock};
+
+    /// Output chunks queued per client (one chunk per emulation slice; a few seconds of MIDI).
+    const QUEUE: usize = 1024;
+
+    struct Client {
+        out: mpsc::SyncSender<Vec<u8>>,
+        sock: TcpStream,
+    }
+
+    static CLIENT: OnceLock<Mutex<Option<Client>>> = OnceLock::new();
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// "7321" or ":7321" means 127.0.0.1:7321; anything else as given.
+    fn resolve(addr: &str) -> Option<SocketAddr> {
+        let a = addr.trim_start_matches(':');
+        let full = if a.parse::<u16>().is_ok() { format!("127.0.0.1:{a}") } else { a.to_string() };
+        full.to_socket_addrs().ok()?.next()
+    }
+
+    pub fn start(addr: &str, tx: mpsc::Sender<Ev>) {
+        let Some(sa) = resolve(addr) else {
+            eprintln!("usb midi tcp {addr}: not an address");
+            return;
+        };
+        if !sa.ip().is_loopback() {
+            eprintln!(
+                "usb midi tcp: WARNING {sa} is reachable from other machines; anyone there can send \
+                 MIDI and SysEx (including OS upgrades) to the emulator"
+            );
+        }
+        let listener = match TcpListener::bind(sa) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("usb midi tcp {sa}: {e}");
+                return;
+            }
+        };
+        eprintln!("usb midi tcp: listening on {sa}");
+        CLIENT.get_or_init(|| Mutex::new(None));
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                let _ = s.set_nodelay(true);
+                let (Ok(w), Ok(k)) = (s.try_clone(), s.try_clone()) else { continue };
+                let (out, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
+                std::thread::spawn(move || writer(w, rx));
+                // the old client's writer ends when its sender is dropped; its reader when shut down
+                if let Some(old) = CLIENT.get().unwrap().lock().unwrap().replace(Client { out, sock: k }) {
+                    let _ = old.sock.shutdown(std::net::Shutdown::Both);
+                }
+                DROPPED.store(0, Ordering::Relaxed);
+                let tx = tx.clone();
+                std::thread::spawn(move || reader(s, tx));
+            }
+        });
+    }
+
+    fn writer(mut s: TcpStream, rx: mpsc::Receiver<Vec<u8>>) {
+        for chunk in rx {
+            if s.write_all(&chunk).is_err() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        }
+    }
+
+    /// Data bytes after a status byte (0 for SysEx, which runs to F7).
+    fn data_len(status: u8) -> usize {
+        match status & 0xF0 {
+            0xC0 | 0xD0 => 1,
+            0x80..=0xE0 => 2,
+            _ => match status {
+                0xF1 | 0xF3 => 1,
+                0xF2 => 2,
+                _ => 0,
+            },
+        }
+    }
+
+    fn reader(mut s: TcpStream, tx: mpsc::Sender<Ev>) {
+        let mut buf = [0u8; 4096];
+        let (mut msg, mut sysex, mut running) = (Vec::new(), false, 0u8);
+        loop {
+            let n = match s.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b >= 0xF8 {
+                    let _ = tx.send(Ev::UsbMidi(vec![b])); // real time, even inside a SysEx
+                } else if b == 0xF0 {
+                    (msg, sysex) = (vec![b], true);
+                } else if sysex {
+                    msg.push(b);
+                    if b == 0xF7 {
+                        let _ = tx.send(Ev::UsbMidi(std::mem::take(&mut msg)));
+                        sysex = false;
+                    }
+                } else if b & 0x80 != 0 {
+                    running = if b < 0xF0 { b } else { 0 };
+                    msg = vec![b];
+                    if data_len(b) == 0 {
+                        let _ = tx.send(Ev::UsbMidi(std::mem::take(&mut msg)));
+                    }
+                } else {
+                    if msg.is_empty() && running != 0 {
+                        msg.push(running);
+                    }
+                    if msg.is_empty() {
+                        continue; // a stray data byte
+                    }
+                    msg.push(b);
+                    if msg.len() == 1 + data_len(msg[0]) {
+                        let _ = tx.send(Ev::UsbMidi(std::mem::take(&mut msg)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Called from the emulation thread: never blocks on the network.
+    pub fn send(bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(c) = CLIENT.get() else { return };
+        let mut c = c.lock().unwrap();
+        let Some(cl) = c.as_ref() else { return };
+        match cl.out.try_send(bytes.to_vec()) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                if DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    eprintln!("usb midi tcp: the client is not reading; dropping USB MIDI output");
+                }
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => *c = None, // its writer ended
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// A client that connects and never reads must not stall the emulation thread's send.
+        #[test]
+        fn send_never_blocks_on_a_client_that_stops_reading() {
+            let (tx, _rx) = mpsc::channel();
+            start("127.0.0.1:47321", tx);
+            let _idle = TcpStream::connect("127.0.0.1:47321").unwrap(); // connected, never reads
+            let t = Instant::now();
+            while CLIENT.get().unwrap().lock().unwrap().is_none() {
+                assert!(t.elapsed() < Duration::from_secs(5), "the client was not accepted");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let chunk = vec![0xF8u8; 64 * 1024];
+            let t = Instant::now();
+            for _ in 0..2048 {
+                send(&chunk); // 128 MB, far past any socket buffer
+            }
+            assert!(t.elapsed() < Duration::from_secs(2), "send blocked: {:?}", t.elapsed());
+            assert!(DROPPED.load(Ordering::Relaxed) > 0, "the full queue was not counted");
+        }
+    }
+}
+
 mod midi {
     use super::Ev;
     #[cfg(unix)]
