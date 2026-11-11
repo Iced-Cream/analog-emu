@@ -592,7 +592,7 @@ impl Cpu {
                     h[*i % n] = pc;
                     *i += 1;
                 }
-                self.execute();
+                self.execute_timed();
             }
             if self.bus.strict_pending.is_some() {
                 self.strict_fault();
@@ -752,7 +752,13 @@ impl Cpu {
             self.bus.io.now += 1;
             let next = pc.wrapping_add(op.len as u32);
             self.pc = next;
-            (op.h)(self, op);
+            if self.bus.timing.is_some() {
+                let flow = self.timing_pre(op.op, op.len);
+                (op.h)(self, op);
+                self.timing_post(flow);
+            } else {
+                (op.h)(self, op);
+            }
             if self.pc != next || (EXACT && self.bus.strict_pending.is_some()) {
                 break;
             }
@@ -768,35 +774,57 @@ impl Cpu {
         self.bus.io.now += 1;
         if self.bus.cache.is_some() {
             // The cache model fetches through the I-cache: no predecoding.
-            return self.execute();
+            return self.execute_timed();
         }
         let op = crate::fast::decode(self, pc);
         self.pc = pc.wrapping_add(op.len as u32);
+        if self.bus.timing.is_some() {
+            let flow = self.timing_pre(op.op, op.len);
+            (op.h)(self, &op);
+            return self.timing_post(flow);
+        }
         (op.h)(self, &op);
     }
 
     pub(crate) fn execute(&mut self) {
         let op = self.fetch16();
-        if self.bus.timing.is_some() {
-            let flow = self.timing_pre(op);
-            self.dispatch(op);
-            return self.timing_post(flow);
-        }
         self.dispatch(op);
     }
 
-    /// Unit timing: the cycles of `op`, just fetched at `op_pc`, beyond the
-    /// one the run loop counted (timing.rs).
+    /// `execute` with unit timing's costs around it (timing.rs). The
+    /// predecoded path charges in `run_ops_loop` instead, so `h_slow`'s
+    /// `execute` is not charged twice.
+    fn execute_timed(&mut self) {
+        if self.bus.timing.is_none() {
+            return self.execute();
+        }
+        let op = self.bus.peek16(self.op_pc);
+        let flow = self.timing_pre(op, 0);
+        self.execute();
+        self.timing_post(flow);
+    }
+
+    /// Unit timing: the cycles of `op` at `op_pc` (`len` bytes, 0 if not
+    /// known), beyond the one the run loop counted.
     #[cold]
     #[inline(never)]
-    fn timing_pre(&mut self, op: u16) -> crate::timing::Flow {
+    fn timing_pre(&mut self, op: u16, len: u8) -> crate::timing::Flow {
         let pc = self.op_pc;
-        let mut w = [op, 0, 0, 0, 0, 0];
-        for (i, x) in w.iter_mut().enumerate().skip(1) {
-            *x = self.bus.peek16(pc.wrapping_add(2 * i as u32));
-        }
-        let t = self.bus.timing.as_mut().unwrap();
-        let (extra, flow, folded) = t.pre(pc, &w);
+        let w1 = self.bus.peek16(pc.wrapping_add(2));
+        let mut t = self.bus.timing.take().unwrap();
+        let mut extra = t.ifetch(pc, if len == 0 { 2 } else { len as u32 });
+        // The other words are read only when the PC's memo entry misses.
+        let bus = &self.bus;
+        let words = || {
+            let mut w = [op, w1, 0, 0, 0, 0];
+            for (i, x) in w.iter_mut().enumerate().skip(2) {
+                *x = bus.peek16(pc.wrapping_add(2 * i as u32));
+            }
+            w
+        };
+        let (x, flow, folded) = t.pre_memo(pc, op, w1, words);
+        extra += x;
+        self.bus.timing = Some(t);
         self.bus.io.now += extra;
         if folded {
             self.bus.io.now -= 1;
@@ -1403,11 +1431,17 @@ impl Cpu {
                 if let Some(c) = self.bus.cache.as_mut() {
                     c.set_cacr(v);
                 }
+                if let Some(t) = self.bus.timing.as_mut() {
+                    t.tags.set_cacr(v);
+                }
             }
             0x004..=0x007 => {
                 self.ctl.insert(rc, v);
                 if let Some(c) = self.bus.cache.as_mut() {
                     c.set_acr((rc - 4) as usize, v);
+                }
+                if let Some(t) = self.bus.timing.as_mut() {
+                    t.tags.acr[(rc - 4) as usize] = v;
                 }
             }
             0x800 => self.other_sp = v,
@@ -1424,6 +1458,9 @@ impl Cpu {
         let cacr = self.cacr;
         if let Some(c) = self.bus.cache.as_mut() {
             c.configure(cacr, acr);
+        }
+        if let Some(t) = self.bus.timing.as_mut() {
+            t.tags.configure(cacr, acr);
         }
     }
 

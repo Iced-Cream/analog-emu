@@ -273,7 +273,7 @@ impl Bus {
     pub fn ddr_plain(&self, a: u32, len: u32) -> Option<usize> {
         let o = self.ddr_off(a)?;
         let end = a.wrapping_add(len - 1);
-        if self.ddr_off(end)? != o + len as usize - 1 || self.watch.is_some() || self.cache.is_some() {
+        if self.ddr_off(end)? != o + len as usize - 1 || self.watch.is_some() || self.cache.is_some() || self.timing.is_some() {
             return None;
         }
         // Wholly below or above the cached code, or a store could hit it.
@@ -514,7 +514,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn read8(&mut self, a: u32) -> u8 {
-        if self.cache.is_some() {
+        if self.cache.is_some() || self.timing.is_some() {
             return self.cached_read(a, 1) as u8;
         }
         self.read8_mem(a)
@@ -522,7 +522,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn read16(&mut self, a: u32) -> u16 {
-        if self.cache.is_some() {
+        if self.cache.is_some() || self.timing.is_some() {
             return self.cached_read(a, 2) as u16;
         }
         self.read16_mem(a)
@@ -530,7 +530,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn read32(&mut self, a: u32) -> u32 {
-        if self.cache.is_some() {
+        if self.cache.is_some() || self.timing.is_some() {
             return self.cached_read(a, 4);
         }
         self.read32_mem(a)
@@ -538,7 +538,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn write8(&mut self, a: u32, v: u8) {
-        if self.cache.is_some() {
+        if self.cache.is_some() || self.timing.is_some() {
             return self.cached_write(a, 1, v as u32);
         }
         self.write8_mem(a, v)
@@ -546,7 +546,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn write16(&mut self, a: u32, v: u16) {
-        if self.cache.is_some() {
+        if self.cache.is_some() || self.timing.is_some() {
             return self.cached_write(a, 2, v as u32);
         }
         self.write16_mem(a, v)
@@ -554,7 +554,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn write32(&mut self, a: u32, v: u32) {
-        if self.cache.is_some() {
+        if self.cache.is_some() || self.timing.is_some() {
             return self.cached_write(a, 4, v);
         }
         self.write32_mem(a, v)
@@ -567,7 +567,7 @@ impl Bus {
         if self.cache.is_some() {
             return self.cached_ifetch(a, 2) as u16;
         }
-        self.read16(a)
+        self.read16_mem(a)
     }
 
     #[inline(always)]
@@ -575,7 +575,7 @@ impl Bus {
         if self.cache.is_some() {
             return self.cached_ifetch(a, 4);
         }
-        self.read32(a)
+        self.read32_mem(a)
     }
 
     fn mem_read(&mut self, a: u32, n: u32) -> u32 {
@@ -589,39 +589,28 @@ impl Bus {
     #[cold]
     #[inline(never)]
     fn cached_read(&mut self, a: u32, n: u32) -> u32 {
+        if self.timing.is_some() {
+            self.charge(a, false);
+        }
         // eDMA (in_dma) reads memory, past the caches.
-        if !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
+        if self.cache.is_some() && !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
             let c = self.cache.as_mut().unwrap();
-            let before = (c.stats.d_misses, c.stats.d_writebacks);
             if let Some(v) = c.read(&mut self.ddr, self.ddr_mask, a, n) {
-                self.charge_d(before);
                 if self.watch_reads {
                     self.check_watch(a, n, v);
                 }
                 return v;
             }
         }
-        self.charge_uncached(a, false);
         self.mem_read(a, n)
     }
 
-    /// Unit timing: the cycles of the D-cache misses and write-backs since
-    /// `before` (the counters before the access).
-    #[inline(always)]
-    fn charge_d(&mut self, before: (u64, u64)) {
-        if let (Some(t), Some(c)) = (self.timing.as_mut(), self.cache.as_ref()) {
-            let cy = t.cache_cost(c.stats.d_misses - before.0, c.stats.d_writebacks - before.1, 0);
-            self.io.now += cy;
-        }
-    }
-
-    /// Unit timing: a CPU access that went past the caches (not eDMA).
-    #[inline(always)]
-    fn charge_uncached(&mut self, a: u32, write: bool) {
+    /// Unit timing: the cycles of a CPU data access at `a` (not eDMA):
+    /// through the tag-only caches for cacheable DDR, else by region.
+    #[cold]
+    #[inline(never)]
+    fn charge(&mut self, a: u32, write: bool) {
         if self.in_dma {
-            return;
-        }
-        if self.timing.is_none() {
             return;
         }
         let r = if self.ddr_off(a).is_some() {
@@ -632,22 +621,22 @@ impl Bus {
             crate::timing::Region::Io
         };
         let t = self.timing.as_mut().unwrap();
-        self.io.now += t.uncached(r, write);
+        self.io.now += t.data(a, write, r);
     }
 
     #[cold]
     #[inline(never)]
     fn cached_write(&mut self, a: u32, n: u32, v: u32) {
-        if !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
+        if self.timing.is_some() {
+            self.charge(a, true);
+        }
+        if self.cache.is_some() && !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
             let c = self.cache.as_mut().unwrap();
-            let before = (c.stats.d_misses, c.stats.d_writebacks);
             if c.write(&mut self.ddr, self.ddr_mask, a, n, v) {
-                self.charge_d(before);
                 self.check_watch(a, n, v);
                 return;
             }
         }
-        self.charge_uncached(a, true);
         match n {
             1 => self.write8_mem(a, v as u8),
             2 => self.write16_mem(a, v as u16),
@@ -661,23 +650,20 @@ impl Bus {
         if self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
             let pc = self.pc;
             let c = self.cache.as_mut().unwrap();
-            let before = c.stats.i_misses;
             if let Some(v) = c.ifetch(&self.ddr, self.ddr_mask, a, n, pc) {
-                let after = c.stats.i_misses;
-                if let Some(t) = self.timing.as_mut() {
-                    self.io.now += t.cache_cost(0, 0, after - before);
-                }
                 return v;
             }
         }
         // Not instruction-cacheable: memory itself, past the D-cache too.
-        self.charge_uncached(a, false);
         self.mem_read(a, n)
     }
 
     /// CPUSHL (`which`: 1 dc, 2 ic, 3 bc) with An = `an`; INTOUCH is `which` 0.
     pub fn cache_op(&mut self, which: u8, an: u32) {
         let in_ddr = self.ddr_off(an).is_some();
+        if let Some(t) = self.timing.as_mut() {
+            self.io.now += t.cache_op(which, an, in_ddr);
+        }
         if let Some(c) = self.cache.as_mut() {
             if which == 0 {
                 if in_ddr {

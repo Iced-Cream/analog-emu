@@ -187,11 +187,6 @@ impl Machine {
         // memory costs come from the cache model, so that is turned on too.
         if let Some(t) = crate::timing::Timing::from_env()? {
             bus.io.ips = t.p.hz;
-            if bus.cache.is_none() {
-                // The MCF5441x's caches: 8 KB each (MCF54418RM 6.2).
-                let kb = std::env::var("DTEMU_CACHE_KB").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-                bus.cache = Some(Box::new(crate::cache::Caches::new(kb, false)));
-            }
             bus.timing = Some(Box::new(t));
         }
         let cached = bus.cache.is_some();
@@ -207,7 +202,10 @@ impl Machine {
         let mut cpu = Cpu::new(bus);
         // The block compiler, on its own thread (DTEMU_JIT_SYNC=1: in line;
         // DTEMU_NO_JIT=1: the interpreter alone).
-        if std::env::var_os("DTEMU_NO_JIT").is_none() && !strict && !cached {
+        // Unit timing charges every instruction and access, which compiled
+        // blocks skip: it runs on the interpreter (predecoded blocks).
+        let timed = cpu.bus.timing.is_some();
+        if std::env::var_os("DTEMU_NO_JIT").is_none() && !strict && !cached && !timed {
             if std::env::var_os("DTEMU_JIT_SYNC").is_some() {
                 cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
             } else {

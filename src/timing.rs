@@ -158,6 +158,37 @@ pub enum Flow {
 }
 
 const NONE: u8 = 0xFF;
+const MEMO: usize = 1 << 15;
+
+/// An instruction's static timing (`Timing::decode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decoded {
+    /// Table cycles beyond one.
+    pub x: u16,
+    /// The register changed in the execute stage (0-7 D, 8-15 A), or NONE.
+    pub dst: u8,
+    /// 0 none, 1 call (BSR/JSR), 2 RTS, 3 Bcc.
+    pub flow: u8,
+    /// Bcc length in bytes.
+    pub len: u8,
+    pub is_move: bool,
+    pub mac: bool,
+    /// An EMAC register store: 3 more cycles right after a MAC.
+    pub mac_rd: bool,
+    /// Address registers read: (base, index, the index's stall), NONE if unused.
+    pub uses: [(u8, u8, u8); 2],
+}
+
+/// Record the registers <ea> (mode, reg) reads to form its address.
+fn use_ea(u: &mut (u8, u8, u8), mode: u16, reg: u16, ext: u16) {
+    if (2..=6).contains(&mode) {
+        u.0 = 8 + reg as u8;
+    }
+    if is_indexed(mode, reg) {
+        u.1 = (ext >> 12) as u8 & 15;
+        u.2 = if (ext >> 9) & 3 == 0 { 2 } else { 3 };
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Timing {
@@ -177,6 +208,239 @@ pub struct Timing {
     pt: Vec<u8>,
     /// Return stack, 4 entries (LIFO, the oldest dropped).
     rs: Vec<u32>,
+    /// Tag-only I- and D-caches: hits and misses, no data (memory stays
+    /// the emulator's plain memory, as in the default mode).
+    pub tags: Tags,
+    #[serde(skip, default = "memo_keys")]
+    memo_key: Vec<(u32, u16, u16)>,
+    #[serde(skip, default = "memo_vals")]
+    memo: Vec<Decoded>,
+    /// The I-cache line of the last fetch (a fetch in the same line hits).
+    #[serde(skip)]
+    last_iline: u32,
+}
+
+fn memo_keys() -> Vec<(u32, u16, u16)> {
+    vec![(u32::MAX, 0, 0); MEMO]
+}
+
+fn memo_vals() -> Vec<Decoded> {
+    vec![Decoded::default(); MEMO]
+}
+
+const LINE: u32 = 16;
+const WAYS: usize = 4;
+const CACR_DEC: u32 = 0x8000_0000;
+const CACR_DPI: u32 = 0x1000_0000;
+const CACR_DDCM: u32 = 0x0600_0000;
+const CACR_DCINVA: u32 = 0x0100_0000;
+const CACR_IEC: u32 = 0x0000_8000;
+const CACR_IDPI: u32 = 0x0000_1000;
+const CACR_IDCM: u32 = 0x0000_0400;
+const CACR_ICINVA: u32 = 0x0000_0100;
+
+fn acr_match(acr: u32, a: u32) -> bool {
+    if acr & 0x8000 == 0 {
+        return false;
+    }
+    let base = acr >> 24;
+    let mask = (acr >> 16) & 0xFF;
+    ((a >> 24) & !mask & 0xFF) == (base & !mask)
+}
+
+/// The caches' tags (cache.rs's geometry and modes, without the data).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Tags {
+    sets: usize,
+    pub cacr: u32,
+    pub acr: [u32; 4],
+    /// (line address | 1 valid | 2 dirty) per way; line addresses are
+    /// 16-aligned, so the low bits are free.
+    d: Vec<u32>,
+    i: Vec<u32>,
+    d_rr: Vec<u8>,
+    i_rr: Vec<u8>,
+    pub d_hits: u64,
+    pub d_misses: u64,
+    pub d_pushes: u64,
+    pub i_hits: u64,
+    pub i_misses: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DMode {
+    WriteThrough,
+    CopyBack,
+    Inhibited,
+}
+
+impl Tags {
+    pub fn new(kb: usize) -> Tags {
+        let sets = kb * 1024 / (LINE as usize * WAYS);
+        Tags {
+            sets,
+            cacr: 0,
+            acr: [0; 4],
+            d: vec![0; sets * WAYS],
+            i: vec![0; sets * WAYS],
+            d_rr: vec![0; sets],
+            i_rr: vec![0; sets],
+            d_hits: 0,
+            d_misses: 0,
+            d_pushes: 0,
+            i_hits: 0,
+            i_misses: 0,
+        }
+    }
+
+    pub fn configure(&mut self, cacr: u32, acr: [u32; 4]) {
+        self.cacr = cacr;
+        self.acr = acr;
+        self.d.iter_mut().chain(self.i.iter_mut()).for_each(|l| *l = 0);
+    }
+
+    pub fn set_cacr(&mut self, v: u32) {
+        self.cacr = v;
+        if v & CACR_DCINVA != 0 {
+            self.d.iter_mut().for_each(|l| *l = 0);
+        }
+        if v & CACR_ICINVA != 0 {
+            self.i.iter_mut().for_each(|l| *l = 0);
+        }
+    }
+
+    fn data_mode(&self, a: u32) -> DMode {
+        if self.cacr & CACR_DEC == 0 {
+            return DMode::Inhibited;
+        }
+        let cm = if acr_match(self.acr[0], a) {
+            (self.acr[0] >> 5) & 3
+        } else if acr_match(self.acr[1], a) {
+            (self.acr[1] >> 5) & 3
+        } else {
+            (self.cacr & CACR_DDCM) >> 25
+        };
+        match cm {
+            0 => DMode::WriteThrough,
+            1 => DMode::CopyBack,
+            _ => DMode::Inhibited,
+        }
+    }
+
+    fn insn_cached(&self, a: u32) -> bool {
+        if self.cacr & CACR_IEC == 0 {
+            return false;
+        }
+        let cm = if acr_match(self.acr[2], a) {
+            (self.acr[2] >> 5) & 3
+        } else if acr_match(self.acr[3], a) {
+            (self.acr[3] >> 5) & 3
+        } else if self.cacr & CACR_IDCM != 0 {
+            2
+        } else {
+            0
+        };
+        cm < 2
+    }
+
+    #[inline(always)]
+    fn set_of(&self, la: u32) -> usize {
+        ((la / LINE) as usize) & (self.sets - 1)
+    }
+
+    /// -> (hit way index, or the victim's index and whether it was dirty).
+    #[inline(always)]
+    fn lookup(lines: &mut [u32], rr: &mut [u8], set: usize, la: u32) -> (bool, usize, bool) {
+        let base = set * WAYS;
+        for w in 0..WAYS {
+            let l = lines[base + w];
+            if l & 1 != 0 && l & !0xF == la {
+                return (true, base + w, false);
+            }
+        }
+        let w = match (0..WAYS).find(|&w| lines[base + w] & 1 == 0) {
+            Some(w) => w,
+            None => {
+                let w = rr[set] as usize;
+                rr[set] = ((w + 1) % WAYS) as u8;
+                w
+            }
+        };
+        let dirty = lines[base + w] & 3 == 3;
+        lines[base + w] = la | 1;
+        (false, base + w, dirty)
+    }
+
+    /// A data access to DDR at `a`. -> (missed, pushed a dirty line,
+    /// inhibited: the access went to memory).
+    pub fn data(&mut self, a: u32, write: bool) -> (bool, bool, bool) {
+        let mode = self.data_mode(a);
+        if mode == DMode::Inhibited {
+            return (false, false, true);
+        }
+        let la = a & !(LINE - 1);
+        let set = self.set_of(la);
+        if mode == DMode::WriteThrough && write {
+            // Writes go through the store buffer; a hit updates the line,
+            // a miss doesn't allocate.
+            let base = set * WAYS;
+            if (0..WAYS).any(|w| self.d[base + w] & 1 != 0 && self.d[base + w] & !0xF == la) {
+                self.d_hits += 1;
+            }
+            return (false, false, false);
+        }
+        let (hit, k, dirty) = Self::lookup(&mut self.d, &mut self.d_rr, set, la);
+        if hit {
+            self.d_hits += 1;
+        } else {
+            self.d_misses += 1;
+            if dirty {
+                self.d_pushes += 1;
+            }
+        }
+        if write && mode == DMode::CopyBack {
+            self.d[k] |= 2;
+        }
+        (!hit, !hit && dirty, false)
+    }
+
+    /// An instruction fetch of the line holding `a`. -> missed.
+    pub fn ifetch(&mut self, a: u32) -> bool {
+        if !self.insn_cached(a) {
+            return false;
+        }
+        let la = a & !(LINE - 1);
+        let set = self.set_of(la);
+        let (hit, _, _) = Self::lookup(&mut self.i, &mut self.i_rr, set, la);
+        if hit {
+            self.i_hits += 1;
+        } else {
+            self.i_misses += 1;
+        }
+        !hit
+    }
+
+    /// CPUSHL (1 dc, 2 ic, 3 bc) by set and way; INTOUCH is `which` 0.
+    /// -> a dirty line was pushed.
+    pub fn cpushl(&mut self, which: u8, an: u32) -> bool {
+        if which == 0 {
+            self.ifetch(an);
+            return false;
+        }
+        let k = self.set_of(an) * WAYS + (an & 3) as usize;
+        let mut pushed = false;
+        if which & 1 != 0 {
+            pushed = self.d[k] & 3 == 3;
+            self.d[k] &= !2;
+            if self.cacr & CACR_DPI == 0 {
+                self.d[k] = 0;
+            }
+        }
+        if which & 2 != 0 && self.cacr & CACR_IDPI == 0 {
+            self.i[k] = 0;
+        }
+        pushed
+    }
 }
 
 /// Effective-address mode and register of a 6-bit field.
@@ -213,6 +477,12 @@ fn is_indexed(mode: u16, reg: u16) -> bool {
     mode == 6 || (mode == 7 && reg == 3)
 }
 
+/// Cache size per cache: the MCF5441x's 8 KB (MCF54418RM 6.2), or
+/// `DTEMU_CACHE_KB`.
+fn p_kb() -> usize {
+    std::env::var("DTEMU_CACHE_KB").ok().and_then(|s| s.parse().ok()).unwrap_or(8)
+}
+
 impl Timing {
     pub fn new(p: Params) -> Timing {
         Timing {
@@ -225,6 +495,10 @@ impl Timing {
             bc: [(u32::MAX, 0); 8],
             pt: vec![1; 128],
             rs: Vec::with_capacity(4),
+            tags: Tags::new(p_kb()),
+            memo_key: memo_keys(),
+            memo: memo_vals(),
+            last_iline: u32::MAX,
         }
     }
 
@@ -245,43 +519,18 @@ impl Timing {
         Ok(Some(Timing::new(p)))
     }
 
-    /// Load-use stall for an address generated by <ea> (mode, reg), whose
-    /// index extension word (if any) is `ext`.
-    fn ea_stall(&self, mode: u16, reg: u16, ext: u16) -> u64 {
-        if self.last_dst == NONE {
-            return 0;
-        }
-        let mut s = 0;
-        if (2..=6).contains(&mode) && self.last_dst == 8 + reg as u8 {
-            s = 2;
-        }
-        if is_indexed(mode, reg) {
-            let xi = (ext >> 12) as u8 & 15;
-            let scale = (ext >> 9) & 3;
-            if xi == self.last_dst {
-                s = s.max(if scale == 0 { 2 } else { 3 });
-            }
-        }
-        s
-    }
-
-    /// Cycles beyond one for the instruction at `pc` whose words start
-    /// with `w` (`w[0]` the opword; 6 words, zero past the end are fine).
-    /// -> (extra cycles, what `post` must check, whether a cycle is
-    /// refunded for folding).
-    pub fn pre(&mut self, pc: u32, w: &[u16; 6]) -> (u64, Flow, bool) {
+    /// The part of an instruction's cost that depends only on its words:
+    /// table cycles, the registers it changes and reads for addresses, and
+    /// what `post` must check. Memoised per PC (`memo`).
+    pub fn decode(w: &[u16; 6]) -> Decoded {
         let op = w[0];
-        let mut x: u64 = 0;
-        let mut stall: u64 = 0;
-        let mut flow = Flow::None;
-        let mut dst = NONE;
-        let mut mac = false;
-        let mut is_move = false;
+        let mut d = Decoded { uses: [(NONE, NONE, 0); 2], ..Decoded::default() };
+        d.dst = NONE;
         let (sm, sr) = ea(op & 0x3F);
         match op >> 12 {
             // MOVE.B/.L/.W
             0x1 | 0x2 | 0x3 => {
-                is_move = true;
+                d.is_move = true;
                 let size = match op >> 12 {
                     1 => 1,
                     2 => 4,
@@ -290,18 +539,21 @@ impl Timing {
                 let (dm, dr) = ((op >> 6) & 7, (op >> 9) & 7);
                 let sw = ea_words(sm, sr, size);
                 if is_indexed(sm, sr) {
-                    x += 1;
+                    d.x += 1;
                 }
                 if dm == 6 {
-                    x += 1;
+                    d.x += 1;
                 }
                 if is_mem(sm, sr) && dm >= 2 {
-                    x += 1;
+                    d.x += 1;
                 }
-                stall = self.ea_stall(sm, sr, w[1]).max(if dm >= 2 { self.ea_stall(dm, dr, w[1 + sw]) } else { 0 });
+                use_ea(&mut d.uses[0], sm, sr, w[1]);
+                if dm >= 2 {
+                    use_ea(&mut d.uses[1], dm, dr, w[1 + sw]);
+                }
                 match dm {
-                    0 => dst = dr as u8,
-                    1 => dst = 8 + dr as u8,
+                    0 => d.dst = dr as u8,
+                    1 => d.dst = 8 + dr as u8,
                     _ => {}
                 }
             }
@@ -312,94 +564,94 @@ impl Timing {
                     let kind = (op >> 6) & 3; // 0 BTST, 1 BCHG, 2 BCLR, 3 BSET
                     let ext = if op & 0x0100 != 0 { 0 } else { 1 };
                     if kind != 0 || (sm == 0 && op & 0x0100 != 0) {
-                        x += 1;
+                        d.x += 1;
                     }
                     if is_indexed(sm, sr) {
-                        x += 1;
+                        d.x += 1;
                     }
-                    stall = self.ea_stall(sm, sr, w[1 + ext]);
+                    use_ea(&mut d.uses[0], sm, sr, w[1 + ext]);
                     if sm == 0 && kind != 0 {
-                        dst = sr as u8;
+                        d.dst = sr as u8;
                     }
                 } else {
                     // ORI/ANDI/SUBI/ADDI/EORI/CMPI #imm,Dx
                     if sm == 0 && (op >> 9) & 7 != 6 {
-                        dst = sr as u8;
+                        d.dst = sr as u8;
                     }
                 }
             }
             0x4 => {
                 match op {
-                    0x4E71 => x += 5,                               // NOP: 6, syncs
-                    0x4E73 => x += 14,                              // RTE: 15
-                    0x4E72 => x += 5,                               // STOP: 6
-                    0x4E75 => flow = Flow::Rts,                     // RTS: post
-                    0x4E7B => x += 19,                              // MOVEC: 20
-                    0x4E60..=0x4E6F => x += 2,                      // MOVE USP: 3
-                    _ if op & 0xFFF8 == 0x4E50 => x += 1,           // LINK.W: 2
+                    0x4E71 => d.x += 5,                               // NOP: 6, syncs
+                    0x4E73 => d.x += 14,                              // RTE: 15
+                    0x4E72 => d.x += 5,                               // STOP: 6
+                    0x4E75 => d.flow = 2,                     // RTS: post
+                    0x4E7B => d.x += 19,                              // MOVEC: 20
+                    0x4E60..=0x4E6F => d.x += 2,                      // MOVE USP: 3
+                    _ if op & 0xFFF8 == 0x4E50 => d.x += 1,           // LINK.W: 2
                     _ if op & 0xFFF0 == 0x4E40 => {}                // TRAP: exc
                     _ if op & 0xFF80 == 0x4E80 => {
                         // JSR (0x4E80) / JMP (0x4EC0)
-                        x += match sm {
+                        d.x += match sm {
                             2 | 5 => 4,
                             6 => 5,
                             7 if sr == 3 => 5,
                             _ => 1, // abs, (d16,PC): 1-3 cycles
                         };
-                        stall = self.ea_stall(sm, sr, w[1]);
+                        use_ea(&mut d.uses[0], sm, sr, w[1]);
                         if op & 0x0040 == 0 {
-                            flow = Flow::Call;
+                            d.flow = 1;
                         }
                     }
                     _ if op & 0xFFC0 == 0x4C00 => {
                         // MULx.L: 4
-                        x += 3;
-                        stall = self.ea_stall(sm, sr, w[2]);
-                        dst = ((w[1] >> 12) & 7) as u8;
+                        d.x += 3;
+                        use_ea(&mut d.uses[0], sm, sr, w[2]);
+                        d.dst = ((w[1] >> 12) & 7) as u8;
                     }
                     _ if op & 0xFFC0 == 0x4C40 => {
                         // DIVx.L / REMx.L: 35
-                        x += 34;
-                        stall = self.ea_stall(sm, sr, w[2]);
-                        dst = ((w[1] >> 12) & 7) as u8;
+                        d.x += 34;
+                        use_ea(&mut d.uses[0], sm, sr, w[2]);
+                        d.dst = ((w[1] >> 12) & 7) as u8;
                     }
                     _ if (op & 0xFFC0 == 0x48C0 || op & 0xFFC0 == 0x4CC0) && (sm == 2 || sm == 5) => {
                         // MOVEM.L: n
-                        x += (w[1].count_ones() as u64).saturating_sub(1);
-                        stall = self.ea_stall(sm, sr, 0);
+                        d.x += (w[1].count_ones() as u16).saturating_sub(1);
+                        use_ea(&mut d.uses[0], sm, sr, 0);
                     }
                     _ if op & 0xFFC0 == 0x46C0 => {
                         // MOVE to SR: 4 (1 with #imm and bit 13 set)
                         if !(sm == 7 && sr == 4 && w[1] & 0x2000 != 0) {
-                            x += 3;
+                            d.x += 3;
                         }
                     }
                     _ if op & 0xF1C0 == 0x41C0 => {
                         // LEA: the address ALU, forwarded without stalls.
                         if is_indexed(sm, sr) {
-                            x += 1;
+                            d.x += 1;
                         }
-                        stall = self.ea_stall(sm, sr, w[1]);
+                        use_ea(&mut d.uses[0], sm, sr, w[1]);
                     }
                     _ if op & 0xFFC0 == 0x4840 => {
                         // PEA (0x4840) / SWAP (mode 0)
                         if sm == 0 {
-                            dst = sr as u8;
+                            d.dst = sr as u8;
                         } else {
                             if is_indexed(sm, sr) {
-                                x += 1;
+                                d.x += 1;
                             }
-                            stall = self.ea_stall(sm, sr, w[1]);
+                            use_ea(&mut d.uses[0], sm, sr, w[1]);
                         }
                     }
                     _ => {
                         // CLR, NEG, NEGX, NOT, EXT, TST, TAS, MOVE from SR...
                         if is_indexed(sm, sr) {
-                            x += 1;
+                            d.x += 1;
                         }
-                        stall = self.ea_stall(sm, sr, w[1]);
+                        use_ea(&mut d.uses[0], sm, sr, w[1]);
                         if sm == 0 && op & 0x0F00 != 0x0A00 {
-                            dst = sr as u8;
+                            d.dst = sr as u8;
                         }
                     }
                 }
@@ -407,12 +659,12 @@ impl Timing {
             0x5 => {
                 // ADDQ/SUBQ/Scc/TPF
                 if is_indexed(sm, sr) {
-                    x += 1;
+                    d.x += 1;
                 }
-                stall = self.ea_stall(sm, sr, w[1]);
+                use_ea(&mut d.uses[0], sm, sr, w[1]);
                 match sm {
-                    0 => dst = sr as u8,
-                    1 => dst = 8 + sr as u8,
+                    0 => d.dst = sr as u8,
+                    1 => d.dst = 8 + sr as u8,
                     _ => {}
                 }
             }
@@ -425,44 +677,47 @@ impl Timing {
                     _ => 2,
                 };
                 match cond {
-                    0 => x += 1, // BRA: 1-3
+                    0 => d.x += 1, // BRA: 1-3
                     1 => {
-                        x += 1; // BSR: 1-3
-                        flow = Flow::Call;
+                        d.x += 1; // BSR: 1-3
+                        d.flow = 1;
                     }
-                    _ => flow = Flow::Bcc { pc, next: pc.wrapping_add(len) },
+                    _ => {
+                        d.flow = 3;
+                        d.len = len;
+                    }
                 }
             }
-            0x7 => dst = ((op >> 9) & 7) as u8, // MOVEQ / MVS / MVZ
+            0x7 => d.dst = ((op >> 9) & 7) as u8, // MOVEQ / MVS / MVZ
             0x8 | 0xC => {
                 let opmode = (op >> 6) & 7;
                 let dx = ((op >> 9) & 7) as u8;
                 if opmode == 3 || opmode == 7 {
                     // DIVx.W 20 / MULx.W 4
-                    x += if op >> 12 == 8 { 19 } else { 3 };
-                    dst = dx;
+                    d.x += if op >> 12 == 8 { 19 } else { 3 };
+                    d.dst = dx;
                 } else if opmode < 3 {
-                    dst = dx;
+                    d.dst = dx;
                 }
                 if is_indexed(sm, sr) {
-                    x += 1;
+                    d.x += 1;
                 }
-                stall = self.ea_stall(sm, sr, w[1]);
+                use_ea(&mut d.uses[0], sm, sr, w[1]);
             }
             0x9 | 0xB | 0xD => {
                 let opmode = (op >> 6) & 7;
                 let rx = ((op >> 9) & 7) as u8;
                 if is_indexed(sm, sr) {
-                    x += 1;
+                    d.x += 1;
                 }
-                stall = self.ea_stall(sm, sr, w[1]);
+                use_ea(&mut d.uses[0], sm, sr, w[1]);
                 let cmp = op >> 12 == 0xB && (opmode < 3 || opmode == 7 || opmode == 3);
                 if !cmp {
                     match opmode {
-                        0..=2 => dst = rx,
-                        3 | 7 => dst = 8 + rx,
-                        _ if sm == 0 && op >> 12 == 0xB => dst = sr as u8, // EOR Dy,Dx
-                        _ if sm == 0 => dst = rx,                          // ADDX / SUBX Dy,Dx
+                        0..=2 => d.dst = rx,
+                        3 | 7 => d.dst = 8 + rx,
+                        _ if sm == 0 && op >> 12 == 0xB => d.dst = sr as u8, // EOR Dy,Dx
+                        _ if sm == 0 => d.dst = rx,                          // ADDX / SUBX Dy,Dx
                         _ => {}
                     }
                 }
@@ -471,46 +726,91 @@ impl Timing {
                 // EMAC.
                 let movacc_to = op & 0xF9C0 == 0xA100; // MOVE.L <ea>,ACCx
                 if op & 0xFFC0 == 0xA900 {
-                    x += 7; // MOVE.L <ea>,MACSR: 8
+                    d.x += 7; // MOVE.L <ea>,MACSR: 8
                 } else if op & 0xFFC0 == 0xAD00 {
-                    x += 6; // MOVE.L <ea>,MASK: 7
+                    d.x += 6; // MOVE.L <ea>,MASK: 7
                 } else if op & 0xF9F0 == 0xA180 || op & 0xFFF0 == 0xA980 || op & 0xFFF0 == 0xAD80 || op & 0xFFF0 == 0xAB80 || op & 0xFFF0 == 0xAF80 {
                     // MOVE.L ACCx/MACSR/MASK/ACCEXT,Rx: 4 right after a MAC.
-                    if self.last_mac {
-                        x += 3;
-                    }
-                    dst = (op & 15) as u8;
+                    d.mac_rd = true;
+                    d.dst = (op & 15) as u8;
                 } else if movacc_to {
-                    mac = true;
+                    d.mac = true;
                 } else {
                     // MAC/MSAC, maybe with a load (bit 7 of the opword set
                     // means register form for some encodings; the load forms
                     // write Rw).
-                    mac = true;
-                    stall = self.ea_stall(sm, sr, 0);
+                    d.mac = true;
+                    use_ea(&mut d.uses[0], sm, sr, 0);
                 }
             }
             0xE => {
                 if op & 0x00C0 != 0x00C0 {
-                    dst = (op & 7) as u8;
+                    d.dst = (op & 7) as u8;
                 }
             }
             0xF => {
                 if op & 0xFF00 == 0xF400 {
-                    x += match (op >> 6) & 3 {
+                    d.x += match (op >> 6) & 3 {
                         1 => 11, // dc: 12
                         _ => 17, // ic, bc: 18
                     };
                     if op & 0xFFF8 == 0xF428 {
-                        x = 18; // INTOUCH: 19
+                        d.x = 18; // INTOUCH: 19
                     }
                 }
             }
             _ => {}
         }
+        d
+    }
+
+    /// Cycles beyond one for the instruction at `pc` whose words start
+    /// with `w` (`w[0]` the opword; 6 words, zero past the end are fine).
+    /// -> (extra cycles, what `post` must check, whether a cycle is
+    /// refunded for folding).
+    pub fn pre(&mut self, pc: u32, w: &[u16; 6]) -> (u64, Flow, bool) {
+        let d = Self::decode(w);
+        self.apply(pc, &d)
+    }
+
+    /// `pre` with the decoding memoised by (PC, opword, next word).
+    #[inline]
+    pub fn pre_memo(&mut self, pc: u32, op: u16, w1: u16, words: impl FnOnce() -> [u16; 6]) -> (u64, Flow, bool) {
+        let k = ((pc >> 1) as usize) & (MEMO - 1);
+        let key = (pc, op, w1);
+        if self.memo_key[k] != key {
+            self.memo_key[k] = key;
+            self.memo[k] = Self::decode(&words());
+        }
+        let d = self.memo[k];
+        self.apply(pc, &d)
+    }
+
+    fn apply(&mut self, pc: u32, d: &Decoded) -> (u64, Flow, bool) {
+        let mut x = d.x as u64;
+        if d.mac_rd && self.last_mac {
+            x += 3;
+        }
+        let mut stall = 0u64;
+        if self.last_dst != NONE {
+            for &(base, idx, st) in &d.uses {
+                if base == self.last_dst {
+                    stall = stall.max(2);
+                }
+                if idx == self.last_dst {
+                    stall = stall.max(st as u64);
+                }
+            }
+        }
+        let flow = match d.flow {
+            1 => Flow::Call,
+            2 => Flow::Rts,
+            3 => Flow::Bcc { pc, next: pc.wrapping_add(d.len as u32) },
+            _ => Flow::None,
+        };
         // MOVE folding: a MOVE after an unfolded instruction issues with it.
         let mut folded = false;
-        if is_move && !self.last_folded && self.p.fold > 0.0 && stall == 0 && x == 0 {
+        if d.is_move && !self.last_folded && self.p.fold > 0.0 && stall == 0 && x == 0 {
             self.fold_acc += self.p.fold;
             if self.fold_acc >= 1.0 {
                 self.fold_acc -= 1.0;
@@ -519,8 +819,8 @@ impl Timing {
             }
         }
         self.last_folded = folded;
-        self.last_dst = dst;
-        self.last_mac = mac;
+        self.last_dst = d.dst;
+        self.last_mac = d.mac;
         self.stats.instructions += 1;
         self.stats.table += x;
         self.stats.stall += stall;
@@ -583,35 +883,62 @@ impl Timing {
         self.p.exc as u64
     }
 
-    /// Cache-model counter deltas over one access -> cycles.
+    /// Instruction fetch of `len` bytes at `pc`: I-cache line fills.
     #[inline]
-    pub fn cache_cost(&mut self, dmiss: u64, wb: u64, imiss: u64) -> u64 {
-        let (a, b, c) = (dmiss * self.p.dmiss as u64, wb * self.p.wb as u64, imiss * self.p.imiss as u64);
-        self.stats.dmiss += a;
-        self.stats.wb += b;
+    pub fn ifetch(&mut self, pc: u32, len: u32) -> u64 {
+        let end = pc.wrapping_add(len.max(1) - 1);
+        let (l0, l1) = (pc & !(LINE - 1), end & !(LINE - 1));
+        let mut n = 0u64;
+        if l0 != self.last_iline {
+            n += self.tags.ifetch(pc) as u64;
+        } else {
+            self.tags.i_hits += 1;
+        }
+        if l1 != l0 {
+            n += self.tags.ifetch(end) as u64;
+        }
+        self.last_iline = l1;
+        let c = n * self.p.imiss as u64;
         self.stats.imiss += c;
-        a + b + c
+        c
     }
 
-    /// A CPU access that bypassed the caches.
+    /// A CPU data access at `a` in region `r` -> cycles.
     #[inline]
-    pub fn uncached(&mut self, kind: Region, write: bool) -> u64 {
-        let c = match kind {
+    pub fn data(&mut self, a: u32, write: bool, r: Region) -> u64 {
+        match r {
             Region::Ddr => {
-                let c = if write { self.p.unc_wr } else { self.p.unc_rd };
-                self.stats.unc += c as u64;
-                c
+                let (miss, push, inhibited) = self.tags.data(a, write);
+                if inhibited {
+                    let c = if write { self.p.unc_wr } else { self.p.unc_rd } as u64;
+                    self.stats.unc += c;
+                    return c;
+                }
+                let (a, b) = (if miss { self.p.dmiss as u64 } else { 0 }, if push { self.p.wb as u64 } else { 0 });
+                self.stats.dmiss += a;
+                self.stats.wb += b;
+                a + b
             }
             Region::Sram => {
                 self.stats.sram += self.p.sram as u64;
-                self.p.sram
+                self.p.sram as u64
             }
             Region::Io => {
                 self.stats.io += self.p.io as u64;
-                self.p.io
+                self.p.io as u64
             }
-        };
-        c as u64
+        }
+    }
+
+    /// CPUSHL / INTOUCH on the tags -> cycles beyond the table's.
+    pub fn cache_op(&mut self, which: u8, an: u32, in_ddr: bool) -> u64 {
+        if which == 0 && !in_ddr {
+            return 0;
+        }
+        let pushed = self.tags.cpushl(which, an);
+        let c = if pushed { self.p.wb as u64 } else { 0 };
+        self.stats.wb += c;
+        c
     }
 
     /// One line for the end of a run.
@@ -629,13 +956,18 @@ impl Timing {
             ("sram", s.sram),
             ("io", s.io),
         ];
+        let tg = &self.tags;
+        let rate = |h: u64, m: u64| if h + m == 0 { 0.0 } else { 100.0 * h as f64 / (h + m) as f64 };
         let mut out = format!(
-            "timing: unit, {:.0} MHz, {} cycles, {} instructions ({} folded, {} mispredicted branches); extra:",
+            "timing: unit, {:.0} MHz, {} cycles, {} instructions ({} folded, {} mispredicted branches); \
+             D-cache {:.2}% hits, I-cache {:.2}% hits; extra:",
             self.p.hz / 1e6,
             now,
             s.instructions,
             s.folded,
-            s.mispredicts
+            s.mispredicts,
+            rate(tg.d_hits, tg.d_misses),
+            rate(tg.i_hits, tg.i_misses)
         );
         for (k, v) in parts {
             out += &format!(" {k} {v} ({:.1}%)", pct(v));
