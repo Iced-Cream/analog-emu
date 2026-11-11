@@ -670,7 +670,8 @@ impl Cpu {
             b.tcost = c;
             b.tn = k;
         } else {
-            let x = if tn > 0 { cost as f64 } else { t.g_cold * n as f64 };
+            let x = if tn > 0 { cost as f64 } else { t.stats.cold_runs += n; t.g_cold * n as f64 };
+            t.stats.gap_ops += n;
             self.bus.io.now += t.charge_learned(x);
         }
     }

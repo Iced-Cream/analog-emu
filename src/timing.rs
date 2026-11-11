@@ -163,6 +163,9 @@ pub struct Stats {
     pub instructions: u64,
     /// Cycles charged from learned block costs (sampled mode).
     pub learned: u64,
+    /// Sampled mode: block runs between windows with no learned cost, and all ops run there.
+    pub cold_runs: u64,
+    pub gap_ops: u64,
     /// Table cycles beyond one per instruction.
     pub table: u64,
     pub stall: u64,
@@ -1037,7 +1040,14 @@ impl Timing {
             self.g_cold = self.cold_extra as f64 / self.cold_ops as f64;
             (e, 1)
         } else {
-            (cost + (e - cost) / 8.0, n.saturating_add(1))
+            {
+            // A running mean, not a short moving average: a block's costly
+            // runs come in bursts (the cold first pass of a loop, then many
+            // warm ones), and a short average forgets them by the time the
+            // burst ends. Capped so the mean can still follow a change.
+            let k = n.saturating_add(1).min(1 << 16);
+            (cost + (e - cost) / k as f32, n.saturating_add(1))
+        }
         }
     }
 
@@ -1136,6 +1146,8 @@ impl Timing {
             ("sram", s.sram),
             ("io", s.io),
             ("learned", s.learned),
+            ("cold_runs", s.cold_runs),
+            ("gap_ops", s.gap_ops),
         ];
         let tg = &self.tags;
         let rate = |h: u64, m: u64| if h + m == 0 { 0.0 } else { 100.0 * h as f64 / (h + m) as f64 };
