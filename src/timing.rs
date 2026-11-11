@@ -55,8 +55,11 @@ pub struct Params {
     pub dmiss: u32,
     /// Dirty D-cache line pushed to DDR (mostly hidden by the push buffer).
     pub wb: u32,
-    /// I-cache line fill from DDR.
+    /// I-cache line fill from DDR after a change of flow.
     pub imiss: u32,
+    /// I-cache line fill of the line after the last one fetched: the
+    /// fetch pipeline (IFP) has started it ahead, so less of it shows.
+    pub imiss_seq: u32,
     /// Data read from DDR past the D-cache (uncached alias).
     pub unc_rd: u32,
     /// Data write to DDR past the D-cache (precise: holds the pipeline).
@@ -65,6 +68,14 @@ pub struct Params {
     pub sram: u32,
     /// An access to a peripheral register.
     pub io: u32,
+    /// Sampled mode: measure every instruction and access for `window_us`
+    /// of each `period_us` of emulated time, and charge each block's
+    /// learned cost the rest of the time.
+    pub window_us: f64,
+    pub period_us: f64,
+    /// The share of each window spent warming the cache tags (their state
+    /// is stale after a gap) before learning starts.
+    pub warm: f64,
 }
 
 impl Default for Params {
@@ -74,13 +85,17 @@ impl Default for Params {
             fold: 0.0,
             exc: 17,
             mispredict: 8,
-            dmiss: 24,
+            dmiss: 42,
             wb: 4,
-            imiss: 24,
-            unc_rd: 20,
+            imiss: 42,
+            imiss_seq: 42,
+            unc_rd: 38,
             unc_wr: 8,
             sram: 0,
             io: 10,
+            window_us: 2000.0,
+            period_us: 20000.0,
+            warm: 0.5,
         }
     }
 }
@@ -112,15 +127,22 @@ impl Params {
                 "dmiss" => self.dmiss = u()?,
                 "wb" => self.wb = u()?,
                 "imiss" => self.imiss = u()?,
+                "imiss_seq" => self.imiss_seq = u()?,
                 "unc_rd" => self.unc_rd = u()?,
                 "unc_wr" => self.unc_wr = u()?,
                 "sram" => self.sram = u()?,
                 "io" => self.io = u()?,
+                "window_us" => self.window_us = f,
+                "period_us" => self.period_us = f,
+                "warm" => self.warm = f,
                 other => return Err(format!("timing param `{other}`: unknown")),
             }
         }
         if self.hz <= 0.0 || !(0.0..=1.0).contains(&self.fold) {
             return Err("timing params: hz must be > 0 and fold within 0..1".into());
+        }
+        if !(self.window_us > 0.0 && self.window_us <= self.period_us) {
+            return Err("timing params: want 0 < window_us <= period_us".into());
         }
         Ok(())
     }
@@ -129,7 +151,12 @@ impl Params {
 /// Where the cycles went, for the end-of-run summary and the fit.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Stats {
+    /// Peripheral accesses per 16 KB page (for `summary`).
+    #[serde(skip)]
+    pub io_pages: std::collections::BTreeMap<u32, u64>,
     pub instructions: u64,
+    /// Cycles charged from learned block costs (sampled mode).
+    pub learned: u64,
     /// Table cycles beyond one per instruction.
     pub table: u64,
     pub stall: u64,
@@ -218,6 +245,54 @@ pub struct Timing {
     /// The I-cache line of the last fetch (a fetch in the same line hits).
     #[serde(skip)]
     last_iline: u32,
+    /// Sampled mode: measuring now, and the clock of the next switch.
+    pub measuring: bool,
+    pub next_switch: u64,
+    /// Learning starts this far into a window (the tags were not kept up
+    /// to date outside it).
+    pub learn_from: u64,
+    /// Average cycles beyond one per instruction in the last window, for
+    /// code without a learned block cost; and this window's sums.
+    pub g_extra: f64,
+    win_extra: u64,
+    win_ops: u64,
+    /// First measured runs of blocks, over all windows: the cost for a
+    /// block not learned yet (rare code runs cold, above the window average).
+    cold_extra: u64,
+    cold_ops: u64,
+    pub g_cold: f64,
+    /// Fractional cycles carried between learned charges.
+    frac: f64,
+    rng: u64,
+    /// `DTEMU_TIMING_FN=ADDR`: time every call of the function at ADDR,
+    /// callees included (entry clock and A7, then calls and total cycles).
+    #[serde(skip)]
+    pub probe: Option<Probe>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Probe {
+    pub addr: u32,
+    pub open: Option<(u64, u32)>,
+    pub calls: u64,
+    pub cycles: u64,
+}
+
+impl Probe {
+    /// Called before each instruction with its PC, the clock and A7.
+    #[inline]
+    pub fn step(&mut self, pc: u32, now: u64, sp: u32) {
+        if let Some((t0, sp0)) = self.open {
+            // Returned: A7 is above the return address the call pushed.
+            if sp > sp0 {
+                self.calls += 1;
+                self.cycles += now - t0;
+                self.open = None;
+            }
+        } else if pc == self.addr {
+            self.open = Some((now, sp));
+        }
+    }
 }
 
 fn memo_keys() -> Vec<(u32, u16, u16)> {
@@ -499,6 +574,21 @@ impl Timing {
             memo_key: memo_keys(),
             memo: memo_vals(),
             last_iline: u32::MAX,
+            measuring: true,
+            next_switch: 0,
+            learn_from: 0,
+            g_extra: 1.0,
+            win_extra: 0,
+            win_ops: 0,
+            cold_extra: 0,
+            cold_ops: 0,
+            g_cold: 1.0,
+            frac: 0.0,
+            rng: 0x9E37_79B9_7F4A_7C15,
+            probe: std::env::var("DTEMU_TIMING_FN")
+                .ok()
+                .and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+                .map(|addr| Probe { addr, ..Probe::default() }),
         }
     }
 
@@ -507,14 +597,18 @@ impl Timing {
     /// default, so a run never claims unit timing it doesn't have.
     pub fn from_env() -> Result<Option<Timing>, String> {
         let v = std::env::var("DTEMU_TIMING").unwrap_or_default();
-        match v.as_str() {
+        let exact = match v.as_str() {
             "" | "0" | "off" => return Ok(None),
-            "unit" | "1" => {}
-            other => return Err(format!("DTEMU_TIMING={other}: want `unit` (or unset)")),
-        }
+            "unit" | "1" => false,
+            "exact" => true,
+            other => return Err(format!("DTEMU_TIMING={other}: want `unit`, `exact` (or unset)")),
+        };
         let mut p = Params::default();
         if let Ok(s) = std::env::var("DTEMU_TIMING_PARAMS") {
             p.apply(&s)?;
+        }
+        if exact {
+            p.window_us = p.period_us;
         }
         Ok(Some(Timing::new(p)))
     }
@@ -529,7 +623,7 @@ impl Timing {
         let (sm, sr) = ea(op & 0x3F);
         match op >> 12 {
             // MOVE.B/.L/.W
-            0x1 | 0x2 | 0x3 => {
+            0x1..=0x3 => {
                 d.is_move = true;
                 let size = match op >> 12 {
                     1 => 1,
@@ -748,15 +842,13 @@ impl Timing {
                     d.dst = (op & 7) as u8;
                 }
             }
-            0xF => {
-                if op & 0xFF00 == 0xF400 {
-                    d.x += match (op >> 6) & 3 {
-                        1 => 11, // dc: 12
-                        _ => 17, // ic, bc: 18
-                    };
-                    if op & 0xFFF8 == 0xF428 {
-                        d.x = 18; // INTOUCH: 19
-                    }
+            0xF if op & 0xFF00 == 0xF400 => {
+                d.x += match (op >> 6) & 3 {
+                    1 => 11, // dc: 12
+                    _ => 17, // ic, bc: 18
+                };
+                if op & 0xFFF8 == 0xF428 {
+                    d.x = 18; // INTOUCH: 19
                 }
             }
             _ => {}
@@ -883,22 +975,93 @@ impl Timing {
         self.p.exc as u64
     }
 
+    /// Sampled mode: the phase at clock `now`. -> Some(measuring) when it
+    /// changes. Exact mode (window = period) measures throughout.
+    #[inline]
+    pub fn phase(&mut self, now: u64) -> Option<bool> {
+        if now < self.next_switch {
+            return None;
+        }
+        let us = self.p.hz / 1e6;
+        if self.p.window_us >= self.p.period_us {
+            self.next_switch = u64::MAX;
+            self.measuring = true;
+            return Some(true);
+        }
+        if self.measuring && self.next_switch != 0 {
+            // A window ends: its average for code without a learned cost.
+            if self.win_ops > 0 {
+                self.g_extra = self.win_extra as f64 / self.win_ops as f64;
+            }
+            self.measuring = false;
+            // The gap is jittered (0.5x..1.5x, a fixed xorshift sequence, so
+            // runs repeat) so that windows do not lock onto the firmware's
+            // own periods (UI ticks, render blocks) and sample one phase of them.
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            let j = 0.5 + (self.rng >> 11) as f64 / (1u64 << 53) as f64;
+            self.next_switch = now + ((self.p.period_us - self.p.window_us) * us * j) as u64;
+        } else {
+            self.measuring = true;
+            self.win_extra = 0;
+            self.win_ops = 0;
+            self.last_iline = u32::MAX;
+            self.last_dst = NONE;
+            self.learn_from = now + (self.p.window_us * self.p.warm * us) as u64;
+            self.next_switch = now + (self.p.window_us * us) as u64;
+        }
+        Some(self.measuring)
+    }
+
+    /// A measured run of a block: `extra` cycles beyond one per
+    /// instruction over `ops` instructions, ending at clock `now`. -> the
+    /// block's updated (cost, runs).
+    #[inline]
+    pub fn learn(&mut self, now: u64, extra: u64, ops: u64, cost: f32, n: u32) -> (f32, u32) {
+        if now < self.learn_from {
+            return (cost, n);
+        }
+        self.win_extra += extra;
+        self.win_ops += ops;
+        let e = extra as f32;
+        if n == 0 {
+            self.cold_extra += extra;
+            self.cold_ops += ops;
+            self.g_cold = self.cold_extra as f64 / self.cold_ops as f64;
+            (e, 1)
+        } else {
+            (cost + (e - cost) / 8.0, n.saturating_add(1))
+        }
+    }
+
+    /// Outside a window: `x` learned cycles -> whole cycles to add now.
+    #[inline]
+    pub fn charge_learned(&mut self, x: f64) -> u64 {
+        self.frac += x;
+        let c = self.frac.floor();
+        self.frac -= c;
+        self.stats.learned += c as u64;
+        c as u64
+    }
+
     /// Instruction fetch of `len` bytes at `pc`: I-cache line fills.
     #[inline]
     pub fn ifetch(&mut self, pc: u32, len: u32) -> u64 {
         let end = pc.wrapping_add(len.max(1) - 1);
         let (l0, l1) = (pc & !(LINE - 1), end & !(LINE - 1));
-        let mut n = 0u64;
+        let mut c = 0u64;
         if l0 != self.last_iline {
-            n += self.tags.ifetch(pc) as u64;
+            if self.tags.ifetch(pc) {
+                c += if l0 == self.last_iline.wrapping_add(LINE) { self.p.imiss_seq } else { self.p.imiss } as u64;
+            }
         } else {
             self.tags.i_hits += 1;
         }
-        if l1 != l0 {
-            n += self.tags.ifetch(end) as u64;
+        if l1 != l0 && self.tags.ifetch(end) {
+            c += self.p.imiss_seq as u64;
         }
         self.last_iline = l1;
-        let c = n * self.p.imiss as u64;
         self.stats.imiss += c;
         c
     }
@@ -924,6 +1087,7 @@ impl Timing {
                 self.p.sram as u64
             }
             Region::Io => {
+                *self.stats.io_pages.entry(a & !0x3FFF).or_insert(0) += 1;
                 self.stats.io += self.p.io as u64;
                 self.p.io as u64
             }
@@ -943,6 +1107,16 @@ impl Timing {
 
     /// One line for the end of a run.
     pub fn summary(&self, now: u64) -> String {
+        let probe = self.probe.as_ref().map(|p| {
+            let avg = if p.calls == 0 { 0.0 } else { p.cycles as f64 / p.calls as f64 };
+            format!(
+                "\ntiming: fn {:08x}: {} calls, {:.0} cycles = {:.2} us a call",
+                p.addr,
+                p.calls,
+                avg,
+                avg / self.p.hz * 1e6
+            )
+        });
         let s = &self.stats;
         let pct = |v: u64| if now == 0 { 0.0 } else { v as f64 * 100.0 / now as f64 };
         let parts = [
@@ -955,12 +1129,14 @@ impl Timing {
             ("unc", s.unc),
             ("sram", s.sram),
             ("io", s.io),
+            ("learned", s.learned),
         ];
         let tg = &self.tags;
         let rate = |h: u64, m: u64| if h + m == 0 { 0.0 } else { 100.0 * h as f64 / (h + m) as f64 };
         let mut out = format!(
-            "timing: unit, {:.0} MHz, {} cycles, {} instructions ({} folded, {} mispredicted branches); \
+            "timing: unit ({}), {:.0} MHz, {} cycles, {} instructions ({} folded, {} mispredicted branches); \
              D-cache {:.2}% hits, I-cache {:.2}% hits; extra:",
+            if self.p.window_us >= self.p.period_us { "exact".to_string() } else { format!("sampled {:.0}/{:.0} us", self.p.window_us, self.p.period_us) },
             self.p.hz / 1e6,
             now,
             s.instructions,
@@ -973,7 +1149,13 @@ impl Timing {
             out += &format!(" {k} {v} ({:.1}%)", pct(v));
         }
         out += &format!(" branch {}", s.branch);
-        out
+        let mut pages: Vec<_> = s.io_pages.iter().collect();
+        pages.sort_by_key(|p| std::cmp::Reverse(*p.1));
+        out += "\ntiming: io pages:";
+        for (pg, n) in pages.iter().take(8) {
+            out += &format!(" {pg:08x}:{n}");
+        }
+        out + &probe.unwrap_or_default()
     }
 }
 

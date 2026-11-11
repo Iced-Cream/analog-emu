@@ -553,6 +553,9 @@ impl Cpu {
             if self.stopped {
                 return Stop::Stopped;
             }
+            if self.bus.timing.is_some() {
+                self.timing_phase();
+            }
             let pc = self.pc;
             // Fast path: a built block. None starts at a hooked PC (hooks
             // flush the cache, and the slow path below never stores one),
@@ -632,7 +635,44 @@ impl Cpu {
             }
         }
         let blk: *const [crate::fast::Op] = &*self.bus.blk_arena[i].ops;
+        if self.bus.timing.is_some() {
+            return self.run_ops_timed(pc, i, blk);
+        }
         self.run_ops(pc, blk);
+    }
+
+    /// Unit timing: switch between measuring and charging learned costs.
+    #[cold]
+    #[inline(never)]
+    fn timing_phase(&mut self) {
+        let now = self.bus.io.now;
+        if let Some(live) = self.bus.timing.as_mut().unwrap().phase(now) {
+            self.bus.timing_live = live;
+        }
+    }
+
+    /// Unit timing on a block: measured (and learned from) in a window,
+    /// else run plain and charged its learned cost.
+    #[cold]
+    #[inline(never)]
+    fn run_ops_timed(&mut self, pc: u32, i: usize, blk: *const [crate::fast::Op]) {
+        let t0 = self.bus.io.now;
+        let n = self.run_ops(pc, blk) as u64;
+        let now = self.bus.io.now;
+        let (cost, tn) = (self.bus.blk_arena[i].tcost, self.bus.blk_arena[i].tn);
+        let t = self.bus.timing.as_mut().unwrap();
+        if self.bus.timing_live {
+            let extra = (now - t0).saturating_sub(n);
+            let (c, k) = t.learn(now, extra, n, cost, tn);
+            // The block may be gone if it wrote code (flush at the next
+            // boundary), but its slot is still there.
+            let b = &mut self.bus.blk_arena[i];
+            b.tcost = c;
+            b.tn = k;
+        } else {
+            let x = if tn > 0 { cost as f64 } else { t.g_cold * n as f64 };
+            self.bus.io.now += t.charge_learned(x);
+        }
     }
 
     /// Run compiled code, then the compiled blocks that follow, for as long
@@ -727,7 +767,7 @@ impl Cpu {
     /// when control leaves the straight line: a taken branch, an
     /// exception, STOP.
     #[inline(always)]
-    fn run_ops(&mut self, pc: u32, blk: *const [crate::fast::Op]) {
+    fn run_ops(&mut self, pc: u32, blk: *const [crate::fast::Op]) -> usize {
         // SAFETY: blocks are boxed and only dropped by `icache_settle`,
         // which runs between blocks, never while one executes.
         let ops: &[crate::fast::Op] = unsafe { &*blk };
@@ -743,8 +783,10 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn run_ops_loop<const EXACT: bool>(&mut self, mut pc: u32, ops: &[crate::fast::Op]) {
+    fn run_ops_loop<const EXACT: bool>(&mut self, mut pc: u32, ops: &[crate::fast::Op]) -> usize {
+        let mut n = 0;
         for op in ops {
+            n += 1;
             self.op_pc = pc;
             if EXACT {
                 self.bus.pc = pc;
@@ -752,7 +794,7 @@ impl Cpu {
             self.bus.io.now += 1;
             let next = pc.wrapping_add(op.len as u32);
             self.pc = next;
-            if self.bus.timing.is_some() {
+            if self.bus.timing_live {
                 let flow = self.timing_pre(op.op, op.len);
                 (op.h)(self, op);
                 self.timing_post(flow);
@@ -764,6 +806,7 @@ impl Cpu {
             }
             pc = next;
         }
+        n
     }
 
     /// Execute exactly one instruction.
@@ -778,12 +821,16 @@ impl Cpu {
         }
         let op = crate::fast::decode(self, pc);
         self.pc = pc.wrapping_add(op.len as u32);
-        if self.bus.timing.is_some() {
+        if self.bus.timing_live {
             let flow = self.timing_pre(op.op, op.len);
             (op.h)(self, &op);
             return self.timing_post(flow);
         }
         (op.h)(self, &op);
+        if let Some(t) = self.bus.timing.as_mut() {
+            let x = t.g_extra;
+            self.bus.io.now += t.charge_learned(x);
+        }
     }
 
     pub(crate) fn execute(&mut self) {
@@ -797,6 +844,13 @@ impl Cpu {
     fn execute_timed(&mut self) {
         if self.bus.timing.is_none() {
             return self.execute();
+        }
+        if !self.bus.timing_live {
+            self.execute();
+            let t = self.bus.timing.as_mut().unwrap();
+            let x = t.g_extra;
+            self.bus.io.now += t.charge_learned(x);
+            return;
         }
         let op = self.bus.peek16(self.op_pc);
         let flow = self.timing_pre(op, 0);
@@ -812,6 +866,9 @@ impl Cpu {
         let pc = self.op_pc;
         let w1 = self.bus.peek16(pc.wrapping_add(2));
         let mut t = self.bus.timing.take().unwrap();
+        if let Some(p) = t.probe.as_mut() {
+            p.step(pc, self.bus.io.now, self.a[7]);
+        }
         let mut extra = t.ifetch(pc, if len == 0 { 2 } else { len as u32 });
         // The other words are read only when the PC's memo entry misses.
         let bus = &self.bus;
