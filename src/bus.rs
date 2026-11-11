@@ -131,6 +131,10 @@ pub struct Bus {
     pub icache_invalidations: u64,
     /// The cache model (`DTEMU_CACHE`, cache.rs): None normally.
     pub cache: Option<Box<crate::cache::Caches>>,
+    /// Unit timing (`DTEMU_TIMING=unit`, timing.rs): None normally. When on,
+    /// the cache model is on too, and CPU accesses add their cycles to the
+    /// clock.
+    pub timing: Option<Box<crate::timing::Timing>>,
 }
 
 /// A predecoded block, and its compiled code once it ran hot.
@@ -190,6 +194,7 @@ impl Bus {
             icache_decodes: 0,
             icache_invalidations: 0,
             cache: None,
+            timing: None,
         }
     }
 
@@ -587,14 +592,47 @@ impl Bus {
         // eDMA (in_dma) reads memory, past the caches.
         if !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
             let c = self.cache.as_mut().unwrap();
+            let before = (c.stats.d_misses, c.stats.d_writebacks);
             if let Some(v) = c.read(&mut self.ddr, self.ddr_mask, a, n) {
+                self.charge_d(before);
                 if self.watch_reads {
                     self.check_watch(a, n, v);
                 }
                 return v;
             }
         }
+        self.charge_uncached(a);
         self.mem_read(a, n)
+    }
+
+    /// Unit timing: the cycles of the D-cache misses and write-backs since
+    /// `before` (the counters before the access).
+    #[inline(always)]
+    fn charge_d(&mut self, before: (u64, u64)) {
+        if let (Some(t), Some(c)) = (self.timing.as_mut(), self.cache.as_ref()) {
+            let cy = t.cache_cost(c.stats.d_misses - before.0, c.stats.d_writebacks - before.1, 0);
+            self.io.now += cy;
+        }
+    }
+
+    /// Unit timing: a CPU access that went past the caches (not eDMA).
+    #[inline(always)]
+    fn charge_uncached(&mut self, a: u32) {
+        if self.in_dma {
+            return;
+        }
+        if self.timing.is_none() {
+            return;
+        }
+        let r = if self.ddr_off(a).is_some() {
+            crate::timing::Region::Ddr
+        } else if self.sram_off(a).is_some() {
+            crate::timing::Region::Sram
+        } else {
+            crate::timing::Region::Io
+        };
+        let t = self.timing.as_mut().unwrap();
+        self.io.now += t.uncached(r);
     }
 
     #[cold]
@@ -602,11 +640,14 @@ impl Bus {
     fn cached_write(&mut self, a: u32, n: u32, v: u32) {
         if !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
             let c = self.cache.as_mut().unwrap();
+            let before = (c.stats.d_misses, c.stats.d_writebacks);
             if c.write(&mut self.ddr, self.ddr_mask, a, n, v) {
+                self.charge_d(before);
                 self.check_watch(a, n, v);
                 return;
             }
         }
+        self.charge_uncached(a);
         match n {
             1 => self.write8_mem(a, v as u8),
             2 => self.write16_mem(a, v as u16),
@@ -620,11 +661,17 @@ impl Bus {
         if self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
             let pc = self.pc;
             let c = self.cache.as_mut().unwrap();
+            let before = c.stats.i_misses;
             if let Some(v) = c.ifetch(&self.ddr, self.ddr_mask, a, n, pc) {
+                let after = c.stats.i_misses;
+                if let Some(t) = self.timing.as_mut() {
+                    self.io.now += t.cache_cost(0, 0, after - before);
+                }
                 return v;
             }
         }
         // Not instruction-cacheable: memory itself, past the D-cache too.
+        self.charge_uncached(a);
         self.mem_read(a, n)
     }
 

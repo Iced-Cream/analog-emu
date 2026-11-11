@@ -455,6 +455,9 @@ impl Cpu {
     /// interrupt mask (interrupts); synchronous exceptions leave it.
     pub fn exception(&mut self, vec: u8, pc: u32, level: Option<u8>) {
         self.exc_counts[vec as usize] += 1;
+        if let Some(t) = self.bus.timing.as_mut() {
+            self.bus.io.now += t.exception();
+        }
         let old_sr = self.sr;
         let mut new_sr = (old_sr | SR_S) & !SR_T;
         if let Some(l) = level {
@@ -774,7 +777,19 @@ impl Cpu {
 
     pub(crate) fn execute(&mut self) {
         let op = self.fetch16();
+        if self.bus.timing.is_some() {
+            self.charge_op(op);
+        }
         self.dispatch(op);
+    }
+
+    /// Unit timing: the extra cycles of `op`, just fetched at `op_pc`.
+    #[cold]
+    #[inline(never)]
+    fn charge_op(&mut self, op: u16) {
+        let ext = self.bus.peek16(self.op_pc.wrapping_add(2));
+        let t = self.bus.timing.as_mut().unwrap();
+        self.bus.io.now += t.op_extra(op, ext);
     }
 
     /// Execute `op`, already fetched, with PC past it.

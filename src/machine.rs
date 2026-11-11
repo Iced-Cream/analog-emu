@@ -183,6 +183,15 @@ impl Machine {
         // DTEMU_CACHE=1 (or =log): the I- and D-cache model (cache.rs). It
         // runs on the interpreter alone, without predecoded blocks.
         bus.cache = crate::cache::Caches::from_env().map(Box::new);
+        // DTEMU_TIMING=unit: the clock counts core cycles (timing.rs). Its
+        // memory costs come from the cache model, so that is turned on too.
+        if let Some(t) = crate::timing::Timing::from_env()? {
+            bus.io.ips = t.p.hz;
+            if bus.cache.is_none() {
+                bus.cache = Some(Box::new(crate::cache::Caches::new(16, false)));
+            }
+            bus.timing = Some(Box::new(t));
+        }
         let cached = bus.cache.is_some();
         if std::env::var_os("DTEMU_NO_ICACHE").is_none() && !cached {
             bus.icache_enable(os.data.len() as u32);
