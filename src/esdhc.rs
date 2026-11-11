@@ -59,8 +59,8 @@ const ID_C: u8 = 0x08;
 /// - The firmware writes the +Drive in 16 KB reliable writes (CMD23 with
 ///   bit 31, then CMD25 of 32 blocks). The drive loader's boot inits (T169:
 ///   90.2 and 84.7 ms on the unit, 6.0 ms in fast mode) are about 14 of
-///   those plus 20 reads; 1.4 ms + 32 x 40 us a write lands them at 85.2
-///   and 85.5 ms with the CPU skeleton's costs. How that splits between the
+///   those plus 20 reads; 0.9 ms + 32 x 26 us a write lands them at 85.0
+///   and 85.0 ms with DTEMU_TIMING=exact's CPU costs (unit-timing 8dd6c30). How that splits between the
 ///   per-command and per-block parts is a guess: every write seen is 32 or
 ///   128 blocks.
 /// - The base clock is the 132 MHz bus clock [inferred]: SYSCTL 0x0E010C
@@ -89,8 +89,8 @@ pub struct CardTiming {
 impl CardTiming {
     /// The unit-mode defaults.
     pub const UNIT: CardTiming = CardTiming {
-        write_s: 1.4e-3,
-        block_s: 40e-6,
+        write_s: 0.9e-3,
+        block_s: 26e-6,
         read_s: 20e-6,
         erase_s: 1e-3,
         r1b_s: 250e-6,
