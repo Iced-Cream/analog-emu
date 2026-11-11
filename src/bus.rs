@@ -135,6 +135,9 @@ pub struct Bus {
     /// the cache model is on too, and CPU accesses add their cycles to the
     /// clock.
     pub timing: Option<Box<crate::timing::Timing>>,
+    /// Unit timing is measuring (every access charged); false outside its
+    /// measuring windows and without unit timing.
+    pub timing_live: bool,
 }
 
 /// A predecoded block, and its compiled code once it ran hot.
@@ -146,6 +149,10 @@ pub struct Block {
     pub no_jit: bool,
     /// Sent to the background compiler.
     pub queued: bool,
+    /// Unit timing: this block's learned cycles beyond one per instruction,
+    /// a run (timing.rs), and how many measured runs it is from.
+    pub tcost: f32,
+    pub tn: u32,
 }
 
 /// Where MAIN OS's text starts; the cache covers the image from here.
@@ -195,6 +202,7 @@ impl Bus {
             icache_invalidations: 0,
             cache: None,
             timing: None,
+            timing_live: false,
         }
     }
 
@@ -273,7 +281,7 @@ impl Bus {
     pub fn ddr_plain(&self, a: u32, len: u32) -> Option<usize> {
         let o = self.ddr_off(a)?;
         let end = a.wrapping_add(len - 1);
-        if self.ddr_off(end)? != o + len as usize - 1 || self.watch.is_some() || self.cache.is_some() || self.timing.is_some() {
+        if self.ddr_off(end)? != o + len as usize - 1 || self.watch.is_some() || self.cache.is_some() || self.timing_live {
             return None;
         }
         // Wholly below or above the cached code, or a store could hit it.
@@ -329,7 +337,7 @@ impl Bus {
     /// Record a block that starts at `pc` and covers [pc, end).
     pub fn block_store(&mut self, pc: u32, end: u32, ops: Box<[Op]>) -> usize {
         let o = pc.wrapping_sub(CODE_BASE);
-        self.blk_arena.push(Block { ops, hits: 0, code: None, no_jit: false, queued: false });
+        self.blk_arena.push(Block { ops, hits: 0, code: None, no_jit: false, queued: false, tcost: 0.0, tn: 0 });
         let id = self.blk_arena.len() as u32;
         self.blk_map[(o >> 1) as usize] = id;
         let e = end.wrapping_sub(CODE_BASE).min(self.icache_span);
@@ -514,7 +522,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn read8(&mut self, a: u32) -> u8 {
-        if self.cache.is_some() || self.timing.is_some() {
+        if self.cache.is_some() || self.timing_live {
             return self.cached_read(a, 1) as u8;
         }
         self.read8_mem(a)
@@ -522,7 +530,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn read16(&mut self, a: u32) -> u16 {
-        if self.cache.is_some() || self.timing.is_some() {
+        if self.cache.is_some() || self.timing_live {
             return self.cached_read(a, 2) as u16;
         }
         self.read16_mem(a)
@@ -530,7 +538,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn read32(&mut self, a: u32) -> u32 {
-        if self.cache.is_some() || self.timing.is_some() {
+        if self.cache.is_some() || self.timing_live {
             return self.cached_read(a, 4);
         }
         self.read32_mem(a)
@@ -538,7 +546,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn write8(&mut self, a: u32, v: u8) {
-        if self.cache.is_some() || self.timing.is_some() {
+        if self.cache.is_some() || self.timing_live {
             return self.cached_write(a, 1, v as u32);
         }
         self.write8_mem(a, v)
@@ -546,7 +554,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn write16(&mut self, a: u32, v: u16) {
-        if self.cache.is_some() || self.timing.is_some() {
+        if self.cache.is_some() || self.timing_live {
             return self.cached_write(a, 2, v as u32);
         }
         self.write16_mem(a, v)
@@ -554,7 +562,7 @@ impl Bus {
 
     #[inline(always)]
     pub fn write32(&mut self, a: u32, v: u32) {
-        if self.cache.is_some() || self.timing.is_some() {
+        if self.cache.is_some() || self.timing_live {
             return self.cached_write(a, 4, v);
         }
         self.write32_mem(a, v)
@@ -589,7 +597,7 @@ impl Bus {
     #[cold]
     #[inline(never)]
     fn cached_read(&mut self, a: u32, n: u32) -> u32 {
-        if self.timing.is_some() {
+        if self.timing_live {
             self.charge(a, false);
         }
         // eDMA (in_dma) reads memory, past the caches.
@@ -627,7 +635,7 @@ impl Bus {
     #[cold]
     #[inline(never)]
     fn cached_write(&mut self, a: u32, n: u32, v: u32) {
-        if self.timing.is_some() {
+        if self.timing_live {
             self.charge(a, true);
         }
         if self.cache.is_some() && !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
