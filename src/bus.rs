@@ -1014,6 +1014,10 @@ impl Bus {
                 return;
             }
         }
+        if a == 0xFC09_0003 && size == 1 {
+            self.io.epier = v as u8;
+            self.io.update_irq();
+        }
         if a == 0xFC09_0006 && size == 1 && self.io.epfr & v as u8 != 0 {
             // Writing 1 clears an EPORT flag.
             self.io.epfr &= !(v as u8);
