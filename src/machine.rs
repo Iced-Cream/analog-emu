@@ -187,6 +187,7 @@ impl Machine {
         // memory costs come from the cache model, so that is turned on too.
         if let Some(t) = crate::timing::Timing::from_env()? {
             bus.io.ips = t.p.hz;
+            bus.io.esdhc.timing = Some(crate::esdhc::CardTiming::from_env()?);
             bus.timing = Some(Box::new(t));
         }
         let cached = bus.cache.is_some();
