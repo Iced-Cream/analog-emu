@@ -235,7 +235,12 @@ fn emulate(
     audio: Arc<Audio>,
     quit: Arc<AtomicBool>,
 ) -> Machine {
-    let ips = o.ips;
+    // Unit timing (DTEMU_TIMING) sets the clock to the core's cycle rate;
+    // --ips is for the default instruction clock only.
+    let ips = match &m.cpu.bus.timing {
+        Some(t) => t.p.hz,
+        None => o.ips,
+    };
     m.cpu.bus.io.ips = ips;
     m.cpu.bus.io.usb_audio_capture = o.usb_wav.is_some();
     let ports = o.midi && (!o.headless || o.midi_headless);
