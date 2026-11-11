@@ -22,8 +22,8 @@
 //!   uses the 4-entry return stack: 2 predicted, 9 mispredicted, 8 empty.
 //! - EMAC: an accumulator store right after a MAC, MSAC or accumulator load
 //!   takes 4 cycles; MOVE to MACSR 8, to MASK 7.
-//! - Memory: the cache model (cache.rs) is turned on, at the MCF5441x's
-//!   8 KB per cache (section 6.2). The manual's times assume zero-wait
+//! - Memory: tag-only 8 KB 4-way I- and D-caches (section 6.2; `Tags`,
+//!   following CACR and the ACRs; data stays in the bus). The manual's times assume zero-wait
 //!   memory, so each D-cache line fill, dirty push and I-cache line fill
 //!   costs a DDR transfer (`dmiss`, `wb`, `imiss`); a data access past the
 //!   caches costs `unc_rd`/`unc_wr` (DDR through the uncached alias, which
@@ -37,6 +37,12 @@
 //! BSR and absolute JSR take 1-3 cycles (taken as 2), stalls from other
 //! register dependencies the manual doesn't list, DDR banks and refresh,
 //! and bus contention with eDMA. The aim is the load within a few points.
+//!
+//! Sampled mode (`DTEMU_TIMING=unit`, the default) measures all of the
+//! above for `window_us` of every `period_us` (gaps jittered so windows do
+//! not lock onto the firmware's own periods), learns each predecoded
+//! block's cost, and charges the learned cost between windows: about real
+//! time. `DTEMU_TIMING=exact` measures throughout, about 3x slower.
 
 use serde::{Deserialize, Serialize};
 
