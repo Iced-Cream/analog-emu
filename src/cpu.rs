@@ -778,18 +778,42 @@ impl Cpu {
     pub(crate) fn execute(&mut self) {
         let op = self.fetch16();
         if self.bus.timing.is_some() {
-            self.charge_op(op);
+            let flow = self.timing_pre(op);
+            self.dispatch(op);
+            return self.timing_post(flow);
         }
         self.dispatch(op);
     }
 
-    /// Unit timing: the extra cycles of `op`, just fetched at `op_pc`.
+    /// Unit timing: the cycles of `op`, just fetched at `op_pc`, beyond the
+    /// one the run loop counted (timing.rs).
     #[cold]
     #[inline(never)]
-    fn charge_op(&mut self, op: u16) {
-        let ext = self.bus.peek16(self.op_pc.wrapping_add(2));
+    fn timing_pre(&mut self, op: u16) -> crate::timing::Flow {
+        let pc = self.op_pc;
+        let mut w = [op, 0, 0, 0, 0, 0];
+        for (i, x) in w.iter_mut().enumerate().skip(1) {
+            *x = self.bus.peek16(pc.wrapping_add(2 * i as u32));
+        }
         let t = self.bus.timing.as_mut().unwrap();
-        self.bus.io.now += t.op_extra(op, ext);
+        let (extra, flow, folded) = t.pre(pc, &w);
+        self.bus.io.now += extra;
+        if folded {
+            self.bus.io.now -= 1;
+        }
+        flow
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn timing_post(&mut self, flow: crate::timing::Flow) {
+        if flow == crate::timing::Flow::None {
+            return;
+        }
+        let sp_top = self.bus.peek32(self.a[7]);
+        let t = self.bus.timing.as_mut().unwrap();
+        let c = t.post(flow, self.pc, sp_top);
+        self.bus.io.now = self.bus.io.now.wrapping_add_signed(c);
     }
 
     /// Execute `op`, already fetched, with PC past it.

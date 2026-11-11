@@ -188,7 +188,9 @@ impl Machine {
         if let Some(t) = crate::timing::Timing::from_env()? {
             bus.io.ips = t.p.hz;
             if bus.cache.is_none() {
-                bus.cache = Some(Box::new(crate::cache::Caches::new(16, false)));
+                // The MCF5441x's caches: 8 KB each (MCF54418RM 6.2).
+                let kb = std::env::var("DTEMU_CACHE_KB").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+                bus.cache = Some(Box::new(crate::cache::Caches::new(kb, false)));
             }
             bus.timing = Some(Box::new(t));
         }

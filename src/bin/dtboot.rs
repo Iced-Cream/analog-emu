@@ -121,6 +121,9 @@ Environment:
                        (DTEMU_STRICT=log: listed only, no fault)
   DTEMU_PROFILE_DUMP=FILE  with --profile-after: every sampled block start and its
                        sample count (one sample per 64 instructions) to FILE
+  DTEMU_TIMING=unit    count core cycles from the MCF54418 timing tables and cache misses,
+                       so CPU load follows the unit's (interpreter only; docs/TIMING.md);
+                       DTEMU_TIMING_PARAMS=k=v,... sets its costs; clocks are then cycles
   DTEMU_CACHE=1        model the I- and D-caches (interpreter only; docs/CACHE.md);
                        =log also prints each stale instruction fetch
 ";
@@ -891,6 +894,9 @@ fn main() {
     }
     if let Some(c) = &m.cpu.bus.cache {
         print!("{}", c.report());
+    }
+    if let Some(t) = &m.cpu.bus.timing {
+        println!("{}", t.summary(m.now()));
     }
     print!("{}", m.task_report());
     let vt: Vec<String> = [97u32, 99, 154, 155, 180, 191, 192, 205, 207, 208, 223].iter().map(|v| format!("v{v}={:08x}", m.cpu.bus.peek32(m.cpu.vbr + v * 4))).collect();

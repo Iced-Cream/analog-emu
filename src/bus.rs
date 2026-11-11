@@ -601,7 +601,7 @@ impl Bus {
                 return v;
             }
         }
-        self.charge_uncached(a);
+        self.charge_uncached(a, false);
         self.mem_read(a, n)
     }
 
@@ -617,7 +617,7 @@ impl Bus {
 
     /// Unit timing: a CPU access that went past the caches (not eDMA).
     #[inline(always)]
-    fn charge_uncached(&mut self, a: u32) {
+    fn charge_uncached(&mut self, a: u32, write: bool) {
         if self.in_dma {
             return;
         }
@@ -632,7 +632,7 @@ impl Bus {
             crate::timing::Region::Io
         };
         let t = self.timing.as_mut().unwrap();
-        self.io.now += t.uncached(r);
+        self.io.now += t.uncached(r, write);
     }
 
     #[cold]
@@ -647,7 +647,7 @@ impl Bus {
                 return;
             }
         }
-        self.charge_uncached(a);
+        self.charge_uncached(a, true);
         match n {
             1 => self.write8_mem(a, v as u8),
             2 => self.write16_mem(a, v as u16),
@@ -671,7 +671,7 @@ impl Bus {
             }
         }
         // Not instruction-cacheable: memory itself, past the D-cache too.
-        self.charge_uncached(a);
+        self.charge_uncached(a, false);
         self.mem_read(a, n)
     }
 
