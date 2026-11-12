@@ -91,6 +91,15 @@ To reproduce it in dtboot: `--usb-host`, dismiss the boot notices (NO at 8.01, 8
 DOWN x7, YES, DOWN, YES, UP, YES, NO x3), then `--usb-host-gone 11.3G:11.5G` so the host enumerates
 again in the new mode; read stats from about 15 G. The emulator's card has no project of the unit's.
 
+In rytm (window or `--headless`): `--usb-overbridge [SECS]` does the same without keys. At SECS of emulated
+time (default 9) it sets what the menu's OVERBRIDGE item sets on OS 1.74 (0x4006c3be: USB CONFIG
+0x405c8e4c = 1, then 0x40004e68(6): USB mode 0x413db2d4 = 6 and its descriptor table 0x413db2d0 =
+0x402728d8 + 6 x 0x28), and the simulated host leaves for 0.2 s and enumerates again (263-byte
+configuration) and streams both ways. It implies `--usb-host`, works beside `--usb-midi-real`, and leaves a
+build alone (with a message) whose USB mode words do not look like OS 1.74's. Setting 0x405c8e4c alone is not
+enough: the descriptors stay USB MIDI's (101 bytes) and nothing streams. CTL1 under `DTEMU_TIMING=unit` with
+it: 80.8-81.2 % / DSP 75.7-75.9 % at s81-90 (unit 80.6-81.2 / 76.0).
+
 Sampled mode, defaults, idle on the card's own project, analoghealth CPU / DSP % (4 readings, 15-19.8 G):
 
 | build | emulator | unit (T175, T138) | CPU difference |
