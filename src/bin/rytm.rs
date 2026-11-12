@@ -284,31 +284,34 @@ fn emulate(
     let mut speed = 0.0;
     let mut phase = 0.0f64;
     // --usb-overbridge: the cycle at which USB CONFIG becomes OVERBRIDGE (from this start).
-    let mut ob_at = o.usb_overbridge.filter(|_| m.is_rytm()).map(|s| m.now() + (s * ips) as u64);
+    // Armed again at the reboot that ends an OS upgrade: the new OS boots in its saved mode.
+    let arm = |m: &Machine| o.usb_overbridge.filter(|_| m.is_rytm()).map(|s| m.now() + (s * ips) as u64);
+    let mut ob_at = arm(&m);
     if o.usb_overbridge.is_some() && ob_at.is_none() {
         eprintln!("usb overbridge: only on the Rytm (its USB CONFIG addresses are known); ignored");
     }
     let mut usb_report = Instant::now();
     while !quit.load(Ordering::Relaxed) {
         if let Some(at) = ob_at.filter(|&at| m.now() >= at) {
-            ob_at = None;
             // What the menu's OVERBRIDGE item does (OS 1.74, 0x4006c3be): the setting (0x400fa68a),
             // then 0x40004e68(6): the USB mode (6 = OVERBRIDGE; USB MIDI boots as 3) and its descriptor
             // table (mode x 0x28 + 0x402728d8), and a restart of the controller, which the host's
             // departure and return stand in for.
+            // Until the OS has set its USB mode up (a slow boot), it is tried again each slice, for up to 30 s.
+            let now = m.now();
             let bus = &mut m.cpu.bus;
-            if bus.peek32(USB_MODE) < 8 && bus.peek32(USB_TABLE) == USB_TABLES + 0x28 * bus.peek32(USB_MODE) {
+            let (mode, table) = (bus.peek32(USB_MODE), bus.peek32(USB_TABLE));
+            if mode < 8 && table == USB_TABLES + 0x28 * mode {
+                ob_at = None;
                 bus.poke8(USB_CONFIG, 1);
                 bus.poke32(USB_MODE, USB_MODE_OVERBRIDGE);
                 bus.poke32(USB_TABLE, USB_TABLES + 0x28 * USB_MODE_OVERBRIDGE);
-                let gone = (at, at + (0.2 * ips) as u64);
-                if let Some(h) = m.usb_host.as_mut() {
-                    h.gone.push(gone);
-                }
-                eprintln!("usb overbridge: USB CONFIG = OVERBRIDGE at {:.2} s; the host re-enumerates", at as f64 / ips);
-            } else {
-                eprintln!("usb overbridge: not OS 1.74's USB mode layout (mode {:#x}, table {:#x}); left as it is",
-                          bus.peek32(USB_MODE), bus.peek32(USB_TABLE));
+                let h = m.usb_host.get_or_insert_with(dtemu::usbhost::UsbHost::new);
+                h.gone.push((now, now + (0.2 * ips) as u64));
+                eprintln!("usb overbridge: USB CONFIG = OVERBRIDGE at {:.2} s; the host re-enumerates", now as f64 / ips);
+            } else if now >= at + (30.0 * ips) as u64 {
+                ob_at = None;
+                eprintln!("usb overbridge: not OS 1.74's USB mode layout (mode {mode:#x}, table {table:#x}); left as it is");
             }
         }
         if o.usb_overbridge.is_some() && usb_report.elapsed() >= Duration::from_secs(10) {
@@ -394,7 +397,10 @@ fn emulate(
             // The end of an OS upgrade: boot what is in the flash now.
             save_flash(&mut m, o);
             match m.reboot_from_flash() {
-                Ok(name) => eprintln!("reset: booting {name} from the flash"),
+                Ok(name) => {
+                    eprintln!("reset: booting {name} from the flash");
+                    ob_at = arm(&m);
+                }
                 Err(e) => {
                     eprintln!("reset: {e}");
                     m.cpu.bus.io.reset_request = false;
