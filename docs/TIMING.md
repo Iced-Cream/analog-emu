@@ -109,3 +109,19 @@ Sampled mode, defaults, idle on the card's own project, analoghealth CPU / DSP %
 
 Without the stream every build read 72.5-78 %. With it, nine of eleven builds are within about 3.6 points
 and the order of the builds matches the unit's except V11F.
+
+## Notes playing (T138, AH10)
+
+T138's plan B played bursts of 8 notes on channel 14 (notes 0, 1, 2, 4, 5, 6, 8, 10, velocity 100) about every
+0.2 s. Replayed in dtboot as a USB MIDI file every 52.8 M cycles from 15 G (sampled mode, CPU / DSP %):
+
+| AH10 | emulator | unit (T138) |
+|---|---|---|
+| idle, stream off | 75.1 / 70.2 | 75.3-75.6 / 70.8 |
+| notes, stream off | 93.5 / 86.1 | 90.4-90.8 / 84.2-84.3 |
+| idle, stream on | 80.7 / 76.0 | - |
+| notes, stream on | 99.0 / 92.2 | - |
+
+T138's idle figure matches the stream-off column, so that run most likely had no Overbridge stream (inferred).
+With notes the emulator reads about 3 points high; part of it is the replay's fixed 0.2 s period (the plan's
+note steps take longer) and the card's own kit instead of a new project at LEV 127.
