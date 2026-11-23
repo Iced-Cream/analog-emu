@@ -264,9 +264,19 @@ impl Profile {
                     return Ok(p);
                 }
                 let da4 = differ(A4_156_CODE);
-                if da4.is_empty() {
+                // The A4's USB MIDI senders are served whole by the stand-in at their first instruction
+                // (Machine::hook, `usb_midi_send`), so a mod may patch their entry (a detour into its own
+                // wrapper) without changing what runs here; every other address must stay stock.
+                let a4_hooked_entries = [0x4000_3578u32, 0x4000_34CC];
+                let da4_strict: Vec<&String> =
+                    da4.iter().filter(|a| !a4_hooked_entries.iter().any(|e| **a == format!("0x{e:08x}"))).collect();
+                if da4_strict.is_empty() {
                     let mut p = Self::a4_156(h, idle_spins);
-                    p.name = "Analog Four MKII OS 1.56 (modified)";
+                    p.name = if da4.is_empty() {
+                        "Analog Four MKII OS 1.56 (modified)"
+                    } else {
+                        "Analog Four MKII OS 1.56 (modified, USB MIDI sender entry patched)"
+                    };
                     return Ok(p);
                 }
                 Err(format!(
@@ -776,5 +786,53 @@ impl Profile {
             boot_ver_flash: 0,
             idle_spins,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic image: zeros, with the A4 1.56 table's bytes at its addresses.
+    fn a4_like() -> Vec<u8> {
+        let end = A4_156_CODE.iter().map(|(a, _)| a - MAIN_LOAD + 16).max().unwrap() as usize;
+        let mut img = vec![0u8; end];
+        for (a, b) in A4_156_CODE {
+            let o = (a - MAIN_LOAD) as usize;
+            img[o..o + 16].copy_from_slice(b);
+        }
+        img
+    }
+
+    fn patch(img: &mut [u8], a: u32) {
+        let o = (a - MAIN_LOAD) as usize;
+        img[o..o + 6].copy_from_slice(&[0x4e, 0xf9, 0x45, 0x65, 0xc7, 0xe8]); // jmp abs.l to a mod's wrapper
+    }
+
+    #[test]
+    fn a4_modified_with_stock_sites() {
+        let p = Profile::for_image(&a4_like()).unwrap();
+        assert_eq!(p.name, "Analog Four MKII OS 1.56 (modified)");
+    }
+
+    #[test]
+    fn a4_usb_midi_sender_entry_may_be_patched() {
+        for a in [0x4000_3578, 0x4000_34CC] {
+            let mut img = a4_like();
+            patch(&mut img, a);
+            let p = Profile::for_image(&img).unwrap();
+            assert_eq!(p.device, Device::A4Mk2);
+            assert_eq!(p.name, "Analog Four MKII OS 1.56 (modified, USB MIDI sender entry patched)");
+            assert_eq!(p.usb_midi_send, 0x4000_3578);
+        }
+    }
+
+    #[test]
+    fn a4_other_hook_sites_must_stay_stock() {
+        let mut img = a4_like();
+        patch(&mut img, 0x4000_3578);
+        patch(&mut img, 0x4006_8BD8); // sysex_send: the stand-in passes some calls on to the OS's own code
+        let e = Profile::for_image(&img).unwrap_err();
+        assert!(e.contains("0x40068bd8"), "{e}");
     }
 }
