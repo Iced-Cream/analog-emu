@@ -573,6 +573,7 @@ impl UsbHost {
                 self.device_desc.clear();
                 self.config_desc.clear();
                 self.iso.clear();
+                self.was_running = false;
                 self.stats.restarts += 1;
                 self.say("host back");
             }
@@ -602,9 +603,11 @@ impl UsbHost {
         if self.device_stack || self.audio_auto {
             // RS off is the firmware's pull-up gone (a USB CONFIG change, 0x4000601a on the Digitakt): a real host
             // sees a disconnect, then a new device when RS comes back, and enumerates it again.
+            // Only once the host has a device to lose: a host just back (`gone`) is still in Idle
+            // and must raise VBUS first, which the firmware waits for before it runs again.
             if running {
                 self.was_running = true;
-            } else if self.was_running {
+            } else if self.was_running && matches!(self.phase, Phase::Reset | Phase::Enumerate | Phase::Stream) {
                 self.was_running = false;
                 self.phase = Phase::Vbus;
                 self.t = now;
