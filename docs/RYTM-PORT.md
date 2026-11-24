@@ -550,6 +550,36 @@ as `R` messages (oblink.rs). Open: the MAIN return's level in the analog model
 (a loop of MAIN came back about 18 dB down); the USB MIDI interface in
 Overbridge mode is still the high-level hook.
 
+**USB AUDIO/MIDI and a class-compliant host (2026-11-24, OS 1.74).** The USB CONFIG menu's items
+store their index in 0x405c8e4c (USB MIDI 0, OVERBRIDGE 1, USB AUDIO/MIDI 2; FUN_400fa68a) and set the
+USB mode word 0x413db2d4 through FUN_40004e68 (3, 6 and 5) [Ghidra: FUN_4006c942, FUN_4006c904,
+FUN_4006c980]. Mode 5 enumerates as 1935:1048, UAC2, configuration 1 with five interfaces: 1 playback
+("Speakers": alternate setting 1, isochronous OUT 0x03 asynchronous, 56 B a microframe, explicit
+feedback IN 0x82, 4 B), 2 capture (alternate setting 1, 0x83 IN), 3/4 MIDI (bulk 0x01/0x81) [Ghidra].
+SET_INTERFACE(1, 1) fills the feedback endpoint's 16-word ring at 0x4FB47440 (FUN_40006768); each OUT
+packet played rewrites a word of it (FUN_40006a0e -> FUN_4000649e); alternate setting 0 (FUN_400067d8)
+or SET_CONFIGURATION 0 stops it [Ghidra; issue 427 in elekloader].
+
+`usbhost.rs` has a class-compliant host for it (`UsbHost::audio`, set by `audio_auto` when the device
+descriptor says 1048): it takes bConfigurationValue from the configuration descriptor, selects the first
+non-zero alternate setting with an isochronous endpoint on each AudioStreaming interface (class 1,
+subclass 2), and services those endpoints at their bInterval: OUT carries silence at the nominal rate
+(6 frames a microframe in the frame size AS_GENERAL and FORMAT_TYPE give: 48 B for 2 x 4 B), IN data is
+read and dropped, the feedback value is kept (`stats.feedback_last`). `set_playing(false)` selects
+alternate setting 0, `set_playing(true)` the chosen ones again. With `audio_auto` the host also follows
+the firmware off and on the bus (USBCMD.RS), as `device_stack` does on the Digitakt, so a USB CONFIG
+change made with keys enumerates the new mode. rytm: `--usb-host` (and `--usb-midi-real`) attach it
+with `audio_auto` on; `--usb-audio [SECS]` makes the switch itself at SECS (default 9) as the menu's item
+does (the setting byte, mode 5 found from the mode table by its device descriptor's PID, and the table
+pointer; the host leaves for 0.2 s and comes back; the setting block's checksum at 0x405c8e14 is not
+re-stamped, so a power cycle after it may not keep the mode); `--usb-audio-idle` enumerates without
+selecting the audio alternate settings until stdin `usb-audio play [SECS]` (`--stdin-commands`), and
+`usb-audio stop` selects alternate setting 0. Log lines: `usb audio: streaming: device 1935:1048, ...`
+each time it starts, `usb audio: play` / `usb audio: stop`, and every 10 s `usb host: audio playing ...`
+with the isochronous counts, the last feedback value and whether the ring at 0x4FB47440 was rewritten
+since the last report. Not modelled: audio content (silence only), UAC2 clock requests (the host sends
+none), capture data.
+
 ## Overbridge link: hello, MIDI pair, voice frames (2026-10-14)
 
 The TCP link (`--ob-link [ADDR]`, oblink.rs; the header has the full message list) gets an opt-in hello, for the
