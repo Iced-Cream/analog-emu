@@ -470,6 +470,7 @@ fn main() {
         h.ack = usb_ack;
         h.midi_every = usb_midi_every;
         h.gone = usb_gone.clone();
+        h.audio_auto = true; // a USB AUDIO/MIDI device (1935:1048) gets the class-compliant host
         h.cdc = !serials.is_empty();
         m.usb_host = Some(h);
     }
@@ -749,6 +750,7 @@ fn main() {
                         h.midi_sleep = usb_noread;
                         h.ack = usb_ack;
                         h.midi_every = usb_midi_every;
+                        h.audio_auto = true;
                         h.cdc = !serials.is_empty();
                         m.usb_host = Some(h);
                     }
@@ -861,7 +863,7 @@ fn main() {
         println!("usb regs: cmd {:08x} sts {:08x} intr {:08x} portsc {:08x} otgsc {:08x} mode {:08x} eplist {:08x} epctrl1 {:08x}",
             b.peek32(0xFC0B_0140), b.peek32(0xFC0B_0144), b.peek32(0xFC0B_0148), b.peek32(0xFC0B_0184), b.peek32(0xFC0B_01A4),
             b.peek32(0xFC0B_01A8), b.peek32(0xFC0B_0158), b.peek32(0xFC0B_01C4));
-        println!("usb host: streaming={} {:?}", h.streaming(), h.stats);
+        println!("usb host: streaming={} audio={} {:?}", h.streaming(), h.audio_streaming(), h.stats);
         if h.device_stack && !h.from_rytm.is_empty() {
             let mut peak = [0u32; dtemu::usbhost::OB_CHANNELS];
             for fr in &h.from_rytm {

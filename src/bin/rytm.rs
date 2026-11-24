@@ -50,6 +50,9 @@ enum Ev {
     Nudge(u8, i8, u8),
     ReleaseAll,
     Save,
+    /// stdin `usb-audio play [SECS]` / `usb-audio stop`: the class-compliant host plays for SECS
+    /// of emulated time (None: until stopped), or stops (Some(0.0)).
+    UsbAudio(Option<f64>),
 }
 
 struct Audio {
@@ -107,6 +110,15 @@ struct Opts {
     /// Without it the emulator takes the sender's calls, and a mod that checks the sender's
     /// state first (0x413db254 = 1, endpoint 1 enabled; core-ar2's core_midi_try_send) sends nothing.
     usb_midi_real: bool,
+    /// --usb-audio [SECS]: at SECS of emulated time (default 9) set GLOBAL > SYSTEM > USB CONFIG to
+    /// USB AUDIO/MIDI (1935:1048) in the firmware's state as its menu does (Rytm OS 1.74 only), and have
+    /// the host leave for 0.2 s and come back: it enumerates the class-compliant device, selects the
+    /// audio alternate settings and plays (usbhost.rs `audio`). Implies --usb-host. Without it, a
+    /// USB CONFIG change to USB AUDIO/MIDI made with keys gets the same host.
+    usb_audio: Option<f64>,
+    /// --usb-audio-idle: the class-compliant host enumerates without selecting the audio alternate
+    /// settings (no application has the device open) until stdin `usb-audio play`.
+    usb_audio_idle: bool,
     /// --usb-midi-tcp ADDR: the USB MIDI port as a raw MIDI byte stream over TCP (miditcp), for
     /// tools on a host without virtual MIDI ports (Windows), and one address per emulator.
     usb_midi_tcp: Option<String>,
@@ -145,6 +157,8 @@ fn parse() -> Opts {
         ob_link: None,
         usb_host: false,
         usb_midi_real: false,
+        usb_audio: None,
+        usb_audio_idle: false,
         usb_midi_tcp: None,
         din_midi_tcp: None,
         power_off: false,
@@ -164,6 +178,18 @@ fn parse() -> Opts {
             "--usb-midi-real" => {
                 o.usb_host = true;
                 o.usb_midi_real = true;
+            }
+            "--usb-audio" => {
+                let next = it.clone().next().filter(|a| !a.starts_with("--")).cloned();
+                if next.is_some() {
+                    it.next();
+                }
+                o.usb_host = true;
+                o.usb_audio = Some(next.map_or(9.0, |v| v.parse().expect("--usb-audio SECS")));
+            }
+            "--usb-audio-idle" => {
+                o.usb_host = true;
+                o.usb_audio_idle = true;
             }
             "--usb-midi-tcp" => o.usb_midi_tcp = it.next().cloned(),
             "--din-midi-tcp" => o.din_midi_tcp = it.next().cloned(),
@@ -211,10 +237,12 @@ fn parse() -> Opts {
                 println!(
                     "usage: {bin} [FIRMWARE.syx] [--snapshot FILE] [--card IMAGE] [--ips N] [--no-audio]\n\
                      \x20       {pad}[--headless --after SECS --screenshot OUT.png] [--press CODE@SECS[:HOLD]] [--turn ENC:DELTA@SECS]\n\
-                     \x20       {pad}[--stdin-commands]  (headless: stdin lines `save` (card, and --snapshot) and `quit`)\n\
+                     \x20       {pad}[--stdin-commands]  (headless: stdin lines `save` (card, and --snapshot), `quit`, `usb-audio play [SECS]`, `usb-audio stop`)\n\
                      \x20       {pad}[--latency MS] [--audio-null] [--wav OUT.wav] [--no-midi]\n\
                      \x20       {pad}[--audio-in audio|ext|both]  (the Mac's default input into AUDIO IN / EXT IN)\n\
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
+                     \x20       {pad}[--usb-audio [SECS]]  (USB CONFIG = USB AUDIO/MIDI at SECS (9); the class-compliant host enumerates and plays; implies --usb-host)\n\
+                     \x20       {pad}[--usb-audio-idle]  (the class-compliant host waits for stdin `usb-audio play` before selecting the audio alternate settings)\n\
                      \x20       {pad}[--usb-midi-real]  (the firmware's own USB MIDI sender, read by the simulated USB host; implies --usb-host)\n\
                      \x20       {pad}[--usb-wav FILE]  (record the USB audio stream: MAIN, 8 voices, AUDIO IN; 12 ch)\n\
                      \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301; 0.0.0.0:7301 for a host on the LAN)\n\
@@ -260,7 +288,12 @@ fn view_of(m: &Machine, status: String) -> View {
 /// new one, without either).
 fn attach_usb(m: &mut Machine, o: &Opts) {
     if o.usb_host && m.usb_host.is_none() {
-        m.usb_host = Some(dtemu::usbhost::UsbHost::new());
+        let mut h = dtemu::usbhost::UsbHost::new();
+        // A device that enumerates as USB AUDIO/MIDI (1935:1048) gets the class-compliant host, as a
+        // computer's audio driver takes it: after --usb-audio, or a USB CONFIG change made with keys.
+        h.audio_auto = true;
+        h.set_playing(!o.usb_audio_idle);
+        m.usb_host = Some(h);
     }
     if o.usb_midi_real && !m.usb_midi_real {
         m.set_usb_midi_real(true);
@@ -269,6 +302,62 @@ fn attach_usb(m: &mut Machine, o: &Opts) {
 
 fn usb_ports(m: &Machine) -> bool {
     m.is_rytm() || m.is_a4() || m.prof.device == dtemu::symbols::Device::Digitakt
+}
+
+/// GLOBAL > SYSTEM > USB CONFIG in OS 1.74's RAM: the menu item's index (USB MIDI 0, OVERBRIDGE 1, USB
+/// AUDIO/MIDI 2; FUN_400fa68a) [measured for 1, Ghidra for 2: FUN_4006c980]. Its block checksum at
+/// 0x405c8e14 is not re-stamped here (FUN_400fa562 does that in the menu).
+const USB_CONFIG: u32 = 0x405c_8e4c;
+const USB_CONFIG_AUDIO: u8 = 2;
+/// OS 1.74's current USB mode (FUN_40004e68: USB MIDI 3, USB AUDIO/MIDI 5, OVERBRIDGE 6) and its
+/// descriptor table pointer, mode x 0x28 + USB_TABLES [Ghidra, measured for 6].
+const USB_MODE: u32 = 0x413d_b2d4;
+const USB_TABLE: u32 = 0x413d_b2d0;
+const USB_TABLES: u32 = 0x4027_28d8;
+/// The 64-byte feedback ring of endpoint 0x82 OS 1.74 fills at SET_INTERFACE(1, alt 1) (FUN_40006768)
+/// and rewrites per OUT packet played (FUN_40006a0e -> FUN_4000649e) [Ghidra, issue 427].
+const USB_AUDIO_RING: u32 = 0x4FB4_7440;
+
+/// The USB mode (an entry of OS 1.74's mode table at USB_TABLES, 0x28 bytes each) whose device
+/// descriptor has product id `pid`: each word of an entry pointing at an 18-byte device descriptor
+/// of Elektron's (bLength 18, type 1, vendor 0x1935) is read. -> None when no entry of 8 has one.
+fn usb_mode_with_pid(bus: &dtemu::bus::Bus, pid: u16) -> Option<u32> {
+    (0..8u32).find(|&mode| {
+        (0..10u32).any(|w| {
+            let a = bus.peek32(USB_TABLES + 0x28 * mode + 4 * w);
+            (0x4000_0000..0x5000_0000).contains(&a)
+                && bus.peek8(a) == 18
+                && bus.peek8(a + 1) == 1
+                && u16::from_le_bytes([bus.peek8(a + 8), bus.peek8(a + 9)]) == 0x1935
+                && u16::from_le_bytes([bus.peek8(a + 10), bus.peek8(a + 11)]) == pid
+        })
+    })
+}
+
+/// --usb-audio's switch, as the menu's USB AUDIO/MIDI item (FUN_4006c980 -> FUN_400fa68a(2),
+/// FUN_40004e68(5)) does it: the setting, the mode and its descriptor table; the host's departure
+/// and return stand in for the controller's restart. -> Some(line) when it is done or given up
+/// (after 30 s of the OS not having set its USB mode up), None to try again.
+fn usb_audio_switch(m: &mut Machine, at: u64, ips: f64) -> Option<String> {
+    let now = m.now();
+    let bus = &mut m.cpu.bus;
+    let (mode, table) = (bus.peek32(USB_MODE), bus.peek32(USB_TABLE));
+    let target = usb_mode_with_pid(bus, dtemu::usbhost::PID_USB_AUDIO);
+    match target {
+        Some(t) if mode < 8 && table == USB_TABLES + 0x28 * mode => {
+            bus.poke8(USB_CONFIG, USB_CONFIG_AUDIO);
+            bus.poke32(USB_MODE, t);
+            bus.poke32(USB_TABLE, USB_TABLES + 0x28 * t);
+            let h = m.usb_host.get_or_insert_with(dtemu::usbhost::UsbHost::new);
+            h.audio_auto = true;
+            h.gone.push((now, now + (0.2 * ips) as u64));
+            Some(format!("usb audio: USB CONFIG = USB AUDIO/MIDI (USB mode {t}, was {mode}) at {:.2} s; the host re-enumerates", now as f64 / ips))
+        }
+        _ if now >= at + (30.0 * ips) as u64 => Some(format!(
+            "usb audio: not OS 1.74's USB mode layout, or no 1935:1048 device descriptor in it (mode {mode:#x}, table {table:#x}, found {target:?}); left as it is"
+        )),
+        _ => None,
+    }
 }
 
 /// The emulator loop. Runs until `quit`.
@@ -299,7 +388,70 @@ fn emulate(
     let mut link_report = Instant::now();
     let mut speed = 0.0;
     let mut phase = 0.0f64;
+    // --usb-audio: the cycle at which USB CONFIG becomes USB AUDIO/MIDI; armed again at the reboot
+    // that ends an OS upgrade (the new OS boots in its saved mode).
+    let arm_audio = |m: &Machine| o.usb_audio.filter(|_| m.is_rytm()).map(|s| m.now() + (s * ips) as u64);
+    let mut au_at = arm_audio(&m);
+    if o.usb_audio.is_some() && au_at.is_none() {
+        eprintln!("usb audio: only on the Rytm (its USB CONFIG addresses are known); ignored");
+    }
+    // The audio host's state as last reported, a `usb-audio play SECS` end, and the ring as last read.
+    let mut au_said = (false, 0u64);
+    let mut play_until: Option<u64> = None;
+    let mut ring_last: Vec<u8> = Vec::new();
+    // The ring's CPU writes, by the DDR write watchpoint (the feedback value can repeat, so a
+    // compare of its bytes cannot tell a rewrite from none): on with --usb-audio / --usb-audio-idle.
+    let mut ring_hits = 0u64;
+    if m.is_rytm() && (o.usb_audio.is_some() || o.usb_audio_idle) {
+        let w = USB_AUDIO_RING & 0x07FF_FFFF;
+        m.cpu.bus.watch = Some((w, w + 64));
+    }
+    let mut usb_report = Instant::now();
     while !quit.load(Ordering::Relaxed) {
+        if let Some(at) = au_at.filter(|&at| m.now() >= at) {
+            if let Some(line) = usb_audio_switch(&mut m, at, ips) {
+                au_at = None;
+                eprintln!("{line}");
+            }
+        }
+        if let Some(end) = play_until.filter(|&e| m.now() >= e) {
+            play_until = None;
+            if let Some(h) = m.usb_host.as_mut() {
+                h.set_playing(false);
+            }
+            eprintln!("usb audio: stop (alternate setting 0) at {:.2} s", end as f64 / ips);
+        }
+        if let Some(h) = m.usb_host.as_ref() {
+            // One line each time the class-compliant host starts streaming (an enumeration or a play).
+            let now_on = h.audio_streaming();
+            let n = h.stats.enumerations;
+            if now_on && (!au_said.0 || au_said.1 != n) {
+                let d = &h.device_desc;
+                let pid = if d.len() >= 12 { u16::from_le_bytes([d[10], d[11]]) } else { 0 };
+                let mut alts: Vec<(u8, u8)> = h.iso.iter().map(|e| (e.interface, e.alt)).collect();
+                alts.dedup();
+                eprintln!("usb audio: streaming: device 1935:{pid:04x}, configuration {}, alternate settings {alts:?}, isochronous endpoints {:02x?} at {:.2} s",
+                          h.config_desc.get(5).copied().unwrap_or(0), h.iso.iter().map(|e| e.address).collect::<Vec<_>>(), m.now() as f64 / ips);
+            }
+            au_said = (now_on, n);
+        }
+        if m.is_rytm() && m.usb_host.as_ref().is_some_and(|h| h.audio) && usb_report.elapsed() >= Duration::from_secs(10) {
+            usb_report = Instant::now();
+            let ring: Vec<u8> = (0..64).map(|k| m.cpu.bus.peek8(USB_AUDIO_RING + k)).collect();
+            let changed = !ring_last.is_empty() && ring != ring_last;
+            let set = ring.chunks(4).filter(|w| w.iter().any(|&b| b != 0)).count();
+            ring_last = ring;
+            let writes = m.cpu.bus.watch_hits - ring_hits;
+            ring_hits = m.cpu.bus.watch_hits;
+            m.cpu.bus.watch_log.clear();
+            if let Some(h) = m.usb_host.as_ref() {
+                let st = &h.stats;
+                eprintln!("usb host: audio playing {}, {} enumerations, {} restarts, {} detaches, iso {} IN ({} B) / {} OUT ({} B), feedback {} reads, last {}; ring {USB_AUDIO_RING:#x} (OS 1.74): {set}/16 words set, {writes} CPU writes and {} since the last report; USB CONFIG {}, mode {}",
+                          h.audio_streaming(), st.enumerations, st.restarts, st.detaches, st.iso_in, st.iso_in_bytes, st.iso_out,
+                          st.iso_out_bytes, st.feedback_reads, st.feedback_last.map_or("none".into(), |v| format!("{v:#010x}")),
+                          if changed { "its bytes changed" } else { "its bytes the same" }, m.cpu.bus.peek8(USB_CONFIG), m.cpu.bus.peek32(USB_MODE));
+            }
+        }
         if let Some(dest) = o.audio_in.as_deref() {
             // Host input into the codec's input queues; at most 100 ms queued,
             // so a slow emulation drops input rather than lagging behind it.
@@ -342,6 +494,19 @@ fn emulate(
                 Ev::Turn(e, d) => m.turn_detents(e, d),
                 Ev::Nudge(e, d, n) => m.nudge_steps(e, d, n, false),
                 Ev::ReleaseAll => m.release_all_keys(),
+                Ev::UsbAudio(cmd) => match m.usb_host.as_mut().filter(|h| h.audio) {
+                    None => eprintln!("usb audio: not played: the host has no USB AUDIO/MIDI device enumerated"),
+                    Some(h) => {
+                        let stop = cmd == Some(0.0);
+                        h.set_playing(!stop);
+                        play_until = cmd.filter(|&s| s > 0.0).map(|s| m.now() + (s * ips) as u64);
+                        if stop {
+                            eprintln!("usb audio: stop (alternate setting 0) at {:.2} s", m.now() as f64 / ips);
+                        } else {
+                            eprintln!("usb audio: play{} at {:.2} s", cmd.map_or(String::new(), |s| format!(" for {s} s")), m.now() as f64 / ips);
+                        }
+                    }
+                },
                 Ev::Save => {
                     save_card(&mut m, o);
                     if let Some(p) = &o.snapshot {
@@ -378,6 +543,12 @@ fn emulate(
                 Ok(name) => {
                     eprintln!("reset: booting {name} from the flash");
                     attach_usb(&mut m, o);
+                    au_at = arm_audio(&m);
+                    if m.is_rytm() && (o.usb_audio.is_some() || o.usb_audio_idle) {
+                        let w = USB_AUDIO_RING & 0x07FF_FFFF;
+                        m.cpu.bus.watch = Some((w, w + 64));
+                        ring_hits = 0;
+                    }
                 }
                 Err(e) => {
                     eprintln!("reset: {e}");
@@ -724,7 +895,7 @@ pub fn main() {
     let (tx, rx) = mpsc::channel();
     if o.usb_host {
         attach_usb(&mut m, &o);
-        eprintln!("usb: a simulated host is attached (set USB CONFIG to OVERBRIDGE){}",
+        eprintln!("usb: a simulated host is attached (set USB CONFIG to OVERBRIDGE, or USB AUDIO/MIDI for the class-compliant host){}",
                   if o.usb_midi_real { "; the firmware's own USB MIDI sender runs" } else { "" });
     }
     if let Some(addr) = &o.ob_link {
@@ -783,7 +954,23 @@ pub fn main() {
                             let _ = tx.send(Ev::Save);
                         }
                         Ok("quit") | Err(_) => break,
-                        Ok(other) => eprintln!("stdin: unknown command {other:?} (save, quit)"),
+                        Ok("usb-audio stop") => {
+                            let _ = tx.send(Ev::UsbAudio(Some(0.0)));
+                        }
+                        Ok(c) if c == "usb-audio play" || c.starts_with("usb-audio play ") => {
+                            match c["usb-audio play".len()..].trim() {
+                                "" => {
+                                    let _ = tx.send(Ev::UsbAudio(None));
+                                }
+                                n => match n.parse::<f64>() {
+                                    Ok(v) if v > 0.0 => {
+                                        let _ = tx.send(Ev::UsbAudio(Some(v)));
+                                    }
+                                    _ => eprintln!("stdin: usb-audio play SECS: {n:?} is not a number of seconds"),
+                                },
+                            }
+                        }
+                        Ok(other) => eprintln!("stdin: unknown command {other:?} (save, quit, usb-audio play [SECS], usb-audio stop)"),
                     }
                 }
                 stop.store(true, Ordering::Relaxed);

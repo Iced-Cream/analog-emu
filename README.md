@@ -124,6 +124,12 @@ then sends nothing. `--usb-midi-real` (window, implies `--usb-host`; dtboot's `-
 --usb-midi-real`) runs the OS's own sender instead, read by the simulated USB host, and keeps
 both across an OS upgrade's reboot. Its output reaches `rytm-emu usb out` and `--usb-midi-tcp` as before.
 
+`--usb-audio [SECS]` (window or `--headless`, Rytm OS 1.74) switches USB CONFIG to USB AUDIO/MIDI at SECS
+(default 9) and attaches a class-compliant USB audio host that selects the audio alternate settings and
+streams; `--usb-audio-idle` waits for stdin `usb-audio play [SECS]` / `usb-audio stop`
+(`--stdin-commands`). Any `--usb-host` takes the class-compliant path when the device enumerates as
+1935:1048, also after a switch made with keys. See docs/RYTM-PORT.md, "USB AUDIO/MIDI".
+
 **OS upgrades** (MKII units): the SPI flash is writable (`src/spiflash.rs`), so an OS
 upgrade sent by Transfer, elektroid or elkflash runs as on a unit: the transfer, the
 UPGRADE OS NOW? prompt, ERASING FLASH..., the write and the reset. With `--flash

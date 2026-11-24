@@ -160,6 +160,138 @@ impl MidiPacker {
     }
 }
 
+/// USB AUDIO/MIDI's product id (1935:1048, docs/OVERBRIDGE.md; OS 1.74's USB mode 5).
+pub const PID_USB_AUDIO: u16 = 0x1048;
+
+/// One isochronous endpoint of a selected alternate setting (`UsbHost::audio`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IsoEp {
+    pub interface: u8,
+    pub alt: u8,
+    /// bEndpointAddress: bit 7 IN, bits 3:0 the number.
+    pub address: u8,
+    /// bmAttributes: bits 1:0 transfer type (1 = isochronous), 3:2 sync, 5:4 usage (1 = feedback).
+    pub attributes: u8,
+    /// Bytes per transaction (wMaxPacketSize bits 10:0) x transactions per microframe (bits 12:11, + 1).
+    pub max_packet: usize,
+    /// Microframes between service intervals: 2^(bInterval - 1) at high speed.
+    pub period: u64,
+    /// Bytes per audio frame (channels x subslot size), from the interface's
+    /// class-specific descriptors; 0 when they gave none.
+    pub frame_bytes: usize,
+}
+
+impl IsoEp {
+    pub fn is_in(&self) -> bool {
+        self.address & 0x80 != 0
+    }
+    pub fn number(&self) -> u32 {
+        (self.address & 0x0F) as u32
+    }
+    pub fn is_feedback(&self) -> bool {
+        (self.attributes >> 4) & 3 == 1
+    }
+    /// The bytes a host sends OUT per service interval: the nominal 48 kHz
+    /// rate (6 frames a microframe) in the endpoint's frame size, at most a
+    /// packet; the whole packet when the frame size is unknown.
+    pub fn out_bytes(&self) -> usize {
+        if self.frame_bytes == 0 {
+            return self.max_packet;
+        }
+        (6 * self.period as usize * self.frame_bytes).min(self.max_packet.max(1))
+    }
+}
+
+/// The class-compliant host's choices from a configuration descriptor:
+/// (bConfigurationValue, the alternate setting picked per AudioStreaming
+/// interface, their isochronous endpoints). USB 2.0 9.6.3/9.6.5/9.6.6; the
+/// audio class's AS_GENERAL (subtype 1) and FORMAT_TYPE (subtype 2)
+/// descriptors give the frame size: UAC2 bNrChannels at +10 of AS_GENERAL
+/// (16 bytes) and bSubslotSize at +4 of FORMAT_TYPE (6 bytes); UAC1
+/// bNrChannels at +4 and bSubframeSize at +5 of FORMAT_TYPE (8+ bytes).
+pub fn audio_choices(config: &[u8]) -> (u8, Vec<(u8, u8)>, Vec<IsoEp>) {
+    let value = config.get(5).copied().unwrap_or(1);
+    // (interface, alt, class, subclass, channels, subslot, endpoints)
+    struct Alt {
+        num: u8,
+        alt: u8,
+        class: u8,
+        sub: u8,
+        channels: usize,
+        subslot: usize,
+        eps: Vec<IsoEp>,
+    }
+    let mut alts: Vec<Alt> = Vec::new();
+    let mut i = 0;
+    while i + 2 <= config.len() {
+        let len = config[i] as usize;
+        if len < 2 || i + len > config.len() {
+            break;
+        }
+        let d = &config[i..i + len];
+        match d[1] {
+            4 if len >= 9 => alts.push(Alt {
+                num: d[2],
+                alt: d[3],
+                class: d[5],
+                sub: d[6],
+                channels: 0,
+                subslot: 0,
+                eps: Vec::new(),
+            }),
+            0x24 if len >= 3 => {
+                if let Some(a) = alts.last_mut().filter(|a| a.class == 1 && a.sub == 2) {
+                    match (d[2], len) {
+                        (1, 16) => a.channels = d[10] as usize,
+                        (2, 6) => a.subslot = d[4] as usize,
+                        (2, l) if l >= 8 => {
+                            a.channels = d[4] as usize;
+                            a.subslot = d[5] as usize;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            5 if len >= 7 => {
+                if let Some(a) = alts.last_mut() {
+                    if d[3] & 3 == 1 {
+                        let w = u16::from_le_bytes([d[4], d[5]]) as usize;
+                        let interval = d[6].clamp(1, 16) as u32;
+                        a.eps.push(IsoEp {
+                            interface: a.num,
+                            alt: a.alt,
+                            address: d[2],
+                            attributes: d[3],
+                            max_packet: (w & 0x7FF) * (1 + ((w >> 11) & 3)),
+                            period: 1u64 << (interval - 1),
+                            frame_bytes: 0,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    let mut picks = Vec::new();
+    let mut eps = Vec::new();
+    for a in &alts {
+        if a.class != 1 || a.sub != 2 || a.alt == 0 || a.eps.is_empty() {
+            continue;
+        }
+        if picks.iter().any(|&(n, _)| n == a.num) {
+            continue;
+        }
+        picks.push((a.num, a.alt));
+        for e in &a.eps {
+            let mut e = e.clone();
+            e.frame_bytes = a.channels * a.subslot;
+            eps.push(e);
+        }
+    }
+    (value, picks, eps)
+}
+
 /// The interrupt line: an enabled USBSTS bit, or an enabled OTGSC status bit.
 pub fn line(bus: &Bus) -> bool {
     let sts = bus.peek32(USBSTS) & bus.peek32(USBINTR);
@@ -266,6 +398,24 @@ pub struct UsbHost {
     /// Read the configuration descriptor and follow the firmware on and off
     /// the bus (module comment). Set by `Machine::usb_microframes`.
     pub device_stack: bool,
+    /// A class-compliant USB audio host instead of Overbridge (`--usb-audio`):
+    /// for USB CONFIG = USB AUDIO/MIDI (1935:1048). It takes the configuration
+    /// the descriptor names, selects the first non-zero alternate setting with
+    /// an isochronous endpoint on every AudioStreaming interface (class 1,
+    /// subclass 2), as a computer's audio driver does when an application opens
+    /// the device, and keeps those endpoints running at their bInterval: data
+    /// IN read, data OUT answered with silence at the nominal 48 kHz rate, an
+    /// explicit feedback IN endpoint read (its last value in `stats`).
+    pub audio: bool,
+    /// The isochronous endpoints of the alternate settings selected (`audio`).
+    pub iso: Vec<IsoEp>,
+    /// `audio`: whether the host plays (its alternate settings selected and
+    /// the endpoints streaming; `set_playing`). On by default.
+    playing: bool,
+    /// Take the class-compliant path whenever the device enumerates as USB
+    /// AUDIO/MIDI (product id `PID_USB_AUDIO`), whatever `audio` says: a
+    /// computer's own driver does that after the menu's switch.
+    pub audio_auto: bool,
     /// The host -> device packet of the Overbridge stream and its channels:
     /// the Rytm's 368 and 12 unless the descriptor says otherwise.
     out_block: usize,
@@ -307,6 +457,16 @@ pub struct UsbStats {
     /// Host restarts (`gone` windows left) and enumerations completed.
     pub restarts: u64,
     pub enumerations: u64,
+    /// `audio`: isochronous dTDs completed IN (data and feedback) and OUT, the
+    /// bytes they moved, and the feedback endpoint's reads and last value.
+    pub iso_in: u64,
+    pub iso_out: u64,
+    pub iso_in_bytes: u64,
+    pub iso_out_bytes: u64,
+    pub feedback_reads: u64,
+    pub feedback_last: Option<u32>,
+    /// Times the firmware left the bus (USBCMD.RS off) and the host enumerated it again.
+    pub detaches: u64,
 }
 
 impl Default for UsbHost {
@@ -340,6 +500,10 @@ impl UsbHost {
             gpt: [None, None],
             cdc: false,
             device_stack: false,
+            audio: false,
+            iso: Vec::new(),
+            playing: true,
+            audio_auto: false,
             out_block: OB_BLOCK,
             out_channels: OB_CHANNELS,
             midi_to_device: VecDeque::new(),
@@ -353,8 +517,15 @@ impl UsbHost {
         }
     }
 
+    /// The Overbridge stream runs (not the class-compliant host's).
     pub fn streaming(&self) -> bool {
-        self.phase == Phase::Stream
+        self.phase == Phase::Stream && !self.audio
+    }
+
+    /// The class-compliant host has configured the device, selected its audio
+    /// alternate settings and plays.
+    pub fn audio_streaming(&self) -> bool {
+        self.phase == Phase::Stream && self.audio && !self.iso.is_empty() && self.playing
     }
 
     /// MIDI to the device, on its bulk OUT endpoint as a USB host sends it
@@ -401,6 +572,8 @@ impl UsbHost {
                 self.in_budget = 0;
                 self.device_desc.clear();
                 self.config_desc.clear();
+                self.iso.clear();
+                self.was_running = false;
                 self.stats.restarts += 1;
                 self.say("host back");
             }
@@ -427,12 +600,14 @@ impl UsbHost {
             self.stats.midi_asleep += 1;
             return;
         }
-        if self.device_stack {
+        if self.device_stack || self.audio_auto {
             // RS off is the firmware's pull-up gone (a USB CONFIG change, 0x4000601a on the Digitakt): a real host
             // sees a disconnect, then a new device when RS comes back, and enumerates it again.
+            // Only once the host has a device to lose: a host just back (`gone`) is still in Idle
+            // and must raise VBUS first, which the firmware waits for before it runs again.
             if running {
                 self.was_running = true;
-            } else if self.was_running {
+            } else if self.was_running && matches!(self.phase, Phase::Reset | Phase::Enumerate | Phase::Stream) {
                 self.was_running = false;
                 self.phase = Phase::Vbus;
                 self.t = now;
@@ -442,6 +617,10 @@ impl UsbHost {
                 self.in_budget = 0;
                 self.device_desc.clear();
                 self.config_desc.clear();
+                self.iso.clear();
+                let p = bus.peek32(PORTSC1) & !(1 | (1 << 2));
+                bus.poke32(PORTSC1, p);
+                self.stats.detaches += 1;
                 self.say("device left the bus");
             }
         }
@@ -496,6 +675,11 @@ impl UsbHost {
                 self.control(bus, now);
                 if self.phase == Phase::Stream && self.cdc {
                     self.serial(bus);
+                } else if self.phase == Phase::Stream && self.audio {
+                    self.iso_stream(bus, now);
+                    if self.midi_in {
+                        self.midi(bus);
+                    }
                 } else if self.phase == Phase::Stream {
                     self.stream(bus, to_rytm);
                     if self.midi_in {
@@ -705,6 +889,10 @@ impl UsbHost {
         let (req, dtype) = (c.setup[1], c.setup[3]);
         if c.setup[0] == 0x80 && req == 6 && dtype == 1 {
             self.device_desc = c.got.clone();
+            if self.audio_auto && self.device_desc.len() >= 12 {
+                let pid = u16::from_le_bytes([self.device_desc[10], self.device_desc[11]]);
+                self.audio = pid == PID_USB_AUDIO;
+            }
         }
         if c.setup[0] == 0x80 && req == 6 && dtype == 2 {
             if c.got.len() >= 4 && c.got.len() == 9 {
@@ -713,6 +901,24 @@ impl UsbHost {
                 self.queue.push_front([0x80, 6, 0, 2, 0, 0, t[0], t[1]]);
             } else {
                 self.config_desc = c.got.clone();
+                if self.audio {
+                    let (value, picks, eps) = audio_choices(&self.config_desc);
+                    self.queue.push_back([0x00, 9, value, 0, 0, 0, 0, 0]); // SET_CONFIGURATION
+                    if self.playing {
+                        for &(n, alt) in &picks {
+                            self.queue.push_back([0x01, 11, alt, 0, n, 0, 0, 0]); // SET_INTERFACE n, alt
+                        }
+                    }
+                    if self.log {
+                        eprintln!(
+                            "usb host: audio: configuration {value} ({} bytes), alternate settings {picks:?}, isochronous {:?}",
+                            self.config_desc.len(),
+                            eps.iter().map(|e| (e.address, e.attributes, e.max_packet, e.period, e.frame_bytes)).collect::<Vec<_>>()
+                        );
+                    }
+                    self.iso = eps;
+                    return;
+                }
                 if self.device_stack {
                     let info = parse_config(&c.got);
                     if info.ob_out_packet > 32 {
@@ -805,6 +1011,80 @@ impl UsbHost {
                 self.midi_out.extend_from_slice(&p[1..1 + n]);
             }
         }
+    }
+
+    /// The class-compliant audio stream (`audio`, while `playing`): each
+    /// isochronous endpoint of the selected alternate settings is serviced
+    /// every `period` microframes, one transaction (one dTD) each: IN data is
+    /// read and dropped, a feedback IN value is kept, OUT carries silence at
+    /// the nominal rate (a short packet completes an isochronous OUT dTD).
+    fn iso_stream(&mut self, bus: &mut Bus, now: u64) {
+        if !self.playing {
+            return;
+        }
+        for k in 0..self.iso.len() {
+            let e = self.iso[k].clone();
+            if now % e.period != 0 {
+                continue;
+            }
+            let (ep, dir_in) = (e.number(), e.is_in());
+            if dir_in {
+                let (b, done) = self.run_dtds(bus, ep, true, &[]);
+                if done || !b.is_empty() {
+                    self.stats.iso_in += 1;
+                    self.stats.iso_in_bytes += b.len() as u64;
+                    if e.is_feedback() && b.len() >= 3 {
+                        let mut w = [0u8; 4];
+                        w[..b.len().min(4)].copy_from_slice(&b[..b.len().min(4)]);
+                        self.stats.feedback_reads += 1;
+                        self.stats.feedback_last = Some(u32::from_le_bytes(w));
+                    }
+                }
+            } else {
+                let zeros = vec![0u8; e.out_bytes()];
+                let bit = 1u32 << ep;
+                if bus.peek32(EPSR) & bit == 0 {
+                    continue;
+                }
+                // Counted per packet sent (an active dTD taken), whether or not it asks for an
+                // interrupt on completion: the firmware sets IOC on few of its OUT dTDs.
+                let td = Self::next_dtd(bus, Self::qh(bus, ep, false));
+                if td & 1 != 0 || bus.peek32((td & !0x1F) + 4) & 0x80 == 0 {
+                    continue;
+                }
+                let total = ((bus.peek32((td & !0x1F) + 4) >> 16) & 0x7FFF) as usize;
+                self.run_dtds(bus, ep, false, &zeros);
+                self.stats.iso_out += 1;
+                self.stats.iso_out_bytes += zeros.len().min(total) as u64;
+            }
+        }
+    }
+
+    /// The class-compliant host starts (`true`) or stops playing: SET_INTERFACE
+    /// to the chosen alternate setting, or to alternate setting 0, on every
+    /// AudioStreaming interface it selected, as a computer's audio driver does
+    /// when an application opens or closes the device. Before the enumeration
+    /// it only sets what the enumeration selects.
+    pub fn set_playing(&mut self, on: bool) {
+        if on == self.playing {
+            return;
+        }
+        self.playing = on;
+        if self.phase != Phase::Stream || !self.audio {
+            return;
+        }
+        let mut seen = Vec::new();
+        for e in &self.iso {
+            if !seen.contains(&e.interface) {
+                seen.push(e.interface);
+                self.queue.push_back([0x01, 11, if on { e.alt } else { 0 }, 0, e.interface, 0, 0, 0]);
+            }
+        }
+        self.say(if on { "audio: play" } else { "audio: stop (alternate setting 0)" });
+    }
+
+    pub fn playing(&self) -> bool {
+        self.playing
     }
 
     /// The serial device's data endpoints: read 0x82, and send what is waiting
@@ -1010,5 +1290,73 @@ mod tests {
     fn config_without_vendor_interfaces_asks_for_nothing() {
         let d = [9, 4, 1, 0, 2, 1, 3, 0, 0, 7, 5, 0x01, 2, 0, 2, 0, 7, 5, 0x81, 2, 0, 2, 0];
         assert_eq!(parse_config(&d), ConfigInfo::default());
+    }
+
+    /// A UAC2 configuration shaped as OS 1.74's USB AUDIO/MIDI one is described (issue 427 review,
+    /// Ghidra part 2): interface 0 audio control; 1 playback (alt 0 empty, alt 1: 0x03 OUT iso async
+    /// 56 B, 0x82 IN feedback 4 B); 2 capture (alt 1: 0x83 IN iso); 3/4 MIDI (bulk 0x01/0x81).
+    fn uac2_config() -> Vec<u8> {
+        let mut d = vec![9, 2, 0, 0, 5, 1, 0, 0x80, 250];
+        d.extend([9, 4, 0, 0, 0, 1, 1, 0x20, 0]); // AC
+        d.extend([9, 4, 1, 0, 0, 1, 2, 0x20, 0]); // playback alt 0
+        d.extend([9, 4, 1, 1, 2, 1, 2, 0x20, 0]); // playback alt 1
+        d.extend([16, 0x24, 1, 1, 0, 1, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0]); // AS_GENERAL, 2 channels
+        d.extend([6, 0x24, 2, 1, 4, 24]); // FORMAT_TYPE I, 4-byte subslots, 24 bits
+        d.extend([7, 5, 0x03, 0x05, 56, 0, 1]); // OUT iso async
+        d.extend([8, 0x25, 1, 0, 0, 0, 0, 0]); // CS endpoint
+        d.extend([7, 5, 0x82, 0x11, 4, 0, 4]); // feedback IN, every 8 microframes
+        d.extend([9, 4, 2, 0, 0, 1, 2, 0x20, 0]); // capture alt 0
+        d.extend([9, 4, 2, 1, 1, 1, 2, 0x20, 0]); // capture alt 1
+        d.extend([16, 0x24, 1, 3, 0, 1, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0]);
+        d.extend([6, 0x24, 2, 1, 4, 24]);
+        d.extend([7, 5, 0x83, 0x05, 56, 0, 1]); // IN iso async
+        d.extend([9, 4, 3, 0, 0, 1, 1, 0, 0]); // MIDI control
+        d.extend([9, 4, 4, 0, 2, 1, 3, 0, 0]); // MIDI streaming
+        d.extend([7, 5, 0x01, 2, 0, 2, 0, 7, 5, 0x81, 2, 0, 2, 0]);
+        let n = d.len() as u16;
+        d[2..4].copy_from_slice(&n.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn audio_host_selects_alt_1_on_both_streaming_interfaces() {
+        let (value, picks, eps) = audio_choices(&uac2_config());
+        assert_eq!(value, 1);
+        assert_eq!(picks, vec![(1, 1), (2, 1)]);
+        let addrs: Vec<u8> = eps.iter().map(|e| e.address).collect();
+        assert_eq!(addrs, vec![0x03, 0x82, 0x83]);
+        let out = &eps[0];
+        assert!(!out.is_in() && !out.is_feedback());
+        assert_eq!((out.max_packet, out.period, out.frame_bytes), (56, 1, 8));
+        assert_eq!(out.out_bytes(), 48); // 6 frames x 2 channels x 4 bytes, under the 56-byte packet
+        let fb = &eps[1];
+        assert!(fb.is_in() && fb.is_feedback());
+        assert_eq!((fb.number(), fb.max_packet, fb.period), (2, 4, 8));
+        assert!(eps[2].is_in() && !eps[2].is_feedback());
+    }
+
+    #[test]
+    fn audio_host_ignores_vendor_and_midi_interfaces() {
+        let d = [9, 4, 1, 3, 2, 0xFF, 0, 0, 0, 7, 5, 0x83, 3, 0x70, 1, 1, 7, 5, 0x03, 3, 0x70, 1, 1];
+        let (_, picks, eps) = audio_choices(&d);
+        assert!(picks.is_empty() && eps.is_empty());
+    }
+
+    #[test]
+    fn play_and_stop_set_the_alternate_settings() {
+        let mut h = UsbHost::new();
+        h.audio = true;
+        h.phase = Phase::Stream;
+        h.iso = audio_choices(&uac2_config()).2;
+        h.set_playing(false);
+        assert!(!h.audio_streaming());
+        let q: Vec<[u8; 8]> = h.queue.drain(..).collect();
+        assert_eq!(q, vec![[0x01, 11, 0, 0, 1, 0, 0, 0], [0x01, 11, 0, 0, 2, 0, 0, 0]]);
+        h.set_playing(true);
+        assert!(h.audio_streaming());
+        let q: Vec<[u8; 8]> = h.queue.drain(..).collect();
+        assert_eq!(q, vec![[0x01, 11, 1, 0, 1, 0, 0, 0], [0x01, 11, 1, 0, 2, 0, 0, 0]]);
+        h.set_playing(true);
+        assert!(h.queue.is_empty());
     }
 }
