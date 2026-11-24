@@ -1046,11 +1046,16 @@ impl UsbHost {
                 if bus.peek32(EPSR) & bit == 0 {
                     continue;
                 }
-                let (_, done) = self.run_dtds(bus, ep, false, &zeros);
-                if done {
-                    self.stats.iso_out += 1;
-                    self.stats.iso_out_bytes += zeros.len() as u64;
+                // Counted per packet sent (an active dTD taken), whether or not it asks for an
+                // interrupt on completion: the firmware sets IOC on few of its OUT dTDs.
+                let td = Self::next_dtd(bus, Self::qh(bus, ep, false));
+                if td & 1 != 0 || bus.peek32((td & !0x1F) + 4) & 0x80 == 0 {
+                    continue;
                 }
+                let total = ((bus.peek32((td & !0x1F) + 4) >> 16) & 0x7FFF) as usize;
+                self.run_dtds(bus, ep, false, &zeros);
+                self.stats.iso_out += 1;
+                self.stats.iso_out_bytes += zeros.len().min(total) as u64;
             }
         }
     }

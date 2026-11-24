@@ -399,6 +399,13 @@ fn emulate(
     let mut au_said = (false, 0u64);
     let mut play_until: Option<u64> = None;
     let mut ring_last: Vec<u8> = Vec::new();
+    // The ring's CPU writes, by the DDR write watchpoint (the feedback value can repeat, so a
+    // compare of its bytes cannot tell a rewrite from none): on with --usb-audio / --usb-audio-idle.
+    let mut ring_hits = 0u64;
+    if m.is_rytm() && (o.usb_audio.is_some() || o.usb_audio_idle) {
+        let w = USB_AUDIO_RING & 0x07FF_FFFF;
+        m.cpu.bus.watch = Some((w, w + 64));
+    }
     let mut usb_report = Instant::now();
     while !quit.load(Ordering::Relaxed) {
         if let Some(at) = au_at.filter(|&at| m.now() >= at) {
@@ -434,12 +441,15 @@ fn emulate(
             let changed = !ring_last.is_empty() && ring != ring_last;
             let set = ring.chunks(4).filter(|w| w.iter().any(|&b| b != 0)).count();
             ring_last = ring;
+            let writes = m.cpu.bus.watch_hits - ring_hits;
+            ring_hits = m.cpu.bus.watch_hits;
+            m.cpu.bus.watch_log.clear();
             if let Some(h) = m.usb_host.as_ref() {
                 let st = &h.stats;
-                eprintln!("usb host: audio playing {}, {} enumerations, {} restarts, {} detaches, iso {} IN ({} B) / {} OUT ({} B), feedback {} reads, last {}; ring {USB_AUDIO_RING:#x} (OS 1.74): {set}/16 words set, {} since the last report; USB CONFIG {}, mode {}",
+                eprintln!("usb host: audio playing {}, {} enumerations, {} restarts, {} detaches, iso {} IN ({} B) / {} OUT ({} B), feedback {} reads, last {}; ring {USB_AUDIO_RING:#x} (OS 1.74): {set}/16 words set, {writes} CPU writes and {} since the last report; USB CONFIG {}, mode {}",
                           h.audio_streaming(), st.enumerations, st.restarts, st.detaches, st.iso_in, st.iso_in_bytes, st.iso_out,
                           st.iso_out_bytes, st.feedback_reads, st.feedback_last.map_or("none".into(), |v| format!("{v:#010x}")),
-                          if changed { "rewritten" } else { "unchanged" }, m.cpu.bus.peek8(USB_CONFIG), m.cpu.bus.peek32(USB_MODE));
+                          if changed { "its bytes changed" } else { "its bytes the same" }, m.cpu.bus.peek8(USB_CONFIG), m.cpu.bus.peek32(USB_MODE));
             }
         }
         if let Some(dest) = o.audio_in.as_deref() {
@@ -534,6 +544,11 @@ fn emulate(
                     eprintln!("reset: booting {name} from the flash");
                     attach_usb(&mut m, o);
                     au_at = arm_audio(&m);
+                    if m.is_rytm() && (o.usb_audio.is_some() || o.usb_audio_idle) {
+                        let w = USB_AUDIO_RING & 0x07FF_FFFF;
+                        m.cpu.bus.watch = Some((w, w + 64));
+                        ring_hits = 0;
+                    }
                 }
                 Err(e) => {
                     eprintln!("reset: {e}");
